@@ -102,6 +102,10 @@ export class Vfs {
   private watchersByDir = new Map<VNode, Set<VfsWatcher>>();
   /** Write-behind persistence hook (OPFS mirror / host deltas), best-effort. */
   persist?: (op: VfsPersistOp) => void;
+  /** Current working directory for resolving RELATIVE guest paths (node's
+   *  fs syscalls resolve against process.cwd() at call time; the provider
+   *  reads the live value so process.chdir is honored mid-process). */
+  cwdProvider?: () => string;
 
   constructor(private now: () => number = () => Date.now()) {
     this.root = this.makeNode('/', null, S_IFDIR | 0o755);
@@ -117,7 +121,15 @@ export class Vfs {
   }
 
   normalize(p: string): string {
-    if (!p.startsWith('/')) throw new VfsError('ERR_INVALID_ARG_VALUE' as string, 22, 'normalize', p, `The "path" argument must be absolute, received ${p}`);
+    // node fs semantics: '' is rejected before resolution; relative paths
+    // resolve against the process cwd (path.resolve(cwd, p)).
+    if (p === '') {
+      throw new VfsError('ERR_INVALID_ARG_VALUE' as string, 22, 'normalize', p, 'The "path" argument must not be empty');
+    }
+    if (!p.startsWith('/')) {
+      const base = this.cwdProvider?.() ?? '/';
+      p = `${base.replace(/\/+$/, '')}/${p}`;
+    }
     const isDir = p.endsWith('/');
     const out: string[] = [];
     for (const seg of p.split('/')) {

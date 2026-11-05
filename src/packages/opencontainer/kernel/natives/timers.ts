@@ -23,6 +23,17 @@ import type { Binding } from './index';
 export function makeTimersBinding(): Binding {
   const g = globalThis as any;
 
+  // HOST timer primitives, captured at binding-creation time (which runs
+  // BEFORE bootKernel replaces globalThis.setTimeout with node's). Arming
+  // the loop wakeup with the guest's setTimeout would be a circular
+  // dependency: the guest queue only drains when the wakeup fires.
+  const hostSetTimeout: typeof setTimeout =
+    (globalThis as any).setTimeout?.bind(globalThis)
+    ?? ((cb: () => void, ms?: number) => setTimeout(cb, ms));
+  const hostClearTimeout: typeof clearTimeout =
+    (globalThis as any).clearTimeout?.bind(globalThis)
+    ?? ((t: any) => clearTimeout(t));
+
   const immediateInfo = new Float64Array(4);
   const timeoutInfo = new Int32Array(1);
 
@@ -39,11 +50,11 @@ export function makeTimersBinding(): Binding {
   function scheduleTimer(msecs: number): void {
     const at = getLibuvNow() + Math.max(0, msecs);
     if (armedTimer !== null && armedAt <= at) return; // armed one is earlier
-    if (armedTimer !== null) clearTimeout(armedTimer);
+    if (armedTimer !== null) hostClearTimeout(armedTimer as any);
     armedAt = at;
     // ceil → the host wakeup never fires sub-ms EARLY (which caused
     // truncation churn: expiry 428.2 armed at 427.4 → 0ms → 0ms → …).
-    armedTimer = setTimeout(() => {
+    armedTimer = hostSetTimeout(() => {
       armedTimer = null;
       armedAt = Infinity;
       try {
@@ -60,7 +71,7 @@ export function makeTimersBinding(): Binding {
   function toggleImmediateRef(ref: boolean): void {
     if (ref && !immediateScheduled.scheduled) {
       immediateScheduled.scheduled = true;
-      setTimeout(() => {
+      hostSetTimeout(() => {
         immediateScheduled.scheduled = false;
         try {
           g.__ocProcessImmediate?.();

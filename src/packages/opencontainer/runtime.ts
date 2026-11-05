@@ -1001,11 +1001,20 @@ export class OpenContainerRuntime {
         if (first === '-v' || first === '--version') {
           return { entry: { type: 'version' }, argv: ['/usr/local/bin/node', first] };
         }
+        // Real node -e semantics (doc/api/cli.md): the FIRST argument after
+        // -e is the script; every following argument goes to process.argv
+        // (argv[1] = first extra — `node -e 'x' -- foo` sees argv[1] === 'foo',
+        // the '--' option terminator itself is consumed). The eval script
+        // itself never appears in argv, and neither does -e.
         if (first === '-e' || first === '--eval') {
-          return { entry: { type: 'eval', code: args.slice(1).join(' ') }, argv: ['/usr/local/bin/node', ...args] };
+          const extras = args.slice(2);
+          if (extras[0] === '--') extras.shift();
+          return { entry: { type: 'eval', code: args[1] ?? '' }, argv: ['/usr/local/bin/node', ...extras] };
         }
         if (first === '-p' || first === '--print') {
-          return { entry: { type: 'eval', code: args.slice(1).join(' '), print: true }, argv: ['/usr/local/bin/node', ...args] };
+          const extras = args.slice(2);
+          if (extras[0] === '--') extras.shift();
+          return { entry: { type: 'eval', code: args[1] ?? '', print: true }, argv: ['/usr/local/bin/node', ...extras] };
         }
         // node <script> — resolve against the shell's cwd.
         const path = this.resolveInCwd(first);
@@ -1242,7 +1251,9 @@ function quoteIfNeeded(code: string): string {
   return code.includes(' ') ? JSON.stringify(code) : code;
 }
 
-/** Quote-aware tokenizer (handles "a b" 'c d' and backslash escapes). */
+/** Quote-aware tokenizer (handles "a b" 'c d' and backslash escapes).
+ *  Bash parity: inside double quotes \", \\, \$ and \` escape; inside single
+ *  quotes NOTHING escapes (all literal). Outside quotes, \\ escapes any char. */
 export function parseCommand(input: string): ParsedCommand {
   const out: string[] = [];
   let cur = '';
@@ -1251,6 +1262,17 @@ export function parseCommand(input: string): ParsedCommand {
     const ch = input[i];
     if (quote) {
       if (ch === quote) quote = null;
+      else if (quote === '"' && ch === '\\' && i + 1 < input.length) {
+        // bash: only " \ $ ` are special after a backslash in double quotes;
+        // every other backslash sequence stays literal (both characters).
+        const next = input[i + 1];
+        if (next === '"' || next === '\\' || next === '$' || next === '`') {
+          cur += next;
+          i++;
+        } else {
+          cur += ch;
+        }
+      }
       else cur += ch;
     } else if (ch === '"' || ch === "'") {
       quote = ch;

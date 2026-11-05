@@ -182,6 +182,9 @@ export async function bootKernel(opts: BootOptions): Promise<BootedKernel> {
     options,
     stdio,
   };
+  // Relative guest paths (fs.writeFileSync('a.txt'), …) resolve against the
+  // LIVE cwd — process.chdir is honored for the rest of the process's life.
+  vfs.cwdProvider = () => currentCwd;
   const natives = new Natives(nativesCtx);
   // ------------------------------------------------------------------ process
   const process: any = Object.create(EventEmitterLikeProto);
@@ -555,8 +558,11 @@ export async function bootKernel(opts: BootOptions): Promise<BootedKernel> {
   (globalThis as any).clearImmediate = timersModule.clearImmediate;
   (globalThis as any).setInterval = timersModule.setInterval;
   (globalThis as any).clearInterval = timersModule.clearInterval;
-  (globalThis as any).setTimeout = globalThis.setTimeout;
-  (globalThis as any).clearTimeout = globalThis.clearTimeout;
+  // node's own setTimeout/clearTimeout: the return value is a real Timeout
+  // (unref/ref/refresh/hasRef — npm's spinner calls .unref()), and refed
+  // timers join the loop census (node semantics: they keep the loop alive).
+  (globalThis as any).setTimeout = timersModule.setTimeout;
+  (globalThis as any).clearTimeout = timersModule.clearTimeout;
 
   (globalThis as any).__ocBootDebug?.('before-buffer');
   const Buffer = require('buffer').Buffer;

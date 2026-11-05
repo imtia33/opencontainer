@@ -1,0 +1,12 @@
+{
+  "name": "opencontainer-harness",
+  "private": true,
+  "version": "0.0.1",
+  "description": "OpenContainer browser E2E harness — a minimal host page (xterm + runtime + SW glue) replacing the lost demo app. Not part of the published package.",
+  "scripts": {
+    "serve": "bun run server.ts"
+  },
+  "dependencies": {
+    "xterm": "5.3.0"
+  }
+}

@@ -2307,6 +2307,7 @@ class Vfs {
   root;
   watchersByDir = new Map;
   persist;
+  cwdProvider;
   constructor(now = () => Date.now()) {
     this.now = now;
     this.root = this.makeNode("/", null, S_IFDIR | 493);
@@ -2327,8 +2328,13 @@ class Vfs {
     };
   }
   normalize(p) {
-    if (!p.startsWith("/"))
-      throw new VfsError("ERR_INVALID_ARG_VALUE", 22, "normalize", p, `The "path" argument must be absolute, received ${p}`);
+    if (p === "") {
+      throw new VfsError("ERR_INVALID_ARG_VALUE", 22, "normalize", p, 'The "path" argument must not be empty');
+    }
+    if (!p.startsWith("/")) {
+      const base = this.cwdProvider?.() ?? "/";
+      p = `${base.replace(/\/+$/, "")}/${p}`;
+    }
     const isDir = p.endsWith("/");
     const out = [];
     for (const seg of p.split("/")) {
@@ -8796,6 +8802,8 @@ function makeV8Binding(_ctx) {
 // src/packages/opencontainer/kernel/natives/timers.ts
 function makeTimersBinding() {
   const g = globalThis;
+  const hostSetTimeout = globalThis.setTimeout?.bind(globalThis) ?? ((cb, ms) => setTimeout(cb, ms));
+  const hostClearTimeout = globalThis.clearTimeout?.bind(globalThis) ?? ((t) => clearTimeout(t));
   const immediateInfo = new Float64Array(4);
   const timeoutInfo = new Int32Array(1);
   let armedTimer = null;
@@ -8808,9 +8816,9 @@ function makeTimersBinding() {
     if (armedTimer !== null && armedAt <= at)
       return;
     if (armedTimer !== null)
-      clearTimeout(armedTimer);
+      hostClearTimeout(armedTimer);
     armedAt = at;
-    armedTimer = setTimeout(() => {
+    armedTimer = hostSetTimeout(() => {
       armedTimer = null;
       armedAt = Infinity;
       try {
@@ -8824,7 +8832,7 @@ function makeTimersBinding() {
   function toggleImmediateRef(ref) {
     if (ref && !immediateScheduled.scheduled) {
       immediateScheduled.scheduled = true;
-      setTimeout(() => {
+      hostSetTimeout(() => {
         immediateScheduled.scheduled = false;
         try {
           g.__ocProcessImmediate?.();
@@ -13973,6 +13981,7 @@ require(${JSON.stringify(requirePath)});
     options,
     stdio
   };
+  vfs.cwdProvider = () => currentCwd;
   const natives = new Natives(nativesCtx);
   const process = Object.create(EventEmitterLikeProto);
   Object.assign(process, {
@@ -14237,8 +14246,8 @@ require(${JSON.stringify(requirePath)});
   globalThis.clearImmediate = timersModule.clearImmediate;
   globalThis.setInterval = timersModule.setInterval;
   globalThis.clearInterval = timersModule.clearInterval;
-  globalThis.setTimeout = globalThis.setTimeout;
-  globalThis.clearTimeout = globalThis.clearTimeout;
+  globalThis.setTimeout = timersModule.setTimeout;
+  globalThis.clearTimeout = timersModule.clearTimeout;
   globalThis.__ocBootDebug?.("before-buffer");
   const Buffer = require2("buffer").Buffer;
   globalThis.Buffer = Buffer;
@@ -14869,6 +14878,17 @@ async function boot(msg) {
     }
   });
   lap("bootstrapMs");
+  {
+    const entryPath = msg.entry?.path ?? "";
+    const argv0 = String(msg.argv?.[1] ?? "");
+    const needsNpm = entryPath.startsWith("/usr/local/bin/npm") || entryPath.startsWith("/usr/local/bin/npx") || entryPath.startsWith("/usr/lib/node_modules/npm") || argv0.startsWith("/usr/local/bin/npm") || argv0.startsWith("/usr/local/bin/npx") || argv0.startsWith("/usr/lib/node_modules/npm");
+    if (needsNpm && index.npm) {
+      const npmBuf = await loadBlob(index.npm, "npm");
+      const mounted = mountNpmTree(npmBuf);
+      lap("npmMountMs");
+      post({ type: "boot-progress", phase: "npm:mount", loaded: mounted, total: mounted });
+    }
+  }
   wireVfsDeltas();
   globalThis.__oc = globalThis.__oc ?? {};
   globalThis.__oc.kernel = kernel;
@@ -14898,6 +14918,22 @@ async function boot(msg) {
   const entry = msg.entry ?? null;
   if (entry)
     await runEntry(entry);
+}
+function mountNpmTree(buf) {
+  if (!kernel)
+    return 0;
+  const { entries, bodyStart, bytes } = parseBlob(buf);
+  const decoder = new TextDecoder;
+  const root = "/usr/lib/node_modules/npm";
+  kernel.vfs.mkdir(root, true);
+  let n = 0;
+  for (const e of entries) {
+    const dest = `${root}/${e.p}`;
+    kernel.vfs.mkdir(dest.slice(0, dest.lastIndexOf("/")), true);
+    kernel.vfs.writeFile(dest, decoder.decode(bytes.subarray(bodyStart + e.o, bodyStart + e.o + e.l)));
+    n++;
+  }
+  return n;
 }
 function drainTicks() {
   try {
@@ -15270,13 +15306,15 @@ self.onmessage = async (ev) => {
             break;
           }
           if (first === "-e" || first === "--eval") {
-            await kernel.runEval(args.slice(1).join(" "));
+            kernel.process.argv = ["/usr/local/bin/node", ...args.slice(2)];
+            await kernel.runEval(args[1] ?? "");
             kernel.startLoopDrainWatcher();
             post({ type: "spawn-done", id: msg.id });
             break;
           }
           if (first === "-p" || first === "--print") {
-            await kernel.runEval(args.slice(1).join(" "), true);
+            kernel.process.argv = ["/usr/local/bin/node", ...args.slice(2)];
+            await kernel.runEval(args[1] ?? "", true);
             kernel.startLoopDrainWatcher();
             post({ type: "spawn-done", id: msg.id });
             break;

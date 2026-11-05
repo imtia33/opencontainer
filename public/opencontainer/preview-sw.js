@@ -18,6 +18,75 @@
 
 const PREVIEW_RE = /^\/opencontainer\/p\/(\d+)(\/.*)?$/;
 
+// ---- ESM graph transport (in-SW, host-route-free) --------------------------
+// Guest ESM graphs are published here by the kernel worker
+// (POST /oc-esm {nonce, entries: [[vfsPath, text], ...]}) and linked by the
+// engine as /oc-esm/<nonce>/<encoded-path> — exactly the URL space
+// kernel/esm-graph.ts computes. Stored in a dedicated Cache API cache so it
+// survives SW termination; FIFO nonce cap keeps growth bounded.
+const ESM_PUBLISH_PATH = '/oc-esm';
+const ESM_GET_RE = /^\/oc-esm\/([A-Za-z0-9_-]+)(\/.+)$/;
+const ESM_CACHE = 'opencontainer-esm-v1';
+const ESM_INDEX_KEY = '/oc-esm/__oc_index__';
+const ESM_MAX_NONCES = 48;
+
+function encodePathSegments(p) {
+  return p.split('/').map((s) => encodeURIComponent(s)).join('/');
+}
+
+async function esmIndex(cache) {
+  try {
+    const hit = await cache.match(ESM_INDEX_KEY);
+    if (hit) return await hit.json();
+  } catch { /* corrupt index → start fresh */ }
+  return [];
+}
+
+async function handleEsmPublish(request) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return new Response('bad json', { status: 400 });
+  }
+  const nonce = String(body.nonce ?? '');
+  const entries = Array.isArray(body.entries) ? body.entries : [];
+  if (!/^[A-Za-z0-9_-]+$/.test(nonce)) {
+    return new Response('bad nonce', { status: 400 });
+  }
+  const cache = await caches.open(ESM_CACHE);
+  for (const [path, text] of entries) {
+    const url = new URL(`/oc-esm/${nonce}${encodePathSegments(String(path))}`, self.location.origin).href;
+    await cache.put(url, new Response(text, {
+      headers: { 'content-type': 'text/javascript; charset=utf-8' },
+    }));
+  }
+  // FIFO eviction of the oldest nonces past the cap.
+  const index = await esmIndex(cache);
+  const next = index.filter((n) => n !== nonce).concat(nonce);
+  while (next.length > ESM_MAX_NONCES) {
+    const oldest = next.shift();
+    const keys = await cache.keys();
+    for (const req of keys) {
+      const u = new URL(req.url);
+      if (u.pathname.startsWith(`/oc-esm/${oldest}/`)) await cache.delete(req);
+    }
+  }
+  await cache.put(ESM_INDEX_KEY, new Response(JSON.stringify(next), {
+    headers: { 'content-type': 'application/json' },
+  }));
+  return new Response('ok');
+}
+
+async function handleEsmGet(url) {
+  const cache = await caches.open(ESM_CACHE);
+  const hit = await cache.match(url.href);
+  if (hit) return hit;
+  return new Response('OpenContainer: ESM graph entry not found (expired?)', {
+    status: 404, headers: { 'content-type': 'text/plain' },
+  });
+}
+
 self.addEventListener('install', () => {
   self.skipWaiting();
 });
@@ -29,6 +98,15 @@ self.addEventListener('activate', (event) => {
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
   if (url.origin !== self.location.origin) return;
+  // ESM graph transport (publish + serve) — handled entirely in the SW.
+  if (url.pathname === ESM_PUBLISH_PATH && event.request.method === 'POST') {
+    event.respondWith(handleEsmPublish(event.request));
+    return;
+  }
+  if (ESM_GET_RE.test(url.pathname) && event.request.method === 'GET') {
+    event.respondWith(handleEsmGet(url));
+    return;
+  }
   const m = PREVIEW_RE.exec(url.pathname);
   if (!m) return; // not a preview URL — default network/cache behavior
   const port = Number(m[1]);
