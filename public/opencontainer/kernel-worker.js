@@ -2605,11 +2605,20 @@ class Vfs {
       throw new VfsError("ENOENT", errnoOf("ENOENT"), "rename", newPath);
     }
     const existing = this.childrenOf(parentB).find((c) => c.name === this.basename(b));
-    if (existing) {
-      if ((existing.mode & S_IFMT) === S_IFDIR && (node.mode & S_IFMT) === S_IFDIR && !this.childrenOf(existing).length) {
+    if (existing && existing !== node) {
+      const existingIsDir = (existing.mode & S_IFMT) === S_IFDIR;
+      const nodeIsDir = (node.mode & S_IFMT) === S_IFDIR;
+      if (existingIsDir && nodeIsDir) {
+        if (this.childrenOf(existing).length) {
+          throw new VfsError("ENOTEMPTY", errnoOf("ENOTEMPTY"), "rename", newPath);
+        }
         this.detach(parentB, existing);
-      } else if (existing !== node) {
-        throw new VfsError("ENOTEMPTY", errnoOf("ENOTEMPTY"), "rename", newPath);
+      } else if (existingIsDir && !nodeIsDir) {
+        throw new VfsError("EISDIR", errnoOf("EISDIR"), "rename", newPath);
+      } else if (!existingIsDir && nodeIsDir) {
+        throw new VfsError("ENOTDIR", errnoOf("ENOTDIR"), "rename", newPath);
+      } else {
+        this.detach(parentB, existing);
       }
     }
     const oldParent = node.parent ?? this.root;
@@ -10901,12 +10910,14 @@ function makePipeWrapBinding(ctx) {
       queueMicrotask(() => req?.oncomplete?.(0));
       return 0;
     }
-    close() {
+    close(cb) {
       if (this.pipeId !== null) {
         if (registry3.get(this.pipeId) === this)
           registry3.delete(this.pipeId);
         hooks.onPipeClose?.(this.pipeId, "close");
       }
+      if (typeof cb === "function")
+        queueMicrotask(() => cb());
     }
     ref() {}
     unref() {}
@@ -11177,7 +11188,7 @@ function makeTcpWrapBinding(ctx) {
       queueMicrotask(() => req?.oncomplete?.(0));
       return 0;
     }
-    close() {
+    close(cb) {
       this.closed = true;
       if (this.connId !== null) {
         if (sockets.get(this.connId) === this)
@@ -11195,6 +11206,8 @@ function makeTcpWrapBinding(ctx) {
           hooks.onTcpUnlisten?.(id, this.localPort);
         }
       }
+      if (typeof cb === "function")
+        queueMicrotask(() => cb());
     }
     ref() {}
     unref() {}
@@ -14155,6 +14168,39 @@ function hasTopLevelAwait(ast) {
 }
 
 // src/packages/opencontainer/kernel/boot.ts
+var hostSetTimeout = globalThis.setTimeout?.bind(globalThis) ?? ((cb, ms) => setTimeout(cb, ms));
+var hostSetInterval = globalThis.setInterval?.bind(globalThis) ?? ((cb, ms) => setInterval(cb, ms));
+var hostClearInterval = globalThis.clearInterval?.bind(globalThis) ?? ((t) => clearInterval(t));
+var pristineGlobals = (() => {
+  const g = globalThis;
+  return {
+    process: g.process,
+    console: g.console,
+    setTimeout: g.setTimeout,
+    clearTimeout: g.clearTimeout,
+    setInterval: g.setInterval,
+    clearInterval: g.clearInterval,
+    setImmediate: g.setImmediate,
+    clearImmediate: g.clearImmediate,
+    Buffer: g.Buffer,
+    global: g.global
+  };
+})();
+var realmGlobalsRestored = false;
+function restoreHostGlobals() {
+  if (realmGlobalsRestored)
+    return;
+  realmGlobalsRestored = true;
+  const g = globalThis;
+  for (const [key, value] of Object.entries(pristineGlobals)) {
+    try {
+      if (value === undefined)
+        delete g[key];
+      else
+        g[key] = value;
+    } catch {}
+  }
+}
 async function bootKernel(opts) {
   const __stageT0 = Date.now();
   const __stage = (name) => {
@@ -14162,8 +14208,21 @@ async function bootKernel(opts) {
       opts.onStage?.(name, Date.now() - __stageT0);
     } catch {}
   };
-  const hostSetInterval = globalThis.setInterval?.bind(globalThis) ?? ((cb, ms) => setInterval(cb, ms));
-  const hostClearInterval = globalThis.clearInterval?.bind(globalThis) ?? ((t) => clearInterval(t));
+  const userOnExit = opts.hooks.onExit;
+  realmGlobalsRestored = false;
+  opts = {
+    ...opts,
+    hooks: {
+      ...opts.hooks,
+      onExit: (code) => {
+        try {
+          userOnExit?.(code);
+        } finally {
+          restoreHostGlobals();
+        }
+      }
+    }
+  };
   installNetPendingGlobalFetch();
   if (typeof globalThis.SharedArrayBuffer === "undefined") {
     globalThis.SharedArrayBuffer = ArrayBuffer;
@@ -14626,9 +14685,9 @@ Node.js ${NODE_VERSION}
         }
         if (counter > 50)
           return resolve();
-        setTimeout(check, 10);
+        hostSetTimeout(check, 10);
       };
-      setTimeout(check, 10);
+      hostSetTimeout(check, 10);
     });
   }
   let drainWatcher = null;

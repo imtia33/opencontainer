@@ -197,7 +197,7 @@ export function makeTcpWrapBinding(ctx: NativesContext): Binding {
       queueMicrotask(() => req?.oncomplete?.(0));
       return 0;
     }
-    close() {
+    close(cb?: () => void): void {
       this.closed = true;
       if (this.connId !== null) {
         if (sockets.get(this.connId) === this) sockets.delete(this.connId);
@@ -214,6 +214,9 @@ export function makeTcpWrapBinding(ctx: NativesContext): Binding {
           hooks.onTcpUnlisten?.(id, this.localPort);
         }
       }
+      // node's HandleWrap.close(cb) invokes cb on completion — net.js
+      // closeSocketHandle emits the Socket 'close' event from it.
+      if (typeof cb === 'function') queueMicrotask(() => cb());
     }
     ref() {}
     unref() {}

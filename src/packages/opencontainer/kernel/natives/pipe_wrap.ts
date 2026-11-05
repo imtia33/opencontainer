@@ -126,11 +126,15 @@ export function makePipeWrapBinding(ctx: NativesContext): Binding {
       queueMicrotask(() => req?.oncomplete?.(0));
       return 0;
     }
-    close() {
+    close(cb?: () => void): void {
       if (this.pipeId !== null) {
         if (registry.get(this.pipeId) === this) registry.delete(this.pipeId);
         hooks.onPipeClose?.(this.pipeId, 'close');
       }
+      // node's HandleWrap.close(cb) invokes cb when the close completes —
+      // net.js's closeSocketHandle emits the Socket 'close' event from it
+      // (child_process counts those to fire the ChildProcess 'close').
+      if (typeof cb === 'function') queueMicrotask(() => cb());
     }
     ref() {}
     unref() {}

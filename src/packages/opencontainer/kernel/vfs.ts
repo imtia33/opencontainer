@@ -394,11 +394,28 @@ export class Vfs {
       throw new VfsError('ENOENT', errnoOf('ENOENT'), 'rename', newPath);
     }
     const existing = this.childrenOf(parentB).find((c) => c.name === this.basename(b));
-    if (existing) {
-      if ((existing.mode & S_IFMT) === S_IFDIR && (node.mode & S_IFMT) === S_IFDIR && !this.childrenOf(existing).length) {
-        this.detach(parentB, existing);
-      } else if (existing !== node) {
-        throw new VfsError('ENOTEMPTY', errnoOf('ENOTEMPTY'), 'rename', newPath);
+    if (existing && existing !== node) {
+      // POSIX rename(2) semantics matrix:
+      //   file  → existing file  : silent atomic replace (atomic writers
+      //                             everywhere depend on this: write temp,
+      //                             rename over the target)
+      //   dir   → existing empty dir : replace
+      //   dir   → existing non-empty dir : ENOTEMPTY
+      //   file  → existing dir   : EISDIR
+      //   dir   → existing file  : ENOTDIR
+      const existingIsDir = (existing.mode & S_IFMT) === S_IFDIR;
+      const nodeIsDir = (node.mode & S_IFMT) === S_IFDIR;
+      if (existingIsDir && nodeIsDir) {
+        if (this.childrenOf(existing).length) {
+          throw new VfsError('ENOTEMPTY', errnoOf('ENOTEMPTY'), 'rename', newPath);
+        }
+        this.detach(parentB, existing); // replace empty dir
+      } else if (existingIsDir && !nodeIsDir) {
+        throw new VfsError('EISDIR', errnoOf('EISDIR'), 'rename', newPath);
+      } else if (!existingIsDir && nodeIsDir) {
+        throw new VfsError('ENOTDIR', errnoOf('ENOTDIR'), 'rename', newPath);
+      } else {
+        this.detach(parentB, existing); // file onto file → replace
       }
     }
     const oldParent = node.parent ?? this.root;

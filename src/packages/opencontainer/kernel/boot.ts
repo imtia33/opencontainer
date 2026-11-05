@@ -60,17 +60,108 @@ export interface BootOptions {
   stdio?: Array<{ type: 'tty' | 'pipe' | 'ignore'; pipeId?: number }>;
 }
 
+/* ------------------------------------------------------------------ */
+/* Host loop primitives — captured at MODULE scope, once per realm.     */
+/* ------------------------------------------------------------------ */
+/**
+ * The kernel's timers module replaces globalThis.setTimeout/setInterval with
+ * the GUEST timer system (guest code expects node-semantics timers as
+ * globals). Kernel-internal machinery — the settle-poll in runMain/runEval
+ * and the loop-drain watcher — must run on the HOST loop instead:
+ *  1. a kernel timer would count as a pending guest handle and block
+ *     "loop empty ⇒ process exits" detection forever;
+ *  2. after the guest process begins exiting, node's own timers refuse new
+ *     schedules (_exiting guard), so a guest-scheduled settle-poll NEVER
+ *     fires — runMain's promise hangs and, in the bun harness (no other
+ *     live host handle), the host silently exits on the drained loop;
+ *  3. sequential in-realm boots (harness: one kernel per process) must not
+ *     capture a PREVIOUS kernel's swapped globals — hence module scope,
+ *    which runs before any bootKernel() call in this realm.
+ */
+const hostSetTimeout: (cb: () => void, ms?: number) => any =
+  (globalThis as any).setTimeout?.bind(globalThis)
+  ?? ((cb: () => void, ms?: number) => setTimeout(cb, ms));
+const hostSetInterval: (cb: () => void, ms: number) => any =
+  (globalThis as any).setInterval?.bind(globalThis)
+  ?? ((cb: () => void, ms: number) => setInterval(cb, ms));
+const hostClearInterval: (t: any) => void =
+  (globalThis as any).clearInterval?.bind(globalThis)
+  ?? ((t: any) => clearInterval(t));
+
+/**
+ * Pristine realm globals, captured once at module load — i.e. BEFORE any
+ * bootKernel() call in this realm has swapped them for the guest's. Used by
+ * restoreHostGlobals() to hand the realm back to the host when the guest
+ * process dies. In the browser worker this is belt-and-braces (the whole
+ * worker is recycled); in shared-realm hosts (the bun test harness, node
+ * embedding) it is REQUIRED: host code that touches `process`, `console`,
+ * `setTimeout`, or `Buffer` after a kernel exited would otherwise run on a
+ * dead guest's objects — timers schedule inside an exiting timer system
+ * (never fire), process.exit hits the guest's wrapped binding, and the host
+ * silently dies on its drained loop.
+ */
+const pristineGlobals = (() => {
+  const g = globalThis as any;
+  return {
+    process: g.process,
+    console: g.console,
+    setTimeout: g.setTimeout,
+    clearTimeout: g.clearTimeout,
+    setInterval: g.setInterval,
+    clearInterval: g.clearInterval,
+    setImmediate: g.setImmediate,
+    clearImmediate: g.clearImmediate,
+    Buffer: g.Buffer,
+    global: g.global,
+  };
+})();
+
+let realmGlobalsRestored = false;
+
+/** Return the realm's globals to their pre-boot (host) values. Idempotent. */
+function restoreHostGlobals(): void {
+  if (realmGlobalsRestored) return;
+  realmGlobalsRestored = true;
+  const g = globalThis as any;
+  for (const [key, value] of Object.entries(pristineGlobals)) {
+    try {
+      if (value === undefined) delete g[key];
+      else g[key] = value;
+    } catch { /* non-writable global — leave it */ }
+  }
+}
+
 export async function bootKernel(opts: BootOptions): Promise<BootedKernel> {
   const __stageT0 = Date.now();
   const __stage = (name: string) => { try { opts.onStage?.(name, Date.now() - __stageT0); } catch { /* diagnostic only */ } };
-  // Capture host loop primitives BEFORE the kernel's timers module replaces
-  // the globals — the loop-drain watcher must live OUTSIDE the kernel timer
-  // system: its own interval would otherwise count as a pending kernel timer
-  // and block "loop empty ⇒ process exits" detection forever.
-  const hostSetInterval = (globalThis as any).setInterval?.bind(globalThis)
-    ?? ((cb: () => void, ms: number) => setInterval(cb, ms));
-  const hostClearInterval = (globalThis as any).clearInterval?.bind(globalThis)
-    ?? ((t: any) => clearInterval(t));
+  // hostSetTimeout / hostSetInterval / hostClearInterval are captured at
+  // MODULE scope (see above) — never from the possibly-swapped globals here.
+
+  // Realm return: after the guest process is dead (its 'exit' handlers have
+  // run — node's exit chain is emit('exit') → reallyExit → hooks.onExit),
+  // hand the realm's globals back to the host. The guest's own exit handlers
+  // still see the guest globals (they run BEFORE the hook). Wrapping here
+  // (before nativesCtx captures the hooks) funnels EVERY exit path —
+  // process.exit, reallyExit, fatal exits, signal default dispositions —
+  // through the same restore.
+  const userOnExit = opts.hooks.onExit;
+  // A fresh kernel takes ownership of this realm's globals — re-arm the
+  // restore (sequential in-realm boots: kernel #1 restored on exit, kernel
+  // #2 swaps again and must restore again).
+  realmGlobalsRestored = false;
+  opts = {
+    ...opts,
+    hooks: {
+      ...opts.hooks,
+      onExit: (code: number) => {
+        try {
+          userOnExit?.(code);
+        } finally {
+          restoreHostGlobals();
+        }
+      },
+    },
+  };
 
   // P1 loop-handle accounting: an in-flight guest fetch is a live uv-style
   // handle (see kernel/net-pending.ts). Installed BEFORE any native code
@@ -726,9 +817,9 @@ export async function bootKernel(opts: BootOptions): Promise<BootedKernel> {
           idleSamples = 0;
         }
         if (counter > 50) return resolve(); // don't wait forever
-        setTimeout(check, 10);
+        hostSetTimeout(check, 10);
       };
-      setTimeout(check, 10);
+      hostSetTimeout(check, 10);
     });
   }
 
