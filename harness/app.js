@@ -66,15 +66,18 @@ function prompt() {
 }
 
 // ---- the shell loop (a thin readline over rt.spawn) -----------------------
+// onData must handle BOTH per-char typing and multi-char chunks (automation
+// injection / bracketed-paste-off pastes deliver whole strings — a real
+// terminal executes those too, e.g. pasted "npm test\r").
 let busy = false;
 let line = '';
-term.onData((d) => {
+const handleChar = (ch) => {
   if (state.error) return;
   if (busy) {
-    rt.writeStdin(d);
+    rt.writeStdin(ch);
     return;
   }
-  if (d === '\r') {
+  if (ch === '\r') {
     term.write('\r\n');
     const cmd = line.trim();
     line = '';
@@ -86,23 +89,26 @@ term.onData((d) => {
     );
     return;
   }
-  if (d === '\x7f') { // backspace
+  if (ch === '\x7f') { // backspace
     if (line.length > 0) {
       line = line.slice(0, -1);
       term.write('\b \b');
     }
     return;
   }
-  if (d === '\x03') { // Ctrl+C
+  if (ch === '\x03') { // Ctrl+C
     term.write('^C\r\n');
     line = '';
     prompt();
     return;
   }
-  if (d >= ' ') {
-    line += d;
-    term.write(d);
+  if (ch >= ' ') {
+    line += ch;
+    term.write(ch);
   }
+};
+term.onData((d) => {
+  for (const ch of d) handleChar(ch);
 });
 
 // ---- preview ServiceWorker + bridge glue ----------------------------------

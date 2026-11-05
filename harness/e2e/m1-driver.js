@@ -58,6 +58,15 @@ void (async () => {
   };
   const waitForText = (needle, ms = 30000) =>
     waitFor(() => allLines().some((l) => l.includes(needle)), ms);
+  // Exact-line match — immune to false positives from echoed commands and
+  // the boot banner (e.g. 'v26.13.0' appears in the banner too).
+  const hasExactLine = (text) => allLines().some((l) => l.trim() === text);
+  const waitForExact = (text, ms = 30000) => waitFor(() => hasExactLine(text), ms);
+  // npm's summary line: "added N package[s] in Xs" — N counts EVERYTHING
+  // installed this run (a persisted package.json with prior deps installs
+  // them all on a fresh session — ephemeral node_modules).
+  const waitForAdded = (ms = 60000) =>
+    waitFor(() => allLines().some((l) => /^added \d+ packages? in \d+s?/.test(l.trim())), ms);
   const PROMPT_RE = /oc v26\.13\.0 ❯\s*$/;
   const promptLine = () => {
     const b = t.buffer.active;
@@ -87,15 +96,15 @@ void (async () => {
 
       // 2. node -v
       await run('node -v');
-      check('node -v', await waitForText('v26.13.0', 15000), '');
+      check('node -v', await waitForExact('v26.13.0', 15000), '');
 
       // 3. node -e hello
       await run(`node -e 'console.log("Hello from OpenContainer")'`);
-      check("node -e hello", await waitForText('Hello from OpenContainer', 15000));
+      check("node -e hello", await waitForExact('Hello from OpenContainer', 15000));
 
       // 4. npm -v (genuine CLI)
       await run('npm -v');
-      check('npm -v → 12.2.1 (genuine CLI)', await waitForText('12.2.1', 20000));
+      check('npm -v → 12.2.1 (genuine CLI)', await waitForExact('12.2.1', 30000));
 
       // 5. npm init -y
       await run('npm init -y');
@@ -105,21 +114,23 @@ void (async () => {
       const t0 = performance.now();
       await run('npm install lodash --no-audit --no-fund', 180000);
       const installMs = Math.round(performance.now() - t0);
-      const addedOk = await waitForText('added 1 package', 60000);
+      const addedOk = await waitForAdded(60000);
       check('npm install lodash (real registry)', addedOk, `${installMs}ms`);
 
       // 7. require lodash in a fresh process
       await run(`node -e 'console.log("CHUNK=" + JSON.stringify(require("lodash").chunk([1,2,3,4],2)))'`);
-      check("require('lodash').chunk", await waitForText('CHUNK=[[1,2],[3,4]]', 30000));
+      check("require('lodash').chunk", await waitForExact('CHUNK=[[1,2],[3,4]]', 30000));
 
       // 8. npx cowsay (child process via host process manager)
       await run('npx --yes cowsay OpenContainer', 180000);
-      const cow = await waitForText('(___)', 60000);
+      // cowsay's speech bubble line — distinctive; the echoed command line
+      // contains the words but never the surrounding bubble markers.
+      const cow = await waitForText('< OpenContainer >', 60000);
       check('npx cowsay (child process)', cow);
 
       // 9. express + background dev server + preview through the SW
       await run('npm install express --no-audit --no-fund', 240000);
-      check('npm install express', await waitForText('added ', 60000));
+      check('npm install express', await waitForAdded(60000));
       await rt.writeFile('/home/project/server.js',
         'const app=require("express")();app.get("/",(q,s)=>s.send("M1-PREVIEW-OK"));app.listen(3000,()=>console.log("SERVER-UP"));');
       {
@@ -149,7 +160,9 @@ void (async () => {
       await waitFor(() => !state.ports.includes(3000), 10000);
       check('server killed', !state.ports.includes(3000), '');
 
-      // 10. arm phase B (ephemeral node_modules)
+      // 10. arm phase B (ephemeral node_modules) — stash phase A results so
+      // they survive the reload (fresh __ocM1Result after navigation).
+      try { sessionStorage.setItem('__ocM1PhaseA', JSON.stringify(R.checks)); } catch { /* quota */ }
       localStorage.setItem('__ocM1Phase', 'b');
       R.phase = 'a-done';
       R.done = true;
@@ -168,18 +181,23 @@ void (async () => {
   // =========================================================================
   try {
     localStorage.removeItem('__ocM1Phase');
+    // merge phase A checks (stashed pre-reload) ahead of phase B's
+    try {
+      const a = JSON.parse(sessionStorage.getItem('__ocM1PhaseA') ?? '[]');
+      R.checks = R.checks.concat(a);
+    } catch { /* absent */ }
     await waitFor(() => state.booted, 60000);
     await waitPrompt(30000);
     // fresh boot banner should NOT contain phase A scrollback
     await run(`node -e 'console.log("NM=" + require("fs").existsSync("node_modules/lodash"))'`);
-    const nmGone = !(await waitForText('NM=true', 8000)) && !!(await waitForText('NM=false', 8000));
-    check('ephemeral: node_modules/lodash gone after reload', nmGone);
+    const nmGone = await waitForExact('NM=false', 8000);
+    check('ephemeral: node_modules/lodash gone after reload', !!nmGone);
     await run(`node -e 'console.log("PJ=" + require("fs").existsSync("package.json"))'`);
-    check('persistent: package.json survives reload', !!(await waitForText('PJ=true', 8000)));
+    check('persistent: package.json survives reload', !!(await waitForExact('PJ=true', 8000)));
     await run('npm install lodash --no-audit --no-fund', 180000);
-    check('reinstall works', !!(await waitForText('added 1 package', 60000)));
+    check('reinstall works', !!(await waitForAdded(60000)));
     await run(`node -e 'console.log("CHUNK=" + JSON.stringify(require("lodash").chunk([1,2,3,4],2)))'`);
-    check('require after reinstall', !!(await waitForText('CHUNK=[[1,2],[3,4]]', 30000)));
+    check('require after reinstall', !!(await waitForExact('CHUNK=[[1,2],[3,4]]', 30000)));
     R.phase = 'b-done';
   } catch (e) {
     R.checks.push({ name: 'phase-b-fatal', ok: false, detail: String(e && (e.stack || e.message || e)).slice(0, 500) });
