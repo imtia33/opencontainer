@@ -203,6 +203,9 @@ function nodeError(code: string, message: string): Error & { code: string } {
 
 /** Map a fetch rejection to a node-style client error. */
 function mapFetchError(err: unknown, url: string): Error & { code: string } {
+  if ((globalThis as any).__ocHttpDebug) {
+    try { (globalThis as any).__ocHttpDebug('fetch-reject ' + url + ' :: ' + String((err as any)?.stack ?? err)); } catch { /* noop */ }
+  }
   const e = err as any;
   const name = String(e?.name ?? '');
   const message = String(e?.message ?? err ?? 'network error');
@@ -670,6 +673,7 @@ class FetchClientRequest extends TinyEmitter {
     }
     if (this._ended || this.destroyed) {
       const err = nodeError('ERR_STREAM_WRITE_AFTER_END', 'write after end');
+      if ((globalThis as any).__ocHttpDebug) { try { (globalThis as any).__ocHttpDebug('stream-error :: ' + String((err as any)?.stack ?? err)); } catch { /* noop */ } }
       this.emit('error', err);
       if (typeof cb === 'function') queueMicrotask(() => cb(err));
       return false;

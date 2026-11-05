@@ -78,6 +78,18 @@ export async function bootKernel(opts: BootOptions): Promise<BootedKernel> {
   // user code) is counted from the first call.
   installNetPendingGlobalFetch();
 
+  // SharedArrayBuffer polyfill for non-cross-origin-isolated hosts. Unlike
+  // WebContainers (which REQUIRES COOP/COEP headers), OpenContainer runs on
+  // any static host — but then the browser hides SharedArrayBuffer, and
+  // guest code that merely allocates one (pnpm: Buffer.from(new
+  // SharedArrayBuffer(n)) as a chunk-copy target) dies with a ReferenceError.
+  // Our workers are in-process, so nothing ever shares memory across threads;
+  // aliasing to ArrayBuffer preserves exactly the semantics we can honor.
+  // Real SAB (isolated hosts, bun/node harnesses) is left untouched.
+  if (typeof (globalThis as any).SharedArrayBuffer === 'undefined') {
+    (globalThis as any).SharedArrayBuffer = ArrayBuffer;
+  }
+
   const vfs = opts.vfs ?? new Vfs();
   const cwd = opts.cwd ?? '/home/project';
   vfs.mkdir('/home', true);

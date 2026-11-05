@@ -734,11 +734,39 @@ export class OpenContainerRuntime {
           break;
         }
         case 'rename': {
-          const data = this.vfsSnapshot.files.get(op.from);
+          const { from, to } = op;
+          const renameKey = (p: string): string => (p === from ? to : to + p.slice(from.length));
+          // Exact file at the source path.
+          const data = this.vfsSnapshot.files.get(from);
           if (data !== undefined) {
-            this.vfsSnapshot.files.delete(op.from);
-            this.vfsSnapshot.files.set(op.to, data);
+            this.vfsSnapshot.files.delete(from);
+            this.vfsSnapshot.files.set(to, data);
           }
+          // DIRECTORY renames move the whole subtree (pnpm imports packages
+          // through a temp dir: lodash_tmp_2_1 → lodash — a one-file rename
+          // handler left the entire tree stranded under the temp name).
+          const prefix = from + '/';
+          for (const p of [...this.vfsSnapshot.files.keys()]) {
+            if (p.startsWith(prefix)) {
+              const d = this.vfsSnapshot.files.get(p)!;
+              this.vfsSnapshot.files.delete(p);
+              this.vfsSnapshot.files.set(renameKey(p), d);
+            }
+          }
+          for (const p of [...this.vfsSnapshot.symlinks.keys()]) {
+            if (p === from || p.startsWith(prefix)) {
+              const t = this.vfsSnapshot.symlinks.get(p)!;
+              this.vfsSnapshot.symlinks.delete(p);
+              this.vfsSnapshot.symlinks.set(renameKey(p), t);
+            }
+          }
+          for (const d of [...this.vfsSnapshot.dirs]) {
+            if (d === from || d.startsWith(prefix)) {
+              this.vfsSnapshot.dirs.delete(d);
+              this.vfsSnapshot.dirs.add(renameKey(d));
+            }
+          }
+          recordAncestorDirs(to);
           break;
         }
       }

@@ -2637,7 +2637,9 @@ class Vfs {
   }
   readlink(p) {
     const node = this.lookup(p, false);
-    if (!node || (node.mode & S_IFMT) !== S_IFLNK) {
+    if (!node)
+      throw new VfsError("ENOENT", errnoOf("ENOENT"), "readlink", p);
+    if ((node.mode & S_IFMT) !== S_IFLNK) {
       throw new VfsError("EINVAL", errnoOf("EINVAL"), "readlink", p);
     }
     return node.target ?? "";
@@ -13046,6 +13048,11 @@ function nodeError(code, message) {
   return err2;
 }
 function mapFetchError(err2, url) {
+  if (globalThis.__ocHttpDebug) {
+    try {
+      globalThis.__ocHttpDebug("fetch-reject " + url + " :: " + String(err2?.stack ?? err2));
+    } catch {}
+  }
   const e = err2;
   const name = String(e?.name ?? "");
   const message = String(e?.message ?? err2 ?? "network error");
@@ -13443,6 +13450,11 @@ class FetchClientRequest extends TinyEmitter {
     }
     if (this._ended || this.destroyed) {
       const err2 = nodeError("ERR_STREAM_WRITE_AFTER_END", "write after end");
+      if (globalThis.__ocHttpDebug) {
+        try {
+          globalThis.__ocHttpDebug("stream-error :: " + String(err2?.stack ?? err2));
+        } catch {}
+      }
       this.emit("error", err2);
       if (typeof cb === "function")
         queueMicrotask(() => cb(err2));
@@ -14153,6 +14165,9 @@ async function bootKernel(opts) {
   const hostSetInterval = globalThis.setInterval?.bind(globalThis) ?? ((cb, ms) => setInterval(cb, ms));
   const hostClearInterval = globalThis.clearInterval?.bind(globalThis) ?? ((t) => clearInterval(t));
   installNetPendingGlobalFetch();
+  if (typeof globalThis.SharedArrayBuffer === "undefined") {
+    globalThis.SharedArrayBuffer = ArrayBuffer;
+  }
   const vfs = opts.vfs ?? new Vfs;
   const cwd = opts.cwd ?? "/home/project";
   vfs.mkdir("/home", true);

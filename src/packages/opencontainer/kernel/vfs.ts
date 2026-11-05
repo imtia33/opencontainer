@@ -427,7 +427,12 @@ export class Vfs {
 
   readlink(p: string): string {
     const node = this.lookup(p, false);
-    if (!node || (node.mode & S_IFMT) !== S_IFLNK) {
+    // node distinguishes the two failures: a MISSING path is ENOENT (what
+    // callers like pnpm's resolveLinkTarget catch to mean "not a link"),
+    // an existing non-symlink is EINVAL. Conflating them made pnpm treat
+    // absent packages as alien modules and try to move them (→ crash).
+    if (!node) throw new VfsError('ENOENT', errnoOf('ENOENT'), 'readlink', p);
+    if ((node.mode & S_IFMT) !== S_IFLNK) {
       throw new VfsError('EINVAL', errnoOf('EINVAL'), 'readlink', p);
     }
     return node.target ?? '';
