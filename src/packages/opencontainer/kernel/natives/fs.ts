@@ -82,16 +82,27 @@ export function makeFsBinding(ctx: NativesContext): Binding {
     fn: T,
   ) {
     return (...args: any[]) => {
-      const maybeReq = args.length ? args[args.length - 1] : undefined;
-      if (isReq(maybeReq)) {
-        const req = maybeReq as ReqLike;
-        const opArgs = args.slice(0, -1);
+      // The FSReqCallback is NOT always the LAST argument — fs.js's
+      // stat/lstat append `throwIfNoEntry` AFTER the req
+      // (binding.stat(path, bigint, req, throwIfNoEntry), fs.js:2076).
+      // Scan backwards for the first req-like object.
+      let reqIdx = -1;
+      for (let i = args.length - 1; i >= 0; i--) {
+        if (isReq(args[i])) { reqIdx = i; break; }
+      }
+      if (reqIdx >= 0) {
+        const req = args[reqIdx] as ReqLike;
+        const opArgs = args.slice(0, reqIdx).concat(args.slice(reqIdx + 1));
         let result: any;
         try {
           result = fn(...opArgs);
         } catch (e) {
-          const code = uvCode(e);
-          queueMicrotask(() => req.oncomplete?.(code));
+          // node's C++ FSReqCallback::Done converts the uv status into a
+          // proper ErrnoException BEFORE the JS oncomplete runs — raw errno
+          // numbers reaching userland break error handling (cacache's write
+          // stream died on a bare -2).
+          const err = errnoExceptionOf(e, syscall, getPath(opArgs));
+          queueMicrotask(() => req.oncomplete?.(err));
           return;
         }
         queueMicrotask(() => req.oncomplete?.(null, result));
@@ -370,7 +381,7 @@ export function makeFsBinding(ctx: NativesContext): Binding {
     }),
 
     // ---- stat family ----------------------------------------------------------
-    stat: dual('stat', (a) => String(a[0]), (path: string, bigint?: boolean, _req?: any, throwIfNoEntry?: boolean) => {
+    stat: dual('stat', (a) => String(a[0]), (path: string, bigint?: boolean, throwIfNoEntry?: boolean) => {
       try {
         return statFields(String(path), true, bigint === true);
       } catch (e) {
@@ -378,7 +389,7 @@ export function makeFsBinding(ctx: NativesContext): Binding {
         throw e;
       }
     }),
-    lstat: dual('lstat', (a) => String(a[0]), (path: string, bigint?: boolean, _req?: any, throwIfNoEntry?: boolean) => {
+    lstat: dual('lstat', (a) => String(a[0]), (path: string, bigint?: boolean, throwIfNoEntry?: boolean) => {
       try {
         return statFields(String(path), false, bigint === true);
       } catch (e) {

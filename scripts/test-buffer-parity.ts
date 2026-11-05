@@ -24,7 +24,7 @@ const hostLog = console.log.bind(console);
 const hostError = console.error.bind(console);
 
 const VENDOR = nodePath.resolve(__dirname, '../src/packages/opencontainer/vendor');
-const NODE_SCRIPT = nodePath.join(__dirname, 'test-buffer-parity.node.js');
+const NODE_SCRIPT = nodePath.join(__dirname, 'test-buffer-parity.node.cjs');
 
 // ---------------------------------------------------------------------------
 // 1. Ground truth from the REAL node binary.

@@ -91,6 +91,64 @@ export function makeUrlBinding(): Binding {
         return undefined;
       }
     },
+    /**
+     * node's C++ bindingUrl.update: apply a component mutation to a href and
+     * return the re-serialized href ('' when the result would be invalid).
+     * Also refreshes the shared urlComponents array — lib/internal/url.js's
+     * setURLContextFromBinding() reads it right after every update.
+     * Action codes mirror lib/internal/url.js updateActions.
+     */
+    update(href: string, action: number, value: string): string {
+      try {
+        const u = new URL(href);
+        switch (action) {
+          case 0: u.protocol = value; break;   // kProtocol
+          case 1: u.host = value; break;       // kHost
+          case 2: u.hostname = value; break;   // kHostname
+          case 3: u.port = value; break;       // kPort
+          case 4: u.username = value; break;   // kUsername
+          case 5: u.password = value; break;   // kPassword
+          case 6: u.pathname = value; break;   // kPathname
+          case 7: u.search = value; break;     // kSearch
+          case 8: u.hash = value; break;       // kHash
+          case 9: {                            // kHref (must be absolute)
+            const u2 = new URL(value);
+            const c2 = computeComponents(u2.href, u2);
+            for (let i = 0; i < 9; i++) urlComponents[i] = c2[i];
+            return u2.href;
+          }
+        }
+        const c = computeComponents(u.href, u);
+        for (let i = 0; i < 9; i++) urlComponents[i] = c[i];
+        return u.href;
+      } catch {
+        return '';
+      }
+    },
+    /**
+     * node's bindingUrl.format: re-serialize a href honoring the
+     * fragment/unicode/search/auth flags (node_url.cc Format).
+     * unicode → approximation: the browser serializer keeps punycode ASCII.
+     */
+    format(href: string, fragment: boolean, _unicode: boolean, search: boolean, auth: boolean): string {
+      try {
+        const u = new URL(href);
+        if (!fragment) u.hash = '';
+        if (!search) u.search = '';
+        if (!auth) { u.username = ''; u.password = ''; }
+        return u.href;
+      } catch {
+        return href;
+      }
+    },
+    /** node's bindingUrl.getOrigin: serialized origin ('null' for opaque). */
+    getOrigin(url: any): string {
+      try {
+        return new URL(url?.href ?? String(url)).origin || 'null';
+      } catch {
+        return 'null';
+      }
+    },
     canParse(input: string, base?: string): boolean {
       try {
         if (base !== undefined) new URL(input, base);

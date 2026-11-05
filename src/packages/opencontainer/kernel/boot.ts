@@ -14,6 +14,7 @@ import { NODE_VERSION, VENDOR_ROOT, resolveModuleFile } from './id-map';
 import { wireBuiltinCompile } from './natives/builtins';
 import { makeEsmGraphImporter, fileUrlOf, dirnameOf as esmDirname } from './esm-graph';
 import { installNetPendingGlobalFetch, netPendingCount } from './net-pending';
+import { zlibPendingCount } from './natives/zlib';
 import { installFetchHttpClient, defaultOutboundRewrite } from './http-fetch-client';
 import { transformEsmToCjs, RequireAsyncModuleError } from './esm-to-cjs';
 
@@ -729,9 +730,11 @@ export async function bootKernel(opts: BootOptions): Promise<BootedKernel> {
     // P1: in-flight fetches are live handles (a pending op holds the loop in
     // node; a browser fetch must too — see kernel/net-pending.ts).
     const pendingNet = netPendingCount();
+    // P1 (zlib): in-flight compression writes are live uv reqs too.
+    const pendingZlib = zlibPendingCount();
     return pendingTimers === 0 && pendingImmediates === 0 && !stdinReading
       && openPipes === 0 && openTcp === 0 && liveChildren === 0
-      && pendingNet === 0;
+      && pendingNet === 0 && pendingZlib === 0;
   }
 
   /** True while this process owns live OS-like resources (open pipes,
@@ -746,7 +749,8 @@ export async function bootKernel(opts: BootOptions): Promise<BootedKernel> {
       || ((tcpB.activeTcpCount?.() ?? 0) > 0)
       || ((procB.activeChildCount?.() ?? 0) > 0)
       || (ttyB.stdinReading?.() ?? false)
-      || netPendingCount() > 0;
+      || netPendingCount() > 0
+      || zlibPendingCount() > 0;
   }
 
   /** Deliver a signal to this process, node's JS-visible semantics: a

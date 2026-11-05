@@ -3,7 +3,7 @@
  * OpenContainer — buffer/fs binding parity GROUND TRUTH (real node side).
  *
  * Run with the sandbox's real node binary:
- *   node scripts/test-buffer-parity.node.js
+ *   node scripts/test-buffer-parity.node.cjs
  *
  * Computes ~44 behavioral cases with REAL node Buffers + fs and prints one
  * JSON object (case id → serialized result) on stdout. The companion script

@@ -1,7 +1,7 @@
 {
   "name": "opencontainer",
   "version": "1.0.0-beta.1",
-  "description": "Browser-native Node.js runtime — real Node v26 lib tree, the real npm CLI, OPFS-backed VFS, and preview networking, running entirely in the browser. Open-source WebContainers alternative.",
+  "description": "Browser-native Node.js runtime \u2014 real Node v26 lib tree, the real npm CLI, OPFS-backed VFS, and preview networking, running entirely in the browser. Open-source WebContainers alternative.",
   "type": "module",
   "license": "MIT",
   "private": false,
@@ -59,13 +59,16 @@
     "build:kernel": "bash scripts/build-opencontainer.sh",
     "build:dist": "bun run scripts/build-dist.ts",
     "test:harness": "bun run scripts/npm-harness.ts -v",
-    "test:buffer-parity": "bun run scripts/test-buffer-parity.ts && node scripts/test-buffer-parity.node.js",
+    "test:buffer-parity": "bun run scripts/test-buffer-parity.ts && node scripts/test-buffer-parity.node.cjs",
     "test:http-client": "bun run scripts/test-http-client.ts",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "test:zlib": "bun run scripts/test-zlib.ts",
+    "test:npm-real": "bun run scripts/test-npm-real.ts"
   },
   "dependencies": {},
   "devDependencies": {
     "bun-types": "^1.3.4",
+    "fflate": "^0.8.3",
     "typescript": "^5"
   }
 }

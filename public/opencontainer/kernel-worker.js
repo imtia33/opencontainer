@@ -4753,16 +4753,22 @@ function makeFsBinding(ctx) {
   }
   function dual(syscall, getPath, fn) {
     return (...args) => {
-      const maybeReq = args.length ? args[args.length - 1] : undefined;
-      if (isReq(maybeReq)) {
-        const req = maybeReq;
-        const opArgs = args.slice(0, -1);
+      let reqIdx = -1;
+      for (let i = args.length - 1;i >= 0; i--) {
+        if (isReq(args[i])) {
+          reqIdx = i;
+          break;
+        }
+      }
+      if (reqIdx >= 0) {
+        const req = args[reqIdx];
+        const opArgs = args.slice(0, reqIdx).concat(args.slice(reqIdx + 1));
         let result;
         try {
           result = fn(...opArgs);
         } catch (e) {
-          const code = uvCode(e);
-          queueMicrotask(() => req.oncomplete?.(code));
+          const err = errnoExceptionOf(e, syscall, getPath(opArgs));
+          queueMicrotask(() => req.oncomplete?.(err));
           return;
         }
         queueMicrotask(() => req.oncomplete?.(null, result));
@@ -4997,7 +5003,7 @@ function makeFsBinding(ctx) {
       }
       return total;
     }),
-    stat: dual("stat", (a) => String(a[0]), (path, bigint, _req, throwIfNoEntry) => {
+    stat: dual("stat", (a) => String(a[0]), (path, bigint, throwIfNoEntry) => {
       try {
         return statFields(String(path), true, bigint === true);
       } catch (e) {
@@ -5006,7 +5012,7 @@ function makeFsBinding(ctx) {
         throw e;
       }
     }),
-    lstat: dual("lstat", (a) => String(a[0]), (path, bigint, _req, throwIfNoEntry) => {
+    lstat: dual("lstat", (a) => String(a[0]), (path, bigint, throwIfNoEntry) => {
       try {
         return statFields(String(path), false, bigint === true);
       } catch (e) {
@@ -6861,6 +6867,76 @@ function makeUrlBinding() {
         if (raiseException === true)
           throw e;
         return;
+      }
+    },
+    update(href, action, value) {
+      try {
+        const u = new URL(href);
+        switch (action) {
+          case 0:
+            u.protocol = value;
+            break;
+          case 1:
+            u.host = value;
+            break;
+          case 2:
+            u.hostname = value;
+            break;
+          case 3:
+            u.port = value;
+            break;
+          case 4:
+            u.username = value;
+            break;
+          case 5:
+            u.password = value;
+            break;
+          case 6:
+            u.pathname = value;
+            break;
+          case 7:
+            u.search = value;
+            break;
+          case 8:
+            u.hash = value;
+            break;
+          case 9: {
+            const u2 = new URL(value);
+            const c2 = computeComponents(u2.href, u2);
+            for (let i = 0;i < 9; i++)
+              urlComponents[i] = c2[i];
+            return u2.href;
+          }
+        }
+        const c = computeComponents(u.href, u);
+        for (let i = 0;i < 9; i++)
+          urlComponents[i] = c[i];
+        return u.href;
+      } catch {
+        return "";
+      }
+    },
+    format(href, fragment, _unicode, search, auth) {
+      try {
+        const u = new URL(href);
+        if (!fragment)
+          u.hash = "";
+        if (!search)
+          u.search = "";
+        if (!auth) {
+          u.username = "";
+          u.password = "";
+        }
+        return u.href;
+      } catch {
+        return href;
+      }
+    },
+    getOrigin(url) {
+      try {
+        return new URL(url?.href ?? String(url)).origin || "null";
+      } catch {
+        return "null";
       }
     },
     canParse(input, base) {
@@ -9976,6 +10052,74 @@ function makeMiscBindings() {
 }
 
 // src/packages/opencontainer/kernel/natives/zlib.ts
+init_browser();
+var zlibPending = 0;
+function zlibPendingCount() {
+  return zlibPending;
+}
+var Z_SYNC_FLUSH = 2;
+var Z_FULL_FLUSH = 3;
+var Z_FINISH = 4;
+var Z_BLOCK = 5;
+var Z_TREES = 6;
+var MODE_DEFLATE = 1;
+var MODE_INFLATE = 2;
+var MODE_GZIP = 3;
+var MODE_GUNZIP = 4;
+var MODE_DEFLATERAW = 5;
+var MODE_INFLATERAW = 6;
+var MODE_UNZIP = 7;
+var EMPTY = new Uint8Array(0);
+function makeUnzipAutoStream() {
+  const wrapper = {
+    ondata: null,
+    _buf: [],
+    _bufLen: 0,
+    _inner: null,
+    push(chunk, final) {
+      if (this._inner)
+        return this._inner.push(chunk, final);
+      if (chunk.length > 0) {
+        this._buf.push(chunk);
+        this._bufLen += chunk.length;
+      }
+      if (this._bufLen < 2) {
+        if (final) {
+          const inner2 = new Unzlib;
+          inner2.ondata = (d) => {
+            if (d && d.length)
+              wrapper.ondata?.(d);
+          };
+          this._inner = inner2;
+          for (const c of this._buf)
+            inner2.push(c, false);
+          inner2.push(EMPTY, true);
+        }
+        return;
+      }
+      const head = new Uint8Array(2);
+      let n = 0;
+      for (const c of this._buf) {
+        const take = Math.min(c.length, 2 - n);
+        head.set(c.subarray(0, take), n);
+        n += take;
+        if (n >= 2)
+          break;
+      }
+      const inner = head[0] === 31 && head[1] === 139 ? new Gunzip : new Unzlib;
+      inner.ondata = (d) => {
+        if (d && d.length)
+          wrapper.ondata?.(d);
+      };
+      this._inner = inner;
+      for (const c of this._buf)
+        inner.push(c, false);
+      if (final)
+        inner.push(EMPTY, true);
+    }
+  };
+  return wrapper;
+}
 var CRC_TABLE = new Uint32Array(256);
 for (let n = 0;n < 256; n++) {
   let c = n;
@@ -9984,52 +10128,210 @@ for (let n = 0;n < 256; n++) {
   CRC_TABLE[n] = c >>> 0;
 }
 function crc32(data, value = 0) {
-  let crc = value >>> 0 ^ 4294967295;
+  let crc2 = value >>> 0 ^ 4294967295;
   const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
-  for (let i = 0;i < bytes.length; i++) {
-    crc = CRC_TABLE[(crc ^ bytes[i]) & 255] ^ crc >>> 8;
+  for (let i2 = 0;i2 < bytes.length; i2++) {
+    crc2 = CRC_TABLE[(crc2 ^ bytes[i2]) & 255] ^ crc2 >>> 8;
   }
-  return (crc ^ 4294967295) >>> 0;
+  return (crc2 ^ 4294967295) >>> 0;
 }
-var STUB_MESSAGE = "OpenContainer: node:zlib compression streams are not implemented yet " + "(S3 — fflate-backed Zlib handle protocol). crc32 is real; require('zlib') " + "loads; every compression operation throws.";
-
-class ZlibHandleBase {
-  mode;
-  constructor(mode) {
-    this.mode = mode;
-  }
-  onerror = null;
-  init(..._args) {
-    const err = new Error(STUB_MESSAGE);
-    err.code = "ENOSYS";
-    err.errno = 38;
-    throw err;
-  }
-}
-
-class ZlibHandle extends ZlibHandleBase {
-}
-
-class BrotliDecoderHandle extends ZlibHandleBase {
-}
-
-class BrotliEncoderHandle extends ZlibHandleBase {
-}
-
-class ZstdCompressHandle extends ZlibHandleBase {
-}
-
-class ZstdDecompressHandle extends ZlibHandleBase {
-}
+var BROTLI_ZSTD_STUB = "OpenContainer: node:zlib Brotli/Zstd streams are not implemented (no " + "browser-side brotli/zstd codec is vendored). DEFLATE/GZIP/RAW/UNZIP are real.";
 function makeZlibBinding() {
+  const zerr = (e) => {
+    const message = String(e?.message ?? e ?? "zlib error");
+    return { message: `OpenContainer: ${message}`, errno: -3, code: "Z_DATA_ERROR" };
+  };
+
+  class HandleBase {
+    onerror = null;
+    writeState = null;
+    processCb = null;
+    rejectGarbageAfterEnd = false;
+    pending = [];
+    finished = false;
+    closed = false;
+    init(_windowBits, _level, _memLevel, _strategy, writeState, processCallback, _dictionary, rejectGarbageAfterEnd) {
+      this.writeState = writeState;
+      this.processCb = processCallback;
+      this.rejectGarbageAfterEnd = rejectGarbageAfterEnd === true;
+    }
+    drain(out, outOff, outLen) {
+      let copied = 0;
+      while (this.pending.length > 0 && copied < outLen) {
+        const head = this.pending[0];
+        const take = Math.min(head.length, outLen - copied);
+        if (take === head.length) {
+          out.set(head, outOff + copied);
+          this.pending.shift();
+        } else {
+          out.set(head.subarray(0, take), outOff + copied);
+          this.pending[0] = head.subarray(take);
+        }
+        copied += take;
+      }
+      if (this.writeState) {
+        this.writeState[0] = outLen - copied;
+        this.writeState[1] = 0;
+      }
+    }
+    raise(e) {
+      const { message, errno, code } = zerr(e);
+      this.onerror?.(message, errno, code);
+      const err2 = new Error(message);
+      err2.errno = errno;
+      err2.code = code;
+      throw err2;
+    }
+    close() {
+      this.closed = true;
+      this.pending = [];
+    }
+    reset() {
+      this.pending = [];
+      this.finished = false;
+    }
+    params(_level, _strategy) {}
+  }
+
+  class ZlibHandle extends HandleBase {
+    mode;
+    stream = null;
+    opts;
+    constructor(mode) {
+      super();
+      this.mode = mode;
+    }
+    init(windowBits, level, memLevel, strategy, writeState, processCallback, dictionary, rejectGarbageAfterEnd) {
+      super.init(windowBits, level, memLevel, strategy, writeState, processCallback, dictionary, rejectGarbageAfterEnd);
+      const opts = {};
+      if (typeof level === "number" && level >= 0 && level <= 9)
+        opts.level = level;
+      if (dictionary && dictionary.byteLength > 0) {
+        opts.dictionary = dictionary instanceof Uint8Array ? dictionary : new Uint8Array(dictionary);
+      }
+      this.opts = opts;
+      this.stream = this.makeStream(opts);
+    }
+    makeStream(opts) {
+      let stream;
+      switch (this.mode) {
+        case MODE_DEFLATE:
+          stream = new Zlib(opts);
+          break;
+        case MODE_INFLATE:
+          stream = new Unzlib(opts);
+          break;
+        case MODE_GZIP:
+          stream = new Gzip(opts);
+          break;
+        case MODE_GUNZIP:
+          stream = new Gunzip(opts);
+          break;
+        case MODE_DEFLATERAW:
+          stream = new Deflate(opts);
+          break;
+        case MODE_INFLATERAW:
+          stream = new Inflate(opts);
+          break;
+        case MODE_UNZIP:
+          stream = makeUnzipAutoStream();
+          break;
+        default: {
+          const err2 = new Error(`OpenContainer: unsupported zlib mode ${this.mode}`);
+          err2.code = "ENOSYS";
+          throw err2;
+        }
+      }
+      stream.ondata = (data) => {
+        if (data && data.length > 0)
+          this.pending.push(data);
+      };
+      return stream;
+    }
+    process(flushFlag, in_, inOff, inLen) {
+      if (this.closed || !this.stream)
+        return;
+      const chunk = inLen > 0 ? in_.subarray(inOff, inOff + inLen) : EMPTY;
+      if (this.finished) {
+        if (chunk.length > 0 && this.rejectGarbageAfterEnd) {
+          this.onerror?.("OpenContainer: trailing junk after end of stream", -3, "ERR_TRAILING_JUNK_AFTER_STREAM_END");
+        }
+        return;
+      }
+      const final = flushFlag === Z_FINISH;
+      try {
+        if (final) {
+          this.stream.push(chunk, true);
+          this.finished = true;
+        } else if (chunk.length > 0) {
+          this.stream.push(chunk, false);
+        }
+        if (!final && this.mode !== MODE_INFLATE && this.mode !== MODE_GUNZIP && this.mode !== MODE_INFLATERAW && this.mode !== MODE_UNZIP && (flushFlag === Z_SYNC_FLUSH || flushFlag === Z_FULL_FLUSH || flushFlag === Z_BLOCK || flushFlag === Z_TREES) && typeof this.stream.flush === "function") {
+          this.stream.flush(flushFlag === Z_SYNC_FLUSH);
+        }
+      } catch (e) {
+        this.finished = true;
+        this.raise(e);
+      }
+    }
+    write(flushFlag, in_, inOff, inLen, out, outOff, outLen) {
+      try {
+        this.process(flushFlag, in_, inOff, inLen);
+      } catch {
+        this.drain(out, outOff, 0);
+        this.writeState[0] = outLen;
+        this.writeState[1] = 0;
+        const cb2 = this.processCb;
+        if (cb2) {
+          zlibPending++;
+          queueMicrotask(() => {
+            zlibPending--;
+            cb2.call(this);
+          });
+        }
+        return;
+      }
+      this.drain(out, outOff, outLen);
+      const cb = this.processCb;
+      if (cb) {
+        zlibPending++;
+        queueMicrotask(() => {
+          zlibPending--;
+          cb.call(this);
+        });
+      }
+    }
+    writeSync(flushFlag, in_, inOff, inLen, out, outOff, outLen) {
+      this.process(flushFlag, in_, inOff, inLen);
+      this.drain(out, outOff, outLen);
+    }
+    reset() {
+      super.reset();
+      if (this.opts !== undefined)
+        this.stream = this.makeStream(this.opts);
+    }
+    params(level, _strategy) {
+      if (this.stream?.o && typeof level === "number")
+        this.stream.o.level = level;
+    }
+  }
+
+  class EnosysHandle {
+    onerror = null;
+    init(..._args) {
+      const err2 = new Error(BROTLI_ZSTD_STUB);
+      err2.code = "ENOSYS";
+      err2.errno = 38;
+      throw err2;
+    }
+  }
   return {
     crc32,
     Zlib: ZlibHandle,
-    BrotliDecoder: BrotliDecoderHandle,
-    BrotliEncoder: BrotliEncoderHandle,
-    ZstdCompress: ZstdCompressHandle,
-    ZstdDecompress: ZstdDecompressHandle,
-    zlibConstants: {}
+    BrotliDecoder: EnosysHandle,
+    BrotliEncoder: EnosysHandle,
+    ZstdCompress: EnosysHandle,
+    ZstdDecompress: EnosysHandle
   };
 }
 
@@ -10273,9 +10575,9 @@ function makePipeWrapBinding(ctx) {
     getAsyncId() {
       return nextAsyncId();
     }
-    open(fd) {
-      this.fd = fd;
-      const mode = ctx.stdio?.[fd];
+    open(fd2) {
+      this.fd = fd2;
+      const mode = ctx.stdio?.[fd2];
       if (mode && mode.type === "pipe" && mode.pipeId !== undefined) {
         this.pipeId = mode.pipeId;
         registry3.set(this.pipeId, this);
@@ -10301,8 +10603,8 @@ function makePipeWrapBinding(ctx) {
     }
     writeLatin1String(req, data) {
       const bytes = new Uint8Array(data.length);
-      for (let i = 0;i < data.length; i++)
-        bytes[i] = data.charCodeAt(i) & 255;
+      for (let i2 = 0;i2 < data.length; i2++)
+        bytes[i2] = data.charCodeAt(i2) & 255;
       this.out(bytes);
       return 0;
     }
@@ -10349,15 +10651,15 @@ function makePipeWrapBinding(ctx) {
     getpeername() {
       return { address: "127.0.0.1", port: 0, family: 2 };
     }
-    setBlocking(_b) {
+    setBlocking(_b2) {
       return 0;
     }
     bind(name, _flags) {
       return uvErr("EACCES", `pipe bind(${name}) — unix domain sockets are not supported`);
     }
     connect(req, _name) {
-      const err = uvErr("EACCES", "pipe connect — unix domain sockets are not supported");
-      queueMicrotask(() => req?.oncomplete?.(err));
+      const err2 = uvErr("EACCES", "pipe connect — unix domain sockets are not supported");
+      queueMicrotask(() => req?.oncomplete?.(err2));
       return 0;
     }
     fchmod(_mode) {
@@ -10492,7 +10794,7 @@ function makeTcpWrapBinding(ctx) {
         return -9;
       let port = this.localPort;
       if (port === 0) {
-        for (let i = 0;i < 200; i++) {
+        for (let i2 = 0;i2 < 200; i2++) {
           const candidate = 40000 + Math.floor(Math.random() * 20000);
           if (!portsInUse.has(candidate)) {
             port = candidate;
@@ -10517,11 +10819,11 @@ function makeTcpWrapBinding(ctx) {
       servers.delete(Number(listenId));
       portsInUse.delete(server.localPort);
       const owner = server[OWNER];
-      const err = new Error(`listen EADDRINUSE :::${server.localPort}`);
-      err.code = "EADDRINUSE";
-      err.errno = -98;
-      err.syscall = "listen";
-      owner?.emit?.("error", err);
+      const err2 = new Error(`listen EADDRINUSE :::${server.localPort}`);
+      err2.code = "EADDRINUSE";
+      err2.errno = -98;
+      err2.syscall = "listen";
+      owner?.emit?.("error", err2);
     }
     connect(req, address, port) {
       return this.connectInternal(req, address, port);
@@ -10578,8 +10880,8 @@ function makeTcpWrapBinding(ctx) {
     }
     writeLatin1String(req, data) {
       const bytes = new Uint8Array(data.length);
-      for (let i = 0;i < data.length; i++)
-        bytes[i] = data.charCodeAt(i) & 255;
+      for (let i2 = 0;i2 < data.length; i2++)
+        bytes[i2] = data.charCodeAt(i2) & 255;
       this.out(bytes);
       return 0;
     }
@@ -10736,12 +11038,12 @@ function makeTcpWrapBinding(ctx) {
       servers.delete(Number(listenId));
       portsInUse.delete(server.localPort);
       const owner = server[OWNER];
-      const err = new Error(`listen EADDRINUSE :::${server.localPort}`);
-      err.code = "EADDRINUSE";
-      err.errno = -98;
-      err.syscall = "listen";
+      const err2 = new Error(`listen EADDRINUSE :::${server.localPort}`);
+      err2.code = "EADDRINUSE";
+      err2.errno = -98;
+      err2.syscall = "listen";
       try {
-        owner?.emit?.("error", err);
+        owner?.emit?.("error", err2);
       } catch {}
     },
     acceptConnection(port, connId, remotePort) {
@@ -10811,7 +11113,7 @@ var METHODS = [
   "UNSUBSCRIBE"
 ];
 var ALL_METHODS = [...METHODS, "PRI"];
-var METHOD_INDEX = new Map(METHODS.map((m, i) => [m, i]));
+var METHOD_INDEX = new Map(METHODS.map((m, i2) => [m, i2]));
 var K_ON_MESSAGE_BEGIN = 0;
 var K_ON_HEADERS = 1;
 var K_ON_HEADERS_COMPLETE = 2;
@@ -10828,9 +11130,9 @@ var S_BODY_CHUNK_CRLF = 5;
 var S_TRAILERS = 6;
 var MAX_HEADER_BYTES_DEFAULT = 16 * 1024;
 function parseError(code, message) {
-  const err = new Error(message);
-  err.code = "HPE_" + code;
-  return err;
+  const err2 = new Error(message);
+  err2.code = "HPE_" + code;
+  return err2;
 }
 var latin1Decoder = typeof TextDecoder !== "undefined" ? new TextDecoder("latin1") : null;
 function latin1Range(buf, from, to) {
@@ -10842,8 +11144,8 @@ function latin1Range(buf, from, to) {
     } catch {}
   }
   let out = "";
-  for (let i = from;i < to; i++)
-    out += String.fromCharCode(buf[i]);
+  for (let i2 = from;i2 < to; i2++)
+    out += String.fromCharCode(buf[i2]);
   return out;
 }
 
@@ -10983,9 +11285,9 @@ class HTTPParser {
         if (line === null)
           return buf.length;
         if (line.line === "") {
-          const err = this.completeHeaders();
-          if (err)
-            return err;
+          const err2 = this.completeHeaders();
+          if (err2)
+            return err2;
           return line.nextPos;
         }
         this.headerBytes += line.line.length + 2;
@@ -11067,12 +11369,12 @@ class HTTPParser {
   }
   takeLine(buf, pos) {
     let idx = -1;
-    for (let i = pos;i < buf.length; i++) {
-      if (buf[i] !== 13)
+    for (let i2 = pos;i2 < buf.length; i2++) {
+      if (buf[i2] !== 13)
         continue;
-      if (i + 1 < buf.length) {
-        if (buf[i + 1] === 10) {
-          idx = i;
+      if (i2 + 1 < buf.length) {
+        if (buf[i2 + 1] === 10) {
+          idx = i2;
           break;
         }
         continue;
@@ -11127,9 +11429,9 @@ class HTTPParser {
   headersAccum = [];
   headerValue(name) {
     const lower = name.toLowerCase();
-    for (let i = 0;i + 1 < this.headersAccum.length; i += 2) {
-      if (this.headersAccum[i].toLowerCase() === lower)
-        return this.headersAccum[i + 1];
+    for (let i2 = 0;i2 + 1 < this.headersAccum.length; i2 += 2) {
+      if (this.headersAccum[i2].toLowerCase() === lower)
+        return this.headersAccum[i2 + 1];
     }
     return;
   }
@@ -11137,8 +11439,8 @@ class HTTPParser {
     if (this.type === HTTPParser.REQUEST && this.upgradeRequested()) {
       this.upgrade = true;
     }
-    const te = (this.headerValue("transfer-encoding") ?? "").toLowerCase();
-    const isChunked = te.includes("chunked");
+    const te2 = (this.headerValue("transfer-encoding") ?? "").toLowerCase();
+    const isChunked = te2.includes("chunked");
     const clRaw = this.headerValue("content-length");
     const skip = this.dispatchHeadersComplete();
     if (skip !== 0) {
@@ -11532,16 +11834,16 @@ function makeHttp2Binding() {
     },
     Http2Session: class Http2Session {
       constructor(_type) {
-        const err = new Error("HTTP/2 sessions are not implemented in the browser runtime");
-        err.code = "ERR_HTTP2_SUPPORT";
-        throw err;
+        const err2 = new Error("HTTP/2 sessions are not implemented in the browser runtime");
+        err2.code = "ERR_HTTP2_SUPPORT";
+        throw err2;
       }
     },
     Http2Stream: class Http2Stream {
       constructor() {
-        const err = new Error("HTTP/2 sessions are not implemented in the browser runtime");
-        err.code = "ERR_HTTP2_SUPPORT";
-        throw err;
+        const err2 = new Error("HTTP/2 sessions are not implemented in the browser runtime");
+        err2.code = "ERR_HTTP2_SUPPORT";
+        throw err2;
       }
     }
   };
@@ -11552,9 +11854,9 @@ function makeStreamPipeBinding() {
   return {
     StreamPipe: class StreamPipe {
       constructor() {
-        const err = new Error("stream_pipe: StreamPipe is not implemented in the browser runtime " + "(only reachable from HTTP/2 session piping, which requires sockets)");
-        err.code = "ERR_NOT_IMPLEMENTED";
-        throw err;
+        const err2 = new Error("stream_pipe: StreamPipe is not implemented in the browser runtime " + "(only reachable from HTTP/2 session piping, which requires sockets)");
+        err2.code = "ERR_NOT_IMPLEMENTED";
+        throw err2;
       }
     }
   };
@@ -11696,25 +11998,25 @@ ${source}
 
 // src/packages/opencontainer/kernel/esm-graph.ts
 function moduleNotFound(spec, parent) {
-  const err = new Error(`Cannot find module '${spec}' imported from ${parent}`);
-  err.code = "ERR_MODULE_NOT_FOUND";
-  return err;
+  const err2 = new Error(`Cannot find module '${spec}' imported from ${parent}`);
+  err2.code = "ERR_MODULE_NOT_FOUND";
+  return err2;
 }
 function packagePathNotExported(spec, parent) {
-  const err = new Error(`Package subpath '${spec}' is not defined by "exports" in its package.json, imported from ${parent}`);
-  err.code = "ERR_PACKAGE_PATH_NOT_EXPORTED";
-  return err;
+  const err2 = new Error(`Package subpath '${spec}' is not defined by "exports" in its package.json, imported from ${parent}`);
+  err2.code = "ERR_PACKAGE_PATH_NOT_EXPORTED";
+  return err2;
 }
 function invalidModuleSpecifier(spec, reason) {
-  const err = new Error(`Invalid module specifier '${spec}' ${reason}`);
-  err.code = "ERR_INVALID_MODULE_SPECIFIER";
-  return err;
+  const err2 = new Error(`Invalid module specifier '${spec}' ${reason}`);
+  err2.code = "ERR_INVALID_MODULE_SPECIFIER";
+  return err2;
 }
 function dirnameOf(p) {
-  const i = p.lastIndexOf("/");
-  if (i <= 0)
+  const i2 = p.lastIndexOf("/");
+  if (i2 <= 0)
     return "/";
-  return p.slice(0, i);
+  return p.slice(0, i2);
 }
 function normalizeJoin(base, rel) {
   const out = [];
@@ -11998,17 +12300,17 @@ class Resolver {
     let pkgName = spec;
     let subpath = "";
     if (spec.startsWith("@")) {
-      const i = spec.indexOf("/");
-      const j = i >= 0 ? spec.indexOf("/", i + 1) : -1;
+      const i2 = spec.indexOf("/");
+      const j = i2 >= 0 ? spec.indexOf("/", i2 + 1) : -1;
       if (j >= 0) {
         pkgName = spec.slice(0, j);
         subpath = spec.slice(j + 1);
       }
     } else {
-      const i = spec.indexOf("/");
-      if (i >= 0) {
-        pkgName = spec.slice(0, i);
-        subpath = spec.slice(i + 1);
+      const i2 = spec.indexOf("/");
+      if (i2 >= 0) {
+        pkgName = spec.slice(0, i2);
+        subpath = spec.slice(i2 + 1);
       }
     }
     let dir = fromDir;
@@ -12128,9 +12430,9 @@ function makeEsmGraphImporter(deps) {
       });
     } catch (e) {
       const loc = e?.loc ? `:${e.loc.line}:${e.loc.column}` : "";
-      const err = new Error(`${path}${loc}: ${e?.message ?? String(e)}`);
-      err.code = "ERR_MODULE_SYNTAX";
-      throw err;
+      const err2 = new Error(`${path}${loc}: ${e?.message ?? String(e)}`);
+      err2.code = "ERR_MODULE_SYNTAX";
+      throw err2;
     }
   }
   function collectStaticSpecifiers(ast) {
@@ -12241,9 +12543,9 @@ export default __m;
     try {
       data = JSON.parse(readUtf8(p));
     } catch (e) {
-      const err = new Error(`Cannot parse JSON module '${p}': ${e?.message ?? e}`);
-      err.code = "ERR_INVALID_JSON";
-      throw err;
+      const err2 = new Error(`Cannot parse JSON module '${p}': ${e?.message ?? e}`);
+      err2.code = "ERR_INVALID_JSON";
+      throw err2;
     }
     const keys = data && typeof data === "object" && !Array.isArray(data) ? Object.keys(data).filter(isSafeIdent) : [];
     let text = `const __j = globalThis.__ocEsmJson(${JSON.stringify(p)});
@@ -12330,14 +12632,14 @@ export default __j;
     armImport();
     try {
       await import(url);
-    } catch (err) {
-      if (err instanceof SyntaxError || /Invalid or unexpected token|Unexpected token|is not defined/.test(String(err?.message ?? ""))) {
-        const better = new SyntaxError(`${err.message} [while evaluating module ${url}]`);
-        better.code = err?.code;
-        better.cause = err;
+    } catch (err2) {
+      if (err2 instanceof SyntaxError || /Invalid or unexpected token|Unexpected token|is not defined/.test(String(err2?.message ?? ""))) {
+        const better = new SyntaxError(`${err2.message} [while evaluating module ${url}]`);
+        better.code = err2?.code;
+        better.cause = err2;
         throw better;
       }
-      throw err;
+      throw err2;
     } finally {
       disarmImport();
     }
@@ -12384,9 +12686,9 @@ function wrapFetchForNetPending(fetchImpl) {
     let p;
     try {
       p = Promise.resolve(fetchImpl(input, init));
-    } catch (err) {
+    } catch (err2) {
       pending--;
-      throw err;
+      throw err2;
     }
     return p.finally(() => {
       pending--;
@@ -12434,21 +12736,21 @@ function toBytes2(chunk, encoding) {
     const enc = String(encoding ?? "utf8").toLowerCase();
     if (enc === "latin1" || enc === "binary") {
       const out = new Uint8Array(chunk.length);
-      for (let i = 0;i < chunk.length; i++)
-        out[i] = chunk.charCodeAt(i) & 255;
+      for (let i2 = 0;i2 < chunk.length; i2++)
+        out[i2] = chunk.charCodeAt(i2) & 255;
       return out;
     }
     if (enc === "base64") {
       const bin = atob(chunk);
       const out = new Uint8Array(bin.length);
-      for (let i = 0;i < bin.length; i++)
-        out[i] = bin.charCodeAt(i);
+      for (let i2 = 0;i2 < bin.length; i2++)
+        out[i2] = bin.charCodeAt(i2);
       return out;
     }
     if (enc === "hex") {
       const out = new Uint8Array(chunk.length >> 1);
-      for (let i = 0;i < out.length; i++) {
-        out[i] = parseInt(chunk.slice(i * 2, i * 2 + 2), 16) || 0;
+      for (let i2 = 0;i2 < out.length; i2++) {
+        out[i2] = parseInt(chunk.slice(i2 * 2, i2 * 2 + 2), 16) || 0;
       }
       return out;
     }
@@ -12476,14 +12778,14 @@ function concatBytes(chunks) {
   return out;
 }
 function nodeError(code, message) {
-  const err = new Error(message);
-  err.code = code;
-  return err;
+  const err2 = new Error(message);
+  err2.code = code;
+  return err2;
 }
-function mapFetchError(err, url) {
-  const e = err;
+function mapFetchError(err2, url) {
+  const e = err2;
   const name = String(e?.name ?? "");
-  const message = String(e?.message ?? err ?? "network error");
+  const message = String(e?.message ?? err2 ?? "network error");
   if (name === "TimeoutError") {
     return nodeError("ETIMEDOUT", `network timeout at: ${url}`);
   }
@@ -12542,9 +12844,9 @@ class TinyEmitter {
   off(event, fn) {
     const list = this._listeners[event];
     if (list) {
-      const i = list.indexOf(fn);
-      if (i >= 0)
-        list.splice(i, 1);
+      const i2 = list.indexOf(fn);
+      if (i2 >= 0)
+        list.splice(i2, 1);
     }
     return this;
   }
@@ -12565,8 +12867,8 @@ class TinyEmitter {
     const list = this._listeners[event];
     if (!list || list.length === 0) {
       if (event === "error") {
-        const err = args[0];
-        console.error(`http-fetch-client: unhandled 'error' event:`, err?.code ?? "", err?.message ?? err);
+        const err2 = args[0];
+        console.error(`http-fetch-client: unhandled 'error' event:`, err2?.code ?? "", err2?.message ?? err2);
       }
       return false;
     }
@@ -12636,6 +12938,8 @@ class FetchIncomingMessage extends TinyEmitter {
     if (response.headers) {
       response.headers.forEach((value, name) => {
         const n = name.toLowerCase();
+        if (n === "content-encoding" || n === "content-length")
+          return;
         (folded[n] ??= []).push(value);
         raw.push(n, value);
       });
@@ -12704,15 +13008,15 @@ class FetchIncomingMessage extends TinyEmitter {
       if (typeof dest.end === "function")
         dest.end();
     });
-    this.on("error", (err) => {
+    this.on("error", (err2) => {
       if (typeof dest.emit === "function")
-        dest.emit("error", err);
+        dest.emit("error", err2);
       else if (typeof dest.destroy === "function")
-        dest.destroy(err);
+        dest.destroy(err2);
     });
     return dest;
   }
-  destroy(err) {
+  destroy(err2) {
     if (this._destroyed)
       return;
     this._destroyed = true;
@@ -12723,8 +13027,8 @@ class FetchIncomingMessage extends TinyEmitter {
         reader.cancel().catch(() => {});
       } catch {}
     }
-    if (err)
-      this.emit("error", err);
+    if (err2)
+      this.emit("error", err2);
     if (!this.complete) {
       this.emit("aborted");
     }
@@ -12787,11 +13091,11 @@ class FetchIncomingMessage extends TinyEmitter {
           this._queue.push(bytes);
       }
       this._finish();
-    } catch (err) {
+    } catch (err2) {
       if (this._destroyed)
         return;
       this._reader = null;
-      this.emit("error", mapFetchError(err, this.url || ""));
+      this.emit("error", mapFetchError(err2, this.url || ""));
       this.emit("close");
     } finally {
       this._pumping = false;
@@ -12875,10 +13179,10 @@ class FetchClientRequest extends TinyEmitter {
       encoding = undefined;
     }
     if (this._ended || this.destroyed) {
-      const err = nodeError("ERR_STREAM_WRITE_AFTER_END", "write after end");
-      this.emit("error", err);
+      const err2 = nodeError("ERR_STREAM_WRITE_AFTER_END", "write after end");
+      this.emit("error", err2);
       if (typeof cb === "function")
-        queueMicrotask(() => cb(err));
+        queueMicrotask(() => cb(err2));
       return false;
     }
     const bytes = toBytes2(chunk, typeof encoding === "string" ? encoding : undefined);
@@ -12926,8 +13230,8 @@ class FetchClientRequest extends TinyEmitter {
   abort() {
     this._destroy(nodeError("ECONNABORTED", `The user aborted a request: ${this._targetUrl || this.path}`));
   }
-  destroy(err) {
-    this._destroy(err ?? nodeError("ECONNABORTED", `The user aborted a request: ${this._targetUrl || this.path}`));
+  destroy(err2) {
+    this._destroy(err2 ?? nodeError("ECONNABORTED", `The user aborted a request: ${this._targetUrl || this.path}`));
   }
   destroySoon() {
     if (!this._ended)
@@ -13031,10 +13335,10 @@ class FetchClientRequest extends TinyEmitter {
       }
       this._armIdle();
       queueMicrotask(() => this._deliverResponse(response));
-    }).catch((err) => {
+    }).catch((err2) => {
       if (this.destroyed || this._errorEmitted)
         return;
-      const mapped = mapFetchError(err, this._targetUrl || absUrl);
+      const mapped = mapFetchError(err2, this._targetUrl || absUrl);
       queueMicrotask(() => this._emitError(mapped));
     });
   }
@@ -13054,14 +13358,14 @@ class FetchClientRequest extends TinyEmitter {
     this.emit("response", res);
     res._start();
   }
-  _emitError(err) {
+  _emitError(err2) {
     if (this._errorEmitted || this._done)
       return;
     this._errorEmitted = true;
-    this.emit("error", err);
+    this.emit("error", err2);
     this._closeAll();
   }
-  _destroy(err) {
+  _destroy(err2) {
     if (this.destroyed)
       return;
     if (this._done) {
@@ -13083,9 +13387,9 @@ class FetchClientRequest extends TinyEmitter {
     if (res && !res.complete) {
       res.destroy();
     }
-    if (err && !this._errorEmitted) {
+    if (err2 && !this._errorEmitted) {
       this._errorEmitted = true;
-      this.emit("error", err);
+      this.emit("error", err2);
     }
     this._closeAll();
   }
@@ -13305,13 +13609,13 @@ function transformEsmToCjs(source, filename, acorn, fileUrl) {
       locations: false,
       ranges: false
     });
-  } catch (err) {
-    if (err instanceof SyntaxError) {
+  } catch (err2) {
+    if (err2 instanceof SyntaxError) {
       try {
-        err.message = `${err.message} at ${filename}`;
+        err2.message = `${err2.message} at ${filename}`;
       } catch {}
     }
-    throw err;
+    throw err2;
   }
   if (hasTopLevelAwait(ast)) {
     throw new RequireAsyncModuleError(filename);
@@ -13489,8 +13793,8 @@ function collectPattern(node, out = []) {
   return out;
 }
 function dirOf(p) {
-  const i = p.lastIndexOf("/");
-  return i <= 0 ? "/" : p.slice(0, i);
+  const i2 = p.lastIndexOf("/");
+  return i2 <= 0 ? "/" : p.slice(0, i2);
 }
 function hasTopLevelAwait(ast) {
   const fnTypes = new Set([
@@ -13776,14 +14080,14 @@ require(${JSON.stringify(requirePath)});
   const drainTicks = () => {
     try {
       runNextTicks?.();
-    } catch (err) {
+    } catch (err2) {
       let handled = false;
       try {
-        handled = typeof process._fatalException === "function" ? process._fatalException(err, false) : false;
+        handled = typeof process._fatalException === "function" ? process._fatalException(err2, false) : false;
       } catch {}
       if (!handled) {
         try {
-          completeFatalExit(err);
+          completeFatalExit(err2);
         } catch {}
       }
     }
@@ -13969,14 +14273,14 @@ require(${JSON.stringify(requirePath)});
   }
   globalThis.__ocBootDebug?.("before-cjs-exec");
   const cjsExecution = execution;
-  function completeFatalExit(err) {
+  function completeFatalExit(err2) {
     if (!process._exiting)
       return false;
     try {
-      const stack = err?.stack ?? String(err);
-      const code = typeof err?.code === "string" ? err.code : null;
+      const stack = err2?.stack ?? String(err2);
+      const code = typeof err2?.code === "string" ? err2.code : null;
       let header = stack;
-      const name = err?.name ?? "Error";
+      const name = err2?.name ?? "Error";
       if (code && !stack.includes(`[${code}]`) && stack.startsWith(`${name}: `)) {
         header = `${name} [${code}]: ${stack.slice(name.length + 2)}`;
       }
@@ -13993,12 +14297,12 @@ Node.js ${NODE_VERSION}
       options.set("--print", true);
     try {
       cjsExecution.evalScript("[eval]", code, false, print === true, false);
-    } catch (err) {
-      const handled = typeof process._fatalException === "function" ? process._fatalException(err, false) : false;
+    } catch (err2) {
+      const handled = typeof process._fatalException === "function" ? process._fatalException(err2, false) : false;
       if (!handled) {
-        if (completeFatalExit(err))
+        if (completeFatalExit(err2))
           return;
-        throw err;
+        throw err2;
       }
     }
     await waitForExitSettled();
@@ -14007,10 +14311,10 @@ Node.js ${NODE_VERSION}
     const mainPath = path.startsWith("/") ? path : vfs.normalize(`${nativesCtx.cwd()}/${path}`);
     process.argv[1] = mainPath;
     const { executeUserEntryPoint } = require2("internal/modules/run_main");
-    const fatalRoute = (err) => {
-      const handled = typeof process._fatalException === "function" ? process._fatalException(err, false) : false;
+    const fatalRoute = (err2) => {
+      const handled = typeof process._fatalException === "function" ? process._fatalException(err2, false) : false;
       if (!handled) {
-        if (completeFatalExit(err))
+        if (completeFatalExit(err2))
           return true;
       }
       return handled;
@@ -14020,9 +14324,9 @@ Node.js ${NODE_VERSION}
       if (r !== null && r !== undefined && typeof r.then === "function") {
         await r;
       }
-    } catch (err) {
-      if (!fatalRoute(err))
-        throw err;
+    } catch (err2) {
+      if (!fatalRoute(err2))
+        throw err2;
     }
     await waitForExitSettled();
   }
@@ -14060,14 +14364,15 @@ Node.js ${NODE_VERSION}
     const openTcp = tcpB.activeTcpCount?.() ?? 0;
     const liveChildren = procB.activeChildCount?.() ?? 0;
     const pendingNet = netPendingCount();
-    return pendingTimers === 0 && pendingImmediates === 0 && !stdinReading && openPipes === 0 && openTcp === 0 && liveChildren === 0 && pendingNet === 0;
+    const pendingZlib = zlibPendingCount();
+    return pendingTimers === 0 && pendingImmediates === 0 && !stdinReading && openPipes === 0 && openTcp === 0 && liveChildren === 0 && pendingNet === 0 && pendingZlib === 0;
   }
   function hasLiveHandles() {
     const pipeB = natives.get("pipe_wrap");
     const tcpB = natives.get("tcp_wrap");
     const procB = natives.get("process_wrap");
     const ttyB = natives.get("tty_wrap");
-    return (pipeB.activePipeCount?.() ?? 0) > 0 || (tcpB.activeTcpCount?.() ?? 0) > 0 || (procB.activeChildCount?.() ?? 0) > 0 || (ttyB.stdinReading?.() ?? false) || netPendingCount() > 0;
+    return (pipeB.activePipeCount?.() ?? 0) > 0 || (tcpB.activeTcpCount?.() ?? 0) > 0 || (procB.activeChildCount?.() ?? 0) > 0 || (ttyB.stdinReading?.() ?? false) || netPendingCount() > 0 || zlibPendingCount() > 0;
   }
   function raiseSignal(sig) {
     try {

@@ -388,11 +388,17 @@ class FetchIncomingMessage extends TinyEmitter {
 
     // headers: fold duplicates with ', ' (node semantics); rawHeaders keep
     // one pair per original header line.
+    // The fetch transport auto-decompresses the body (gzip/deflate/br) and
+    // delivers decoded bytes — so content-encoding (now a lie: the body is
+    // NOT encoded) and content-length (the COMPRESSED length) must be
+    // dropped, or consumers like make-fetch-happen/minipass-fetch gunzip
+    // already-decompressed JSON and die with Z_DATA_ERROR.
     const folded: Record<string, string[]> = Object.create(null);
     const raw: string[] = [];
     if (response.headers) {
       response.headers.forEach((value, name) => {
         const n = name.toLowerCase();
+        if (n === 'content-encoding' || n === 'content-length') return;
         (folded[n] ??= []).push(value);
         raw.push(n, value);
       });
