@@ -113,6 +113,26 @@ const pristineGlobals = (() => {
     clearImmediate: g.clearImmediate,
     Buffer: g.Buffer,
     global: g.global,
+    // Web-stream classes: the kernel installs node's own implementations
+    // (node parity — see the webstreams_globals boot stage); the realm must
+    // get the HOST's (browser-native) classes back on kernel exit.
+    ReadableStream: g.ReadableStream,
+    ReadableStreamDefaultReader: g.ReadableStreamDefaultReader,
+    ReadableStreamBYOBReader: g.ReadableStreamBYOBReader,
+    ReadableStreamBYOBRequest: g.ReadableStreamBYOBRequest,
+    ReadableByteStreamController: g.ReadableByteStreamController,
+    ReadableStreamDefaultController: g.ReadableStreamDefaultController,
+    WritableStream: g.WritableStream,
+    WritableStreamDefaultWriter: g.WritableStreamDefaultWriter,
+    WritableStreamDefaultController: g.WritableStreamDefaultController,
+    TransformStream: g.TransformStream,
+    TransformStreamDefaultController: g.TransformStreamDefaultController,
+    ByteLengthQueuingStrategy: g.ByteLengthQueuingStrategy,
+    CountQueuingStrategy: g.CountQueuingStrategy,
+    TextEncoderStream: g.TextEncoderStream,
+    TextDecoderStream: g.TextDecoderStream,
+    CompressionStream: g.CompressionStream,
+    DecompressionStream: g.DecompressionStream,
   };
 })();
 
@@ -505,6 +525,48 @@ export async function bootKernel(opts: BootOptions): Promise<BootedKernel> {
   const g2 = globalThis as any;
   g2.process = process;
   g2.console = consoleModule;
+
+  // ------------------------------------------------------- web streams
+  // Node parity: real node exposes its OWN webstreams implementations as
+  // the global classes (internal/bootstrap/web/exposed-wildcard.js →
+  // internal/webstreams/*). Keeping the BROWSER's natives instead made
+  // every node-stream ↔ web-stream crossing throw
+  //   ERR_INVALID_ARG_TYPE "transform.readable ... must be an instance of
+  //   ReadableStream. Received an instance of ReadableStream"
+  // (node's symbol brand check vs the browser class) — create-expo-app's
+  // tar extraction died exactly there: a node-adapters ReadableStream
+  // .pipeThrough(new DecompressionStream(...)) with the browser's
+  // DecompressionStream. With node's own classes as globals, both sides
+  // share the brand. TextEncoder/TextDecoder stay native (identical API,
+  // faster); only the STREAM classes swap.
+  try {
+    const readableStreamMod = require('internal/webstreams/readablestream');
+    const writableStreamMod = require('internal/webstreams/writablestream');
+    const transformStreamMod = require('internal/webstreams/transformstream');
+    const queuingStrategiesMod = require('internal/webstreams/queuingstrategies');
+    const webEncodingMod = require('internal/webstreams/encoding');
+    const compressionMod = require('internal/webstreams/compression');
+    g2.ReadableStream = readableStreamMod.ReadableStream;
+    g2.ReadableStreamDefaultReader = readableStreamMod.ReadableStreamDefaultReader;
+    g2.ReadableStreamBYOBReader = readableStreamMod.ReadableStreamBYOBReader;
+    g2.ReadableStreamBYOBRequest = readableStreamMod.ReadableStreamBYOBRequest;
+    g2.ReadableByteStreamController = readableStreamMod.ReadableByteStreamController;
+    g2.ReadableStreamDefaultController = readableStreamMod.ReadableStreamDefaultController;
+    g2.WritableStream = writableStreamMod.WritableStream;
+    g2.WritableStreamDefaultWriter = writableStreamMod.WritableStreamDefaultWriter;
+    g2.WritableStreamDefaultController = writableStreamMod.WritableStreamDefaultController;
+    g2.TransformStream = transformStreamMod.TransformStream;
+    g2.TransformStreamDefaultController = transformStreamMod.TransformStreamDefaultController;
+    g2.ByteLengthQueuingStrategy = queuingStrategiesMod.ByteLengthQueuingStrategy;
+    g2.CountQueuingStrategy = queuingStrategiesMod.CountQueuingStrategy;
+    g2.TextEncoderStream = webEncodingMod.TextEncoderStream;
+    g2.TextDecoderStream = webEncodingMod.TextDecoderStream;
+    g2.CompressionStream = compressionMod.CompressionStream;
+    g2.DecompressionStream = compressionMod.DecompressionStream;
+    __stage('webstreams_globals');
+  } catch (e: any) {
+    (globalThis as any).__ocDebugHook?.(`[webstreams globals failed] ${String(e)}`);
+  }
 
   // ------------------------------------------------------------------ globals
   // Real bootstrap step (C++ does this in node): initialize debuglog env.

@@ -62,7 +62,8 @@
     "test:http-client": "bun run scripts/test-http-client.ts",
     "prepublishOnly": "npm run build",
     "test:zlib": "bun run scripts/test-zlib.ts",
-    "test:npm-real": "bun run scripts/test-npm-real.ts"
+    "test:npm-real": "bun run scripts/test-npm-real.ts",
+    "test:node-api": "bun run scripts/test-node-api.ts"
   },
   "dependencies": {},
   "devDependencies": {

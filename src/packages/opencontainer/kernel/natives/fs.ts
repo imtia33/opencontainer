@@ -171,6 +171,15 @@ export function makeFsBinding(ctx: NativesContext): Binding {
     if (!vfs.exists(path)) {
       throw new VfsError('ENOENT', errnoOf('ENOENT'), 'open', path);
     }
+    // open('w'/'w+') = O_TRUNC: the file is truncated to ZERO bytes at open
+    // (open(2) semantics). Without this, writeFileSync over an existing
+    // LONGER file left the old tail in place (fs.writeFileSync(p, 4 bytes)
+    // over 8 → [new4][old tail]) — the Node API authenticity suite caught
+    // it: every atomic-overwrite writer (write temp + rename is fine, but
+    // direct rewrites are everywhere) depends on truncation.
+    if (flags & 512 /* O_TRUNC */) {
+      try { vfs.writeFile(path, new Uint8Array(0)); } catch { /* not writable (dir) — the later write fails */ }
+    }
     const fd = nextFd++;
     fds.set(fd, { path, flags, pos: 0 });
     return fd;
@@ -496,8 +505,16 @@ export function makeFsBinding(ctx: NativesContext): Binding {
     readFileUtf8(path: string, _flags: number): string {
       return dec.decode(vfs.readFile(String(path)));
     },
-    writeFileUtf8(path: string, data: string, _flags: number, _mode: number): void {
-      vfs.writeFile(String(path), data);
+    writeFileUtf8(path: string, data: string, flags: number, _mode: number): void {
+      // fs.js's writeFileSync/appendFileSync string fast path hands us the
+      // PARSED flags — appendFileSync arrives as O_APPEND ('a' = 1089),
+      // writeFileSync as O_TRUNC ('w' = 577). Honoring them is what makes
+      // appendFileSync append (it used to overwrite: 'x' then 'y' → 'y').
+      if (flags & 1024 /* O_APPEND */) {
+        vfs.appendFile(String(path), data);
+      } else {
+        vfs.writeFile(String(path), data);
+      }
     },
     rmSync(path: string, _maxRetries: number, recursive: boolean, _retryDelay: number): void {
       vfs.rm(String(path), { recursive, force: false });

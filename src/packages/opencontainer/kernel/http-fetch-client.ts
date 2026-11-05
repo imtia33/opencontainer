@@ -380,6 +380,11 @@ class FetchIncomingMessage extends TinyEmitter {
   private _gateResolve: (() => void) | null = null;
   /** Wired by the owning request to re-arm its idle timeout on activity. */
   _touch: (() => void) | null = null;
+  /** setEncoding() state: streaming decoder (utf-8*) or label for
+   *  Buffer-per-chunk decoding — node's IncomingMessage is a Readable,
+   *  and CLIs (create-expo-app telemetry) call res.setEncoding('utf8'). */
+  private _streamDecoder: TextDecoder | null = null;
+  private _encodingLabel: string | null = null;
 
   constructor(response: Response, init: { method: string; url: string; socket: FakeSocket; statusCodes: any }) {
     super();
@@ -415,6 +420,33 @@ class FetchIncomingMessage extends TinyEmitter {
 
     // 204/304/HEAD → response.body is null → immediate 'end'.
     this._reader = response.body ? response.body.getReader() : null;
+  }
+
+  /** node stream.Readable#setEncoding: subsequent 'data' chunks arrive as
+   *  decoded STRINGS instead of Buffers (utf-8* streams through a decoder
+   *  so multi-byte chars split across chunks survive). */
+  setEncoding(enc?: string): void {
+    const label = String(enc ?? 'utf8').toLowerCase();
+    if (label === 'utf8' || label === 'utf-8') {
+      this._streamDecoder = new TextDecoder();
+      this._encodingLabel = null;
+    } else {
+      this._streamDecoder = null;
+      this._encodingLabel = label;
+    }
+  }
+
+  private _emitData(bytes: Uint8Array): void {
+    if (this._streamDecoder) {
+      const text = this._streamDecoder.decode(bytes, { stream: true });
+      if (text) this.emit('data', text);
+      return;
+    }
+    if (this._encodingLabel) {
+      this.emit('data', Buffer.from(bytes).toString(this._encodingLabel as any));
+      return;
+    }
+    this.emit('data', bytes);
   }
 
   /** Called by the owning ClientRequest right after 'response' is emitted. */
@@ -517,7 +549,7 @@ class FetchIncomingMessage extends TinyEmitter {
   private _drainQueue(): void {
     while (this._queue.length > 0 && this._flowing) {
       const chunk = this._queue.shift()!;
-      this.emit('data', chunk);
+      this._emitData(chunk);
     }
   }
   private _schedulePump(): void {
@@ -550,7 +582,7 @@ class FetchIncomingMessage extends TinyEmitter {
         else if (raw?.buffer) bytes = new Uint8Array(raw.buffer, raw.byteOffset ?? 0, raw.byteLength ?? raw.buffer.byteLength);
         else bytes = encoder.encode(String(raw ?? ''));
         this._touch?.();
-        if (this._flowing) this.emit('data', bytes);
+        if (this._flowing) this._emitData(bytes);
         else this._queue.push(bytes);
       }
       this._finish();

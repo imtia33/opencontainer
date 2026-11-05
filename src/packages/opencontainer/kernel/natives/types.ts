@@ -3,9 +3,22 @@ import type { Binding } from './index';
 /** internalBinding('types') — node_types.cc equivalents in pure JS. */
 export function makeTypesBinding(): Binding {
   // SharedArrayBuffer exists ONLY in cross-origin-isolated pages (COOP+COEP).
-  // Referencing the bare global in a plain page throws ReferenceError — guard
-  // it once so non-isolated hosts still boot (SAB features report false).
-  const HAS_SAB = typeof SharedArrayBuffer !== 'undefined';
+  // boot.ts POLYFILLS it (SharedArrayBuffer = ArrayBuffer) on non-isolated
+  // hosts so guest allocation sites don't ReferenceError — under that alias,
+  // `x instanceof SharedArrayBuffer` is TRUE for every ArrayBuffer, which
+  // made node's compression-stream chunk validation reject EVERY chunk as
+  // "SAB-backed" (create-expo-app: ERR_INVALID_ARG_TYPE chunk, an instance
+  // of Uint8Array). Detect the alias at CALL time: only a REAL SAB class
+  // (isolated host, or bun/node harness) can produce a true result.
+  const isRealSABClass = (C: any): boolean =>
+    typeof C === 'function' && C !== (globalThis as any).ArrayBuffer;
+  const HAS_SAB = isRealSABClass((globalThis as any).SharedArrayBuffer);
+  // Named local — node DESTRUCTURES binding functions (`const { isSharedArrayBuffer
+  // } = internalBinding('types')`), so methods must never rely on `this`.
+  const isSharedArrayBufferImpl = (v: any): boolean => {
+    const SAB: any = (globalThis as any).SharedArrayBuffer;
+    return isRealSABClass(SAB) && v instanceof SAB;
+  };
   return {
     isAsyncFunction(fn: any): boolean {
       return typeof fn === 'function' && fn.constructor?.name === 'AsyncFunction';
@@ -41,12 +54,12 @@ export function makeTypesBinding(): Binding {
       return v === null || (typeof v !== 'object' && typeof v !== 'function');
     },
     isAnyArrayBuffer(v: any): boolean {
-      return v instanceof ArrayBuffer || (HAS_SAB && v instanceof SharedArrayBuffer);
+      // Aliased-SAB worlds: ArrayBuffer covers everything the polyfill can
+      // produce; real-SAB worlds: the alias-aware check adds true SABs.
+      return v instanceof ArrayBuffer || isSharedArrayBufferImpl(v);
     },
     isArrayBuffer(v: any): boolean { return v instanceof ArrayBuffer; },
-    isSharedArrayBuffer(v: any): boolean {
-      return HAS_SAB && v instanceof SharedArrayBuffer;
-    },
+    isSharedArrayBuffer: isSharedArrayBufferImpl,
     isArrayBufferDetached(v: any): boolean {
       return v instanceof ArrayBuffer && v.byteLength === 0 && (v as any).__detached === true;
     },

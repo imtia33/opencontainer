@@ -4858,6 +4858,11 @@ function makeFsBinding(ctx) {
     if (!vfs.exists(path)) {
       throw new VfsError("ENOENT", errnoOf("ENOENT"), "open", path);
     }
+    if (flags & 512) {
+      try {
+        vfs.writeFile(path, new Uint8Array(0));
+      } catch {}
+    }
     const fd = nextFd++;
     fds.set(fd, { path, flags, pos: 0 });
     return fd;
@@ -5142,8 +5147,12 @@ function makeFsBinding(ctx) {
     readFileUtf8(path, _flags) {
       return dec.decode(vfs.readFile(String(path)));
     },
-    writeFileUtf8(path, data, _flags, _mode) {
-      vfs.writeFile(String(path), data);
+    writeFileUtf8(path, data, flags, _mode) {
+      if (flags & 1024) {
+        vfs.appendFile(String(path), data);
+      } else {
+        vfs.writeFile(String(path), data);
+      }
     },
     rmSync(path, _maxRetries, recursive, _retryDelay) {
       vfs.rm(String(path), { recursive, force: false });
@@ -9717,7 +9726,12 @@ function makeStringDecoderBinding() {
 
 // src/packages/opencontainer/kernel/natives/types.ts
 function makeTypesBinding() {
-  const HAS_SAB = typeof SharedArrayBuffer !== "undefined";
+  const isRealSABClass = (C) => typeof C === "function" && C !== globalThis.ArrayBuffer;
+  const HAS_SAB = isRealSABClass(globalThis.SharedArrayBuffer);
+  const isSharedArrayBufferImpl = (v) => {
+    const SAB = globalThis.SharedArrayBuffer;
+    return isRealSABClass(SAB) && v instanceof SAB;
+  };
   return {
     isAsyncFunction(fn) {
       return typeof fn === "function" && fn.constructor?.name === "AsyncFunction";
@@ -9781,14 +9795,12 @@ function makeTypesBinding() {
       return v === null || typeof v !== "object" && typeof v !== "function";
     },
     isAnyArrayBuffer(v) {
-      return v instanceof ArrayBuffer || HAS_SAB && v instanceof SharedArrayBuffer;
+      return v instanceof ArrayBuffer || isSharedArrayBufferImpl(v);
     },
     isArrayBuffer(v) {
       return v instanceof ArrayBuffer;
     },
-    isSharedArrayBuffer(v) {
-      return HAS_SAB && v instanceof SharedArrayBuffer;
-    },
+    isSharedArrayBuffer: isSharedArrayBufferImpl,
     isArrayBufferDetached(v) {
       return v instanceof ArrayBuffer && v.byteLength === 0 && v.__detached === true;
     },
@@ -13209,6 +13221,8 @@ class FetchIncomingMessage extends TinyEmitter {
   _gate = null;
   _gateResolve = null;
   _touch = null;
+  _streamDecoder = null;
+  _encodingLabel = null;
   constructor(response, init) {
     super();
     this.statusCode = response.status;
@@ -13234,6 +13248,29 @@ class FetchIncomingMessage extends TinyEmitter {
     this.headers = headers;
     this.rawHeaders = raw;
     this._reader = response.body ? response.body.getReader() : null;
+  }
+  setEncoding(enc) {
+    const label = String(enc ?? "utf8").toLowerCase();
+    if (label === "utf8" || label === "utf-8") {
+      this._streamDecoder = new TextDecoder;
+      this._encodingLabel = null;
+    } else {
+      this._streamDecoder = null;
+      this._encodingLabel = label;
+    }
+  }
+  _emitData(bytes) {
+    if (this._streamDecoder) {
+      const text = this._streamDecoder.decode(bytes, { stream: true });
+      if (text)
+        this.emit("data", text);
+      return;
+    }
+    if (this._encodingLabel) {
+      this.emit("data", Buffer.from(bytes).toString(this._encodingLabel));
+      return;
+    }
+    this.emit("data", bytes);
   }
   _start() {
     if (this._destroyed)
@@ -13328,7 +13365,7 @@ class FetchIncomingMessage extends TinyEmitter {
   _drainQueue() {
     while (this._queue.length > 0 && this._flowing) {
       const chunk = this._queue.shift();
-      this.emit("data", chunk);
+      this._emitData(chunk);
     }
   }
   _schedulePump() {
@@ -13369,7 +13406,7 @@ class FetchIncomingMessage extends TinyEmitter {
           bytes = encoder.encode(String(raw ?? ""));
         this._touch?.();
         if (this._flowing)
-          this.emit("data", bytes);
+          this._emitData(bytes);
         else
           this._queue.push(bytes);
       }
@@ -14183,7 +14220,24 @@ var pristineGlobals = (() => {
     setImmediate: g.setImmediate,
     clearImmediate: g.clearImmediate,
     Buffer: g.Buffer,
-    global: g.global
+    global: g.global,
+    ReadableStream: g.ReadableStream,
+    ReadableStreamDefaultReader: g.ReadableStreamDefaultReader,
+    ReadableStreamBYOBReader: g.ReadableStreamBYOBReader,
+    ReadableStreamBYOBRequest: g.ReadableStreamBYOBRequest,
+    ReadableByteStreamController: g.ReadableByteStreamController,
+    ReadableStreamDefaultController: g.ReadableStreamDefaultController,
+    WritableStream: g.WritableStream,
+    WritableStreamDefaultWriter: g.WritableStreamDefaultWriter,
+    WritableStreamDefaultController: g.WritableStreamDefaultController,
+    TransformStream: g.TransformStream,
+    TransformStreamDefaultController: g.TransformStreamDefaultController,
+    ByteLengthQueuingStrategy: g.ByteLengthQueuingStrategy,
+    CountQueuingStrategy: g.CountQueuingStrategy,
+    TextEncoderStream: g.TextEncoderStream,
+    TextDecoderStream: g.TextDecoderStream,
+    CompressionStream: g.CompressionStream,
+    DecompressionStream: g.DecompressionStream
   };
 })();
 var realmGlobalsRestored = false;
@@ -14479,6 +14533,34 @@ require(${JSON.stringify(requirePath)});
   const g2 = globalThis;
   g2.process = process;
   g2.console = consoleModule;
+  try {
+    const readableStreamMod = require2("internal/webstreams/readablestream");
+    const writableStreamMod = require2("internal/webstreams/writablestream");
+    const transformStreamMod = require2("internal/webstreams/transformstream");
+    const queuingStrategiesMod = require2("internal/webstreams/queuingstrategies");
+    const webEncodingMod = require2("internal/webstreams/encoding");
+    const compressionMod = require2("internal/webstreams/compression");
+    g2.ReadableStream = readableStreamMod.ReadableStream;
+    g2.ReadableStreamDefaultReader = readableStreamMod.ReadableStreamDefaultReader;
+    g2.ReadableStreamBYOBReader = readableStreamMod.ReadableStreamBYOBReader;
+    g2.ReadableStreamBYOBRequest = readableStreamMod.ReadableStreamBYOBRequest;
+    g2.ReadableByteStreamController = readableStreamMod.ReadableByteStreamController;
+    g2.ReadableStreamDefaultController = readableStreamMod.ReadableStreamDefaultController;
+    g2.WritableStream = writableStreamMod.WritableStream;
+    g2.WritableStreamDefaultWriter = writableStreamMod.WritableStreamDefaultWriter;
+    g2.WritableStreamDefaultController = writableStreamMod.WritableStreamDefaultController;
+    g2.TransformStream = transformStreamMod.TransformStream;
+    g2.TransformStreamDefaultController = transformStreamMod.TransformStreamDefaultController;
+    g2.ByteLengthQueuingStrategy = queuingStrategiesMod.ByteLengthQueuingStrategy;
+    g2.CountQueuingStrategy = queuingStrategiesMod.CountQueuingStrategy;
+    g2.TextEncoderStream = webEncodingMod.TextEncoderStream;
+    g2.TextDecoderStream = webEncodingMod.TextDecoderStream;
+    g2.CompressionStream = compressionMod.CompressionStream;
+    g2.DecompressionStream = compressionMod.DecompressionStream;
+    __stage("webstreams_globals");
+  } catch (e) {
+    globalThis.__ocDebugHook?.(`[webstreams globals failed] ${String(e)}`);
+  }
   globalThis.__ocBootDebug?.("before-debuglog");
   const debuglogMod = require2("internal/util/debuglog");
   if (typeof debuglogMod.initializeDebugEnv === "function") {
@@ -14580,8 +14662,8 @@ require(${JSON.stringify(requirePath)});
   globalThis.setTimeout = timersModule.setTimeout;
   globalThis.clearTimeout = timersModule.clearTimeout;
   globalThis.__ocBootDebug?.("before-buffer");
-  const Buffer = require2("buffer").Buffer;
-  globalThis.Buffer = Buffer;
+  const Buffer2 = require2("buffer").Buffer;
+  globalThis.Buffer = Buffer2;
   globalThis.global = globalThis;
   globalThis.__ocBootDebug?.("before-execution");
   const execution = require2("internal/process/execution");
