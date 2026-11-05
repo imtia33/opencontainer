@@ -14386,6 +14386,9 @@ async function opfsRoot() {
 function opfsKey(path) {
   return encodeURIComponent(path);
 }
+function isEphemeralPath(p) {
+  return p.includes("/node_modules/");
+}
 async function saveTreeToOpfs() {
   if (!kernel)
     return;
@@ -14393,11 +14396,14 @@ async function saveTreeToOpfs() {
   if (!root)
     return;
   const tree = kernel.vfs.exportTree("/home");
+  const eDirs = tree.dirs.filter((p) => !isEphemeralPath(p));
+  const eFiles = tree.files.filter(([p]) => !isEphemeralPath(p));
+  const eSymlinks = tree.symlinks.filter(([p]) => !isEphemeralPath(p));
   const manifest = {
     savedAt: Date.now(),
-    dirs: tree.dirs,
-    symlinks: tree.symlinks,
-    files: tree.files.map(([p]) => p)
+    dirs: eDirs,
+    symlinks: eSymlinks,
+    files: eFiles.map(([p]) => p)
   };
   const mf = await root.getFileHandle("_manifest.json", { create: true });
   const w = await mf.createSyncAccessHandle();
@@ -14406,7 +14412,7 @@ async function saveTreeToOpfs() {
   w.write(mbytes, { at: 0 });
   w.flush();
   w.close();
-  for (const [p, data] of tree.files) {
+  for (const [p, data] of eFiles) {
     const fh = await root.getFileHandle(opfsKey(p), { create: true });
     const acc = await fh.createSyncAccessHandle();
     acc.truncate(0);
@@ -14414,9 +14420,9 @@ async function saveTreeToOpfs() {
     acc.flush();
     acc.close();
   }
-  const live = new Set(tree.files.map(([p]) => opfsKey(p)));
+  const live = new Set(eFiles.map(([p]) => opfsKey(p)));
   for await (const [name] of root.entries()) {
-    if (name.startsWith("_") || name.endsWith(".json"))
+    if (name.startsWith("_"))
       continue;
     if (!live.has(name)) {
       try {
@@ -14437,10 +14443,12 @@ async function loadTreeFromOpfs() {
   } catch {
     return null;
   }
-  const dirs = manifest.dirs ?? [];
-  const symlinks = manifest.symlinks ?? [];
+  const dirs = (manifest.dirs ?? []).filter((p) => !isEphemeralPath(p));
+  const symlinks = (manifest.symlinks ?? []).filter(([p]) => !isEphemeralPath(p));
   const files = [];
   for (const p of manifest.files ?? []) {
+    if (isEphemeralPath(p))
+      continue;
     try {
       const fh = await root.getFileHandle(opfsKey(p));
       const file = await fh.getFile();

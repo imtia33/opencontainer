@@ -383,16 +383,36 @@ function opfsKey(path: string): string {
   return encodeURIComponent(path);
 }
 
+/** Ephemeral-path rule — the WebContainers-style node_modules lifecycle.
+ *
+ *  Dependency weight is NEVER persisted: node_modules at ANY depth is
+ *  rebuilt by npm on demand ("reload → project files kept, node_modules
+ *  dropped"). The npm HTTP cache under /home/node/.npm/_cacache is
+ *  content-addressed (sha-named) and contains no node_modules path segment,
+ *  so it survives this rule automatically — reinstalls come back from cache
+ *  in ~1 s instead of full network. Shared by save AND load: a stale
+ *  manifest from an older session (which still listed node_modules) must
+ *  not be able to hydrate them back. */
+function isEphemeralPath(p: string): boolean {
+  return p.includes('/node_modules/');
+}
+
 async function saveTreeToOpfs(): Promise<void> {
   if (!kernel) return;
   const root = await opfsRoot();
   if (!root) return;
   const tree = kernel.vfs.exportTree('/home');
+  // Ephemeral filter BEFORE the manifest is built: node_modules is excluded
+  // from dirs/files/symlinks, so the manifest never lists it, and the `live`
+  // set below purges stale node_modules entries written by older sessions.
+  const eDirs = tree.dirs.filter((p) => !isEphemeralPath(p));
+  const eFiles = tree.files.filter(([p]) => !isEphemeralPath(p));
+  const eSymlinks = tree.symlinks.filter(([p]) => !isEphemeralPath(p));
   const manifest = {
     savedAt: Date.now(),
-    dirs: tree.dirs,
-    symlinks: tree.symlinks,
-    files: tree.files.map(([p]) => p),
+    dirs: eDirs,
+    symlinks: eSymlinks,
+    files: eFiles.map(([p]) => p),
   };
   const mf = await root.getFileHandle('_manifest.json', { create: true });
   const w = await mf.createSyncAccessHandle();
@@ -401,7 +421,7 @@ async function saveTreeToOpfs(): Promise<void> {
   w.write(mbytes, { at: 0 });
   w.flush();
   w.close();
-  for (const [p, data] of tree.files) {
+  for (const [p, data] of eFiles) {
     const fh = await root.getFileHandle(opfsKey(p), { create: true });
     const acc = await fh.createSyncAccessHandle();
     acc.truncate(0);
@@ -409,9 +429,13 @@ async function saveTreeToOpfs(): Promise<void> {
     acc.flush();
     acc.close();
   }
-  const live = new Set(tree.files.map(([p]) => opfsKey(p)));
+  const live = new Set(eFiles.map(([p]) => opfsKey(p)));
   for await (const [name] of root.entries()) {
-    if (name.startsWith('_') || name.endsWith('.json')) continue;
+    // Skip ONLY our own manifest (`_` prefix). A bare `.endsWith('.json')`
+    // guard here once leaked: guest package.json etc. are percent-encoded
+    // keys that END in .json, so deleted guest .json files were never
+    // purged from OPFS. The live-set is the purge authority.
+    if (name.startsWith('_')) continue;
     if (!live.has(name)) {
       try { await root.removeEntry(name); } catch { /* best-effort */ }
     }
@@ -429,10 +453,15 @@ async function loadTreeFromOpfs(): Promise<OpfsPaths | null> {
   } catch {
     return null; // no persisted state
   }
-  const dirs: string[] = manifest.dirs ?? [];
-  const symlinks: Array<[string, string]> = manifest.symlinks ?? [];
+  // Load-time half of the ephemeral rule (see isEphemeralPath): manifests
+  // saved by older sessions can still list node_modules — never hydrate it.
+  const dirs: string[] = (manifest.dirs ?? []).filter((p: string) => !isEphemeralPath(p));
+  const symlinks: Array<[string, string]> = (manifest.symlinks ?? []).filter(
+    ([p]: [string, string]) => !isEphemeralPath(p),
+  );
   const files: Array<[string, Uint8Array]> = [];
   for (const p of manifest.files ?? []) {
+    if (isEphemeralPath(p)) continue;
     try {
       const fh = await root.getFileHandle(opfsKey(p));
       const file = await fh.getFile();
