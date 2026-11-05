@@ -381,7 +381,13 @@ export function makeFsBinding(ctx: NativesContext): Binding {
     }),
 
     // ---- stat family ----------------------------------------------------------
-    stat: dual('stat', (a) => String(a[0]), (path: string, bigint?: boolean, throwIfNoEntry?: boolean) => {
+    // binding call convention (node's fs.js): stat(path, bigint, req?,
+    // throwIfNoEntry?) — SYNC calls pass `undefined` in the req slot,
+    // ASYNC (dual-detected req) args arrive req-stripped, so the boolean may
+    // sit in EITHER position 3 or 4. Detect by type, not position.
+    stat: dual('stat', (a) => String(a[0]), (...all: any[]) => {
+      const [path, bigint, x, y] = all as [string, boolean?, boolean?, boolean?];
+      const throwIfNoEntry = typeof x === 'boolean' ? x : y;
       try {
         return statFields(String(path), true, bigint === true);
       } catch (e) {
@@ -389,7 +395,9 @@ export function makeFsBinding(ctx: NativesContext): Binding {
         throw e;
       }
     }),
-    lstat: dual('lstat', (a) => String(a[0]), (path: string, bigint?: boolean, throwIfNoEntry?: boolean) => {
+    lstat: dual('lstat', (a) => String(a[0]), (...all: any[]) => {
+      const [path, bigint, x, y] = all as [string, boolean?, boolean?, boolean?];
+      const throwIfNoEntry = typeof x === 'boolean' ? x : y;
       try {
         return statFields(String(path), false, bigint === true);
       } catch (e) {
@@ -397,7 +405,9 @@ export function makeFsBinding(ctx: NativesContext): Binding {
         throw e;
       }
     }),
-    fstat: dual('fstat', (a) => fdPath(a[0]), (fd: number, bigint?: boolean, _req?: any, throwIfNoEntry?: boolean) => {
+    fstat: dual('fstat', (a) => fdPath(a[0]), (...all: any[]) => {
+      const [fd, bigint, x, y] = all as [number, boolean?, boolean?, boolean?];
+      const throwIfNoEntry = typeof x === 'boolean' ? x : y;
       try {
         return statFields(fdPath(fd), true, bigint === true);
       } catch (e) {

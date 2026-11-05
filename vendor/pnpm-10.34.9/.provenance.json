@@ -1,0 +1,9 @@
+{
+  "name": "pnpm",
+  "version": "10.34.9",
+  "source": "https://registry.npmjs.org/pnpm/-/pnpm-10.34.9.tgz",
+  "integrity": "verified against registry tarball",
+  "modified": false,
+  "notes": "Unmodified upstream tarball extraction. pnpm >=11 ships a NATIVE binary which no browser container can execute (its own wrapper detects WebContainers and refuses); 10.x is the last pure-JS upstream line. Platform .node addons (reflink.*) are excluded by the OCRT blob packer (NUL-byte guard) and are optional on all platforms.",
+  "vendoredAt": "2026-11-05"
+}

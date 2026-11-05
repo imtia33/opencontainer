@@ -22,6 +22,11 @@
  * file) and binary files — the OCRT container is UTF-8 text only, so binaries
  * (detected by NUL-byte / invalid-UTF-8 scan) are excluded and reported.
  *
+ * The upstream pnpm CLI (vendored at repo-root vendor/pnpm-<ver>) gets the
+ * same treatment as a FOURTH lazily-fetched blob. pnpm >= 11 ships a native
+ * binary (no browser container can exec it — its own wrapper refuses under
+ * WebContainers), so 10.x — the last pure-JS upstream line — is vendored.
+ *
  * Output (content-addressed by sha256 prefix):
  *   public/opencontainer/runtime/node-<ver>-core-<hash8>.ocrt.gz
  *   public/opencontainer/runtime/node-<ver>-amaro-<hash8>.ocrt.gz
@@ -39,6 +44,7 @@ import { createHash } from 'node:crypto';
 const ROOT = path.resolve(import.meta.dir, '..');
 const VENDOR = path.join(ROOT, 'src/packages/opencontainer/vendor/node-v26.13.0');
 const NPM_VENDOR = path.join(ROOT, 'vendor/npm-12.2.1');
+const PNPM_VENDOR = path.join(ROOT, 'vendor/pnpm-10.34.9');
 const OUT_DIR = path.join(ROOT, 'public/opencontainer/runtime');
 
 interface Entry { p: string; o: number; l: number }
@@ -64,15 +70,15 @@ function pack(files: string[], vendorDir: string): { blob: Buffer; index: Entry[
 }
 
 /**
- * Collect EVERY file under the vendored npm tree (any extension — it is an
- * unmodified upstream tarball extraction) except:
- *   - `.provenance.json` — our own bookkeeping file, not part of upstream npm
+ * Collect EVERY file under a vendored upstream CLI tree (any extension — it
+ * is an unmodified upstream tarball extraction) except:
+ *   - `.provenance.json` — our own bookkeeping file, not part of upstream
  *   - binary files — the OCRT container concatenates UTF-8 file bodies only,
  *     so NUL-byte / invalid-UTF-8 files are excluded and reported.
- * Paths are repo-relative to the npm vendor dir, POSIX separators, sorted so
+ * Paths are repo-relative to the vendor dir, POSIX separators, sorted so
  * the blob is byte-for-byte deterministic for a given tree.
  */
-function collectNpmFiles(
+function collectCliFiles(
   vendorDir: string,
 ): { files: string[]; excluded: { p: string; reason: string }[] } {
   const files: string[] = [];
@@ -120,7 +126,7 @@ function main() {
 
   const sha = (buf: Buffer) => createHash('sha256').update(buf).digest('hex').slice(0, 8);
   const write = (
-    name: 'core' | 'amaro' | 'npm',
+    name: 'core' | 'amaro' | 'npm' | 'pnpm',
     files: string[],
     vendorDir: string = VENDOR,
     filePrefix?: string,
@@ -153,11 +159,22 @@ function main() {
   const npmVersion: string = JSON.parse(
     fs.readFileSync(path.join(NPM_VENDOR, 'package.json'), 'utf8'),
   ).version;
-  const { files: npmFiles, excluded: npmExcluded } = collectNpmFiles(NPM_VENDOR);
+  const { files: npmFiles, excluded: npmExcluded } = collectCliFiles(NPM_VENDOR);
   for (const ex of npmExcluded) {
     console.warn(`[opencontainer] npm: excluding ${ex.p} (${ex.reason})`);
   }
   const npm = write('npm', npmFiles, NPM_VENDOR, `npm-${npmVersion}`);
+
+  // Fourth blob: the REAL upstream pnpm CLI (10.x — last pure-JS line;
+  // >= 11 is a native binary no browser container can exec).
+  const pnpmVersion: string = JSON.parse(
+    fs.readFileSync(path.join(PNPM_VENDOR, 'package.json'), 'utf8'),
+  ).version;
+  const { files: pnpmFiles, excluded: pnpmExcluded } = collectCliFiles(PNPM_VENDOR);
+  for (const ex of pnpmExcluded) {
+    console.warn(`[opencontainer] pnpm: excluding ${ex.p} (${ex.reason})`);
+  }
+  const pnpm = write('pnpm', pnpmFiles, PNPM_VENDOR, `pnpm-${pnpmVersion}`);
 
   const index = {
     nodeVersion,
@@ -165,6 +182,7 @@ function main() {
     core,
     amaro,
     npm,
+    pnpm,
   };
   fs.writeFileSync(
     path.join(OUT_DIR, 'index.json'),
@@ -181,7 +199,7 @@ function main() {
     `export const RUNTIME_INDEX = ${JSON.stringify(indexFields, null, 2)} as const;\n`,
   );
   console.log(
-    `[opencontainer] runtime index written (${core.modules + amaro.modules + npm.modules} modules total)`,
+    `[opencontainer] runtime index written (${core.modules + amaro.modules + npm.modules + pnpm.modules} modules total)`,
   );
 }
 

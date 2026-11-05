@@ -1,6 +1,6 @@
 {
   "nodeVersion": "v26.13.0",
-  "generatedAt": "2026-11-05T16:16:32.071Z",
+  "generatedAt": "2026-11-05T16:59:23.188Z",
   "core": {
     "file": "node-v26.13.0-core-d3f3d922.ocrt.gz",
     "sha256": "d3f3d922",
@@ -21,5 +21,12 @@
     "rawBytes": 12521574,
     "gzBytes": 3002702,
     "modules": 1941
+  },
+  "pnpm": {
+    "file": "pnpm-10.34.9-9e7dd051.ocrt.gz",
+    "sha256": "9e7dd051",
+    "rawBytes": 18048951,
+    "gzBytes": 3924383,
+    "modules": 1058
   }
 }

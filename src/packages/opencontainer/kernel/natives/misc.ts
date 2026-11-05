@@ -1,4 +1,5 @@
 import type { Binding } from './index';
+import { EmuPort, EmuMessageChannel } from './messaging-ports';
 
 /**
  * Grab-bag of small bindings used lazily by lib internals. Values chosen so
@@ -162,34 +163,16 @@ export function makeMiscBindings(): Record<string, Binding> {
       };
     })(),
     messaging: (() => {
-      // S3.1: internal/worker/io.js (worker_threads) destructures MessagePort,
+      // internal/worker/io.js (worker_threads) destructures MessagePort,
       // MessageChannel, broadcastChannel, drainMessagePort,
       // moveMessagePortToContext, receiveMessageOnPort and stopMessagePort at
-      // LOAD time — their absence made `require('worker_threads')` itself
-      // throw (found via create-vite's dependency graph).
-      const BrowserMessagePort: any = (globalThis as any).MessagePort ?? class {};
-      const BrowserMessageChannel: any = (globalThis as any).MessageChannel ?? class {};
-      // Load-time-safe stand-in: node performs PROTOTYPE SURGERY on the class
-      // it gets (ObjectSetPrototypeOf(MessagePort, NodeEventTarget) + own-
-      // descriptor copying). Handing it the browser's class directly would
-      // mutate the HOST realm's MessagePort — which the preview bridge and
-      // the process manager depend on. This subclass carries copies of the
-      // browser prototype's methods as OWN properties so the surgery
-      // preserves them, while the browser class stays untouched.
-      class OCMessagePort extends BrowserMessagePort {}
-      for (const key of Object.getOwnPropertyNames(BrowserMessagePort.prototype)) {
-        if (key === 'constructor') continue;
-        const desc = Object.getOwnPropertyDescriptor(BrowserMessagePort.prototype, key);
-        if (desc) Object.defineProperty(OCMessagePort.prototype, key, desc);
-      }
-      class OCMessageChannel {
-        port1: any; port2: any;
-        constructor() {
-          const mc = new BrowserMessageChannel();
-          this.port1 = mc.port1;
-          this.port2 = mc.port2;
-        }
-      }
+      // LOAD time. EmuPort/EmuMessageChannel are the kernel's in-process
+      // ports (linked event emitters) — also the transport underneath the
+      // in-process worker_threads implementation (natives/worker.ts). They
+      // tolerate io.js's PROTOTYPE SURGERY (re-parenting onto NodeEventTarget
+      // + descriptor copying) because every method is an own prototype
+      // property; unlike the earlier browser-class stand-ins they also give
+      // port1.on('message') — which the vendored Worker class requires.
       return {
       DOMException: (globalThis as any).DOMException ?? class DOMException extends Error { constructor(msg: string, name?: string) { super(msg); this.name = name ?? 'DOMException'; } },
       kTransfer: Symbol('nodejs.messaging.transfer'),
@@ -204,8 +187,8 @@ export function makeMiscBindings(): Record<string, Binding> {
       kIsDetached: Symbol('nodejs.messaging.is_detached'),
       kUntransferable: Symbol('nodejs.messaging.untransferable'),
       kDeserializePrimitive: Symbol('nodejs.messaging.deserialize_primitive'),
-        MessagePort: OCMessagePort,
-        MessageChannel: OCMessageChannel,
+        MessagePort: EmuPort,
+        MessageChannel: EmuMessageChannel,
         broadcastChannel: (globalThis as any).BroadcastChannel ?? class {},
         drainMessagePort() {},
         stopMessagePort() {},

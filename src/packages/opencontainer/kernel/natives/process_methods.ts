@@ -24,7 +24,17 @@ export function makeProcessMethodsBinding(ctx: NativesContext): Binding {
     hrtime: fillHrtime,
     hrtimeBigInt: fillHrtime,
 
-    exit(code: number) { ctx.hooks.onExit(code); },
+    exit(code: number) {
+      // In-process worker dispatch window (worker_threads compat): a worker
+      // script's process.exit() ends THAT worker, never the whole process
+      // (node semantics: workers don't own process state).
+      const dispatch = (globalThis as any).__ocWorkerDispatch;
+      if (dispatch && typeof dispatch.workerExit === 'function') {
+        dispatch.workerExit(code);
+        return;
+      }
+      ctx.hooks.onExit(code);
+    },
     abort() { ctx.hooks.onExit(134); },
     chdir(p: string) {
       try {

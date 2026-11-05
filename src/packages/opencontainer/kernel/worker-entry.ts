@@ -617,27 +617,31 @@ async function boot(msg: {
 
   lap('bootstrapMs');
 
-  // ---- P1 "npm is npm": entry-gated mount of the genuine npm CLI tree ----
-  // The upstream npm CLI (12.2.1) ships as a third runtime blob. It is
-  // mounted ONLY when this process's entry is an npm/npx binary, so `node
-  // -e` boots never pay the fetch/decode. Mounted BEFORE wireVfsDeltas()
-  // — system files are blob-derived and must never enter host snapshots
-  // (same discipline as boot.ts's mountPkg).
+  // ---- P1 "npm is npm" / "pnpm is pnpm": entry-gated mount of the genuine
+  // upstream CLI trees. Both ship as lazily-fetched runtime blobs and are
+  // mounted ONLY when this process's entry is one of their binaries, so
+  // `node -e` boots never pay the fetch/decode. Mounted BEFORE
+  // wireVfsDeltas() — system files are blob-derived and must never enter
+  // host snapshots (same discipline as boot.ts's mountPkg).
   {
     const entryPath: string = msg.entry?.path ?? '';
     const argv0 = String(msg.argv?.[1] ?? '');
-    const needsNpm =
-      entryPath.startsWith('/usr/local/bin/npm') ||
-      entryPath.startsWith('/usr/local/bin/npx') ||
-      entryPath.startsWith('/usr/lib/node_modules/npm') ||
-      argv0.startsWith('/usr/local/bin/npm') ||
-      argv0.startsWith('/usr/local/bin/npx') ||
-      argv0.startsWith('/usr/lib/node_modules/npm');
-    if (needsNpm && index.npm) {
+    const needsPkg = (root: string) =>
+      entryPath.startsWith(`/usr/local/bin/${root}`) ||
+      entryPath.startsWith(`/usr/lib/node_modules/${root}`) ||
+      argv0.startsWith(`/usr/local/bin/${root}`) ||
+      argv0.startsWith(`/usr/lib/node_modules/${root}`);
+    if (index.npm && (needsPkg('npm') || needsPkg('npx'))) {
       const npmBuf = await loadBlob(index.npm, 'npm');
-      const mounted = mountNpmTree(npmBuf);
+      const mounted = mountCliTree(npmBuf, '/usr/lib/node_modules/npm');
       lap('npmMountMs');
       post({ type: 'boot-progress', phase: 'npm:mount', loaded: mounted, total: mounted });
+    }
+    if (index.pnpm && (needsPkg('pnpm') || needsPkg('pnpx'))) {
+      const pnpmBuf = await loadBlob(index.pnpm, 'pnpm');
+      const mounted = mountCliTree(pnpmBuf, '/usr/lib/node_modules/pnpm');
+      lap('pnpmMountMs');
+      post({ type: 'boot-progress', phase: 'pnpm:mount', loaded: mounted, total: mounted });
     }
   }
 
@@ -680,18 +684,17 @@ async function boot(msg: {
 }
 
 /***
- * Mount the genuine npm CLI tree from its OCRT blob into the VFS at
- * /usr/lib/node_modules/npm (boot.ts's bin shims already point
- * /usr/local/bin/npm|npx at bin/npm-cli.js / bin/npx-cli.js there).
- * The npm blob's entry paths are relative to the upstream package root —
- * they do NOT share the core blob's node-v26.13.0/ namespace, which is why
- * this mounts VFS-direct instead of going through the module store.
+ * Mount a genuine upstream CLI tree from its OCRT blob into the VFS at
+ * <root> (boot.ts's bin shims already point /usr/local/bin/npm|npx|pnpm|pnpx
+ * at the right files inside). A blob's entry paths are relative to the
+ * upstream package root — they do NOT share the core blob's
+ * node-v26.13.0/ namespace, which is why this mounts VFS-direct instead of
+ * going through the module store.
  */
-function mountNpmTree(buf: ArrayBuffer): number {
+function mountCliTree(buf: ArrayBuffer, root: string): number {
   if (!kernel) return 0;
   const { entries, bodyStart, bytes } = parseBlob(buf);
   const decoder = new TextDecoder();
-  const root = '/usr/lib/node_modules/npm';
   kernel.vfs.mkdir(root, true);
   let n = 0;
   for (const e of entries) {

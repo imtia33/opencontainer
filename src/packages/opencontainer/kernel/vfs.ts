@@ -76,6 +76,19 @@ export class VfsError extends Error {
     this.errno = errno;
     this.syscall = syscall;
     this.path = path;
+    // Debug probe (harness): record every ENOENT with its origin stack.
+    if (code === 'ENOENT') {
+      const g = globalThis as any;
+      if (g.__ocVfsEnoentLog) {
+        try {
+          g.__ocVfsEnoentLog.push({
+            syscall, path,
+            stack: String(new Error().stack ?? '').split('\n').slice(2, 7).join(' | '),
+          });
+          if (g.__ocVfsEnoentLog.length > 200) g.__ocVfsEnoentLog.shift();
+        } catch { /* probe must never break the kernel */ }
+      }
+    }
   }
 }
 

@@ -22,5 +22,12 @@ export const RUNTIME_INDEX = {
     "rawBytes": 12521574,
     "gzBytes": 3002702,
     "modules": 1941
+  },
+  "pnpm": {
+    "file": "pnpm-10.34.9-9e7dd051.ocrt.gz",
+    "sha256": "9e7dd051",
+    "rawBytes": 18048951,
+    "gzBytes": 3924383,
+    "modules": 1058
   }
 } as const;

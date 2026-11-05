@@ -2238,6 +2238,21 @@ class VfsError extends Error {
     this.errno = errno;
     this.syscall = syscall;
     this.path = path;
+    if (code === "ENOENT") {
+      const g = globalThis;
+      if (g.__ocVfsEnoentLog) {
+        try {
+          g.__ocVfsEnoentLog.push({
+            syscall,
+            path,
+            stack: String(new Error().stack ?? "").split(`
+`).slice(2, 7).join(" | ")
+          });
+          if (g.__ocVfsEnoentLog.length > 200)
+            g.__ocVfsEnoentLog.shift();
+        } catch {}
+      }
+    }
   }
 }
 function errnoOf(code) {
@@ -4380,6 +4395,11 @@ function makeProcessMethodsBinding(ctx) {
     hrtime: fillHrtime,
     hrtimeBigInt: fillHrtime,
     exit(code) {
+      const dispatch = globalThis.__ocWorkerDispatch;
+      if (dispatch && typeof dispatch.workerExit === "function") {
+        dispatch.workerExit(code);
+        return;
+      }
       ctx.hooks.onExit(code);
     },
     abort() {
@@ -5009,7 +5029,9 @@ function makeFsBinding(ctx) {
       }
       return total;
     }),
-    stat: dual("stat", (a) => String(a[0]), (path, bigint, throwIfNoEntry) => {
+    stat: dual("stat", (a) => String(a[0]), (...all) => {
+      const [path, bigint, x, y] = all;
+      const throwIfNoEntry = typeof x === "boolean" ? x : y;
       try {
         return statFields(String(path), true, bigint === true);
       } catch (e) {
@@ -5018,7 +5040,9 @@ function makeFsBinding(ctx) {
         throw e;
       }
     }),
-    lstat: dual("lstat", (a) => String(a[0]), (path, bigint, throwIfNoEntry) => {
+    lstat: dual("lstat", (a) => String(a[0]), (...all) => {
+      const [path, bigint, x, y] = all;
+      const throwIfNoEntry = typeof x === "boolean" ? x : y;
       try {
         return statFields(String(path), false, bigint === true);
       } catch (e) {
@@ -5027,7 +5051,9 @@ function makeFsBinding(ctx) {
         throw e;
       }
     }),
-    fstat: dual("fstat", (a) => fdPath(a[0]), (fd, bigint, _req, throwIfNoEntry) => {
+    fstat: dual("fstat", (a) => fdPath(a[0]), (...all) => {
+      const [fd, bigint, x, y] = all;
+      const throwIfNoEntry = typeof x === "boolean" ? x : y;
       try {
         return statFields(fdPath(fd), true, bigint === true);
       } catch (e) {
@@ -7064,24 +7090,277 @@ function makePerformanceBinding(ctx) {
   };
 }
 
+// src/packages/opencontainer/kernel/natives/messaging-ports.ts
+class EmuPort {
+  peer = null;
+  listeners = new Map;
+  closed = false;
+  dispatchTrap = null;
+  static pair() {
+    const a = new EmuPort;
+    const b = new EmuPort;
+    a.peer = b;
+    b.peer = a;
+    return [a, b];
+  }
+  on(event, fn) {
+    let set = this.listeners.get(event);
+    if (!set) {
+      set = new Set;
+      this.listeners.set(event, set);
+    }
+    set.add(fn);
+    return this;
+  }
+  once(event, fn) {
+    const wrapped = (...args) => {
+      this.off(event, wrapped);
+      fn(...args);
+    };
+    return this.on(event, wrapped);
+  }
+  off(event, fn) {
+    this.listeners.get(event)?.delete(fn);
+    return this;
+  }
+  emit(event, ...args) {
+    if (this.closed)
+      return false;
+    const set = this.listeners.get(event);
+    if (!set || set.size === 0)
+      return false;
+    for (const fn of [...set]) {
+      try {
+        fn(...args);
+      } catch (err) {
+        queueMicrotask(() => {
+          throw err;
+        });
+      }
+    }
+    return true;
+  }
+  postMessage(data, _transferList) {
+    if (this.closed || !this.peer || this.peer.closed)
+      return;
+    const peer = this.peer;
+    if (globalThis.__ocWorkerMsgDebug) {
+      try {
+        const d = data;
+        globalThis.__ocWorkerMsgDebug(`${data === false ? "shutdown" : d?.type ?? (d?.status ? `reply:${d.status}` : "?")} ${d?.error ? "ERROR code=" + d.error.code + " msg=" + String(d.error.message).slice(0, 300) : ""} ${d?.value !== undefined ? "value:" + (typeof d.value === "object" ? Object.keys(d.value ?? {}).slice(0, 8).join(",") : String(d.value)) : ""}`);
+      } catch {}
+    }
+    queueMicrotask(() => {
+      const deliver = () => peer.emit("message", data);
+      if (peer.dispatchTrap)
+        peer.dispatchTrap(deliver);
+      else
+        deliver();
+    });
+  }
+  close(_cb) {
+    if (this.closed)
+      return;
+    this.closed = true;
+    const peer = this.peer;
+    this.listeners.clear();
+    if (peer && !peer.closed) {
+      peer.closed = true;
+      peer.emit("close");
+      peer.listeners.clear();
+    }
+    this.emit("close");
+  }
+  start() {}
+  ref() {}
+  unref() {}
+  hasRef() {
+    return false;
+  }
+}
+
+class EmuMessageChannel {
+  port1;
+  port2;
+  constructor() {
+    [this.port1, this.port2] = EmuPort.pair();
+  }
+}
+
 // src/packages/opencontainer/kernel/natives/worker.ts
+var kMainThreadName = "main";
+var nextThreadId = 1;
 function makeWorkerBinding() {
+  const g = globalThis;
+  const workers = new Map;
+
+  class WorkerImpl {
+    messagePort;
+    onexit = null;
+    threadId;
+    threadName;
+    invalidExecArgv = null;
+    invalidNodeOptions = null;
+    threadSide;
+    exited = false;
+    constructor(_url, _env, execArgv, _resourceLimits, _trackUnmanagedFds, _isInternal, name) {
+      if (Array.isArray(execArgv) && execArgv.length > 0) {
+        this.invalidExecArgv = execArgv;
+      }
+      this.threadId = nextThreadId++;
+      this.threadName = name ?? `WorkerThread-${this.threadId}`;
+      const [mainSide, threadSide] = EmuPort.pair();
+      this.messagePort = mainSide;
+      this.threadSide = threadSide;
+      this.threadSide.on("message", (m) => this.onControlMessage(m));
+      workers.set(this.threadId, this);
+    }
+    startThread() {}
+    stopThread() {
+      this.finish(1);
+    }
+    ref() {}
+    unref() {}
+    takeHeapSnapshot() {}
+    onControlMessage(msg) {
+      if (!msg || msg.type !== "loadScript")
+        return;
+      const filename = String(msg.filename ?? "");
+      const workerData = msg.workerData;
+      const publicPort = msg.publicPort ?? null;
+      this.bootScript(filename, workerData, publicPort);
+    }
+    async bootScript(filename, workerData, publicPort) {
+      if (publicPort) {
+        publicPort.dispatchTrap = (deliver) => {
+          const prev = g.__ocWorkerDispatch;
+          g.__ocWorkerDispatch = this;
+          try {
+            deliver();
+          } finally {
+            g.__ocWorkerDispatch = prev;
+          }
+        };
+      }
+      const view = {
+        __proto__: null,
+        isMainThread: false,
+        parentPort: publicPort,
+        workerData,
+        threadId: this.threadId,
+        threadName: this.threadName,
+        resourceLimits: null,
+        MessagePort: EmuPort,
+        MessageChannel: EmuMessageChannel,
+        BroadcastChannel: globalThis.BroadcastChannel ?? class BroadcastChannel {
+        },
+        markAsUncloneable() {},
+        moveMessagePortToContext() {
+          throw new Error("OpenContainer: worker_threads context move is not supported");
+        },
+        receiveMessageOnPort() {
+          throw new Error("OpenContainer: synchronous receiveMessageOnPort() is not supported");
+        },
+        postMessageToThread() {
+          throw new Error("OpenContainer: postMessageToThread is not supported");
+        },
+        SHARE_ENV: Symbol("nodejs.worker_threads.SHARE_ENV"),
+        environmentData: new Map,
+        getEnvironmentData(k) {
+          return this.environmentData.get(k);
+        },
+        setEnvironmentData(k, v) {
+          if (v === undefined)
+            this.environmentData.delete(k);
+          else
+            this.environmentData.set(k, v);
+        }
+      };
+      view.default = view;
+      const restore = swapBuiltin("worker_threads", view);
+      g.__ocWorkerDispatch = this;
+      try {
+        const requireFile = g.__ocRequireFile;
+        if (typeof requireFile !== "function") {
+          throw new Error("OpenContainer: kernel file-require hook not wired (worker boot)");
+        }
+        requireFile(filename);
+        this.threadSide.postMessage({ type: "upAndRunning" });
+      } catch (err) {
+        g.__ocWorkerError = err;
+        this.finish(1);
+        return;
+      } finally {
+        g.__ocWorkerDispatch = null;
+        restore();
+      }
+    }
+    workerExit(code) {
+      this.finish(code);
+    }
+    finish(code) {
+      if (this.exited)
+        return;
+      this.exited = true;
+      workers.delete(this.threadId);
+      try {
+        this.threadSide.close();
+      } catch {}
+      try {
+        this.messagePort.close();
+      } catch {}
+      try {
+        this.onexit?.(code, null, null);
+      } catch {}
+    }
+  }
+  function swapBuiltin(id, exportsObj) {
+    try {
+      const realm = g.__ocRealmRequire?.("internal/bootstrap/realm");
+      const bm = realm?.BuiltinModule?.map?.get(id);
+      if (!bm)
+        return () => {};
+      const saved = { exports: bm.exports, loaded: bm.loaded, loading: bm.loading };
+      bm.exports = exportsObj;
+      bm.loaded = true;
+      bm.loading = false;
+      return () => {
+        bm.exports = saved.exports;
+        bm.loaded = saved.loaded;
+        bm.loading = saved.loading;
+      };
+    } catch {
+      return () => {};
+    }
+  }
   return {
+    ownsProcessState: true,
     isMainThread: true,
+    isInternalThread: false,
+    resourceLimits: null,
+    threadId: 0,
+    threadName: kMainThreadName,
+    Worker: WorkerImpl,
+    getEnvMessagePort() {
+      return null;
+    },
     messaging: null,
     getMsgChannel() {
       return null;
     },
     postMessage() {
-      throw new Error("worker_threads is not yet supported in OpenContainer (S5)");
+      throw new Error("OpenContainer: worker-to-thread postMessage is not supported");
     },
     parentPort: null,
-    threadId: 0,
-    resourceLimits: null,
     markAsUntransferable() {},
     moveMessagePortToContext() {
-      throw new Error("unsupported");
+      throw new Error("OpenContainer: worker_threads context move is not supported");
     },
+    kMaxYoungGenerationSizeMb: 16,
+    kMaxOldGenerationSizeMb: 4096,
+    kCodeRangeSizeMb: 0,
+    kStackSizeMb: 4,
+    kTotalResourceLimitCount: 0,
     getHeapStatistics() {
       return { totalHeapSize: 0, usedHeapSize: 0, totalExternalSize: 0, totalAvailableSize: 0 };
     },
@@ -9826,30 +10105,6 @@ function makeMiscBindings() {
       };
     })(),
     messaging: (() => {
-      const BrowserMessagePort = globalThis.MessagePort ?? class {
-      };
-      const BrowserMessageChannel = globalThis.MessageChannel ?? class {
-      };
-
-      class OCMessagePort extends BrowserMessagePort {
-      }
-      for (const key of Object.getOwnPropertyNames(BrowserMessagePort.prototype)) {
-        if (key === "constructor")
-          continue;
-        const desc = Object.getOwnPropertyDescriptor(BrowserMessagePort.prototype, key);
-        if (desc)
-          Object.defineProperty(OCMessagePort.prototype, key, desc);
-      }
-
-      class OCMessageChannel {
-        port1;
-        port2;
-        constructor() {
-          const mc = new BrowserMessageChannel;
-          this.port1 = mc.port1;
-          this.port2 = mc.port2;
-        }
-      }
       return {
         DOMException: globalThis.DOMException ?? class DOMException extends Error {
           constructor(msg, name) {
@@ -9869,8 +10124,8 @@ function makeMiscBindings() {
         kIsDetached: Symbol("nodejs.messaging.is_detached"),
         kUntransferable: Symbol("nodejs.messaging.untransferable"),
         kDeserializePrimitive: Symbol("nodejs.messaging.deserialize_primitive"),
-        MessagePort: OCMessagePort,
-        MessageChannel: OCMessageChannel,
+        MessagePort: EmuPort,
+        MessageChannel: EmuMessageChannel,
         broadcastChannel: globalThis.BroadcastChannel ?? class {
         },
         drainMessagePort() {},
@@ -13947,8 +14202,9 @@ require(${JSON.stringify(requirePath)});
     binShim("/usr/bin/npm", "/usr/lib/node_modules/npm/bin/npm-cli.js");
     binShim("/usr/bin/npx", "/usr/lib/node_modules/npm/bin/npx-cli.js");
     binShim("/usr/local/bin/npm-oc", "/usr/lib/node_modules/npm-oc/cli.js");
-    binShim("/usr/local/bin/pnpm", "/usr/lib/node_modules/pnpm-oc/cli.js");
-    binShim("/usr/local/bin/pnpx", "/usr/lib/node_modules/pnpm-oc/cli.js");
+    binShim("/usr/local/bin/pnpm", "/usr/lib/node_modules/pnpm/bin/pnpm.cjs");
+    binShim("/usr/local/bin/pnpx", "/usr/lib/node_modules/pnpm/bin/pnpx.cjs");
+    binShim("/usr/local/bin/pnpm-oc", "/usr/lib/node_modules/pnpm-oc/cli.js");
     binShim("/usr/local/bin/corepack", "/usr/lib/node_modules/oc-sh/corepack.js");
     binShim("/usr/bin/sh", "/usr/lib/node_modules/oc-sh/sh.js");
     binShim("/bin/sh", "/usr/lib/node_modules/oc-sh/sh.js");
@@ -14192,6 +14448,7 @@ require(${JSON.stringify(requirePath)});
     const acorn = require2("internal/deps/acorn/acorn/dist/acorn");
     const builtinModules = cjsLoaderMod.Module?.builtinModules ?? [];
     const requireCjsFile = (p) => cjsLoaderMod.Module._load(p, null, true);
+    globalThis.__ocRequireFile = requireCjsFile;
     const importer = makeEsmGraphImporter({
       vfs: nativesCtx.vfs,
       requireBuiltin: require2,
@@ -14881,12 +15138,18 @@ async function boot(msg) {
   {
     const entryPath = msg.entry?.path ?? "";
     const argv0 = String(msg.argv?.[1] ?? "");
-    const needsNpm = entryPath.startsWith("/usr/local/bin/npm") || entryPath.startsWith("/usr/local/bin/npx") || entryPath.startsWith("/usr/lib/node_modules/npm") || argv0.startsWith("/usr/local/bin/npm") || argv0.startsWith("/usr/local/bin/npx") || argv0.startsWith("/usr/lib/node_modules/npm");
-    if (needsNpm && index.npm) {
+    const needsPkg = (root) => entryPath.startsWith(`/usr/local/bin/${root}`) || entryPath.startsWith(`/usr/lib/node_modules/${root}`) || argv0.startsWith(`/usr/local/bin/${root}`) || argv0.startsWith(`/usr/lib/node_modules/${root}`);
+    if (index.npm && (needsPkg("npm") || needsPkg("npx"))) {
       const npmBuf = await loadBlob(index.npm, "npm");
-      const mounted = mountNpmTree(npmBuf);
+      const mounted = mountCliTree(npmBuf, "/usr/lib/node_modules/npm");
       lap("npmMountMs");
       post({ type: "boot-progress", phase: "npm:mount", loaded: mounted, total: mounted });
+    }
+    if (index.pnpm && (needsPkg("pnpm") || needsPkg("pnpx"))) {
+      const pnpmBuf = await loadBlob(index.pnpm, "pnpm");
+      const mounted = mountCliTree(pnpmBuf, "/usr/lib/node_modules/pnpm");
+      lap("pnpmMountMs");
+      post({ type: "boot-progress", phase: "pnpm:mount", loaded: mounted, total: mounted });
     }
   }
   wireVfsDeltas();
@@ -14919,12 +15182,11 @@ async function boot(msg) {
   if (entry)
     await runEntry(entry);
 }
-function mountNpmTree(buf) {
+function mountCliTree(buf, root) {
   if (!kernel)
     return 0;
   const { entries, bodyStart, bytes } = parseBlob(buf);
   const decoder = new TextDecoder;
-  const root = "/usr/lib/node_modules/npm";
   kernel.vfs.mkdir(root, true);
   let n = 0;
   for (const e of entries) {

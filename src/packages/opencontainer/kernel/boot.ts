@@ -134,18 +134,20 @@ export async function bootKernel(opts: BootOptions): Promise<BootedKernel> {
     vfs.mkdir('/bin', true);
     // The node "binary": recognized by path in process_wrap (NODE_BIN).
     vfs.writeFile('/usr/local/bin/node', '#!/usr/bin/env node\n');
-    // P1 "npm is npm": npm/npx are the REAL vendored upstream CLI
-    // (/usr/lib/node_modules/npm — mounted by the host from the npm blob,
-    // see worker-entry ensureNpmTree; harnesses mount from disk). npm-oc /
-    // pnpm-oc stay available ONLY as explicitly-named rollback tools — they
-    // are no longer the default `npm` (never an invisible fallback).
+    // P1 "npm is npm" / "pnpm is pnpm": npm/npx and pnpm/pnpx are the REAL
+    // vendored upstream CLIs (/usr/lib/node_modules/{npm,pnpm} — mounted by
+    // the host from their OCRT blobs, see worker-entry; harnesses mount from
+    // disk). npm-oc / pnpm-oc stay available ONLY as explicitly-named
+    // rollback tools — they are no longer the default `npm`/`pnpm` (never an
+    // invisible fallback).
     binShim('/usr/local/bin/npm', '/usr/lib/node_modules/npm/bin/npm-cli.js');
     binShim('/usr/local/bin/npx', '/usr/lib/node_modules/npm/bin/npx-cli.js');
     binShim('/usr/bin/npm', '/usr/lib/node_modules/npm/bin/npm-cli.js');
     binShim('/usr/bin/npx', '/usr/lib/node_modules/npm/bin/npx-cli.js');
     binShim('/usr/local/bin/npm-oc', '/usr/lib/node_modules/npm-oc/cli.js');
-    binShim('/usr/local/bin/pnpm', '/usr/lib/node_modules/pnpm-oc/cli.js');
-    binShim('/usr/local/bin/pnpx', '/usr/lib/node_modules/pnpm-oc/cli.js');
+    binShim('/usr/local/bin/pnpm', '/usr/lib/node_modules/pnpm/bin/pnpm.cjs');
+    binShim('/usr/local/bin/pnpx', '/usr/lib/node_modules/pnpm/bin/pnpx.cjs');
+    binShim('/usr/local/bin/pnpm-oc', '/usr/lib/node_modules/pnpm-oc/cli.js');
     binShim('/usr/local/bin/corepack', '/usr/lib/node_modules/oc-sh/corepack.js');
     binShim('/usr/bin/sh', '/usr/lib/node_modules/oc-sh/sh.js');
     binShim('/bin/sh', '/usr/lib/node_modules/oc-sh/sh.js');
@@ -486,6 +488,10 @@ export async function bootKernel(opts: BootOptions): Promise<BootedKernel> {
     const acorn: any = require('internal/deps/acorn/acorn/dist/acorn');
     const builtinModules: string[] = cjsLoaderMod.Module?.builtinModules ?? [];
     const requireCjsFile = (p: string): any => cjsLoaderMod.Module._load(p, null, true);
+    // Kernel file-require hook for the in-process worker_threads compat
+    // layer (natives/worker.ts): worker scripts load through node's own CJS
+    // loader — same VFS, same require cache, same semantics.
+    (globalThis as any).__ocRequireFile = requireCjsFile;
     const importer = makeEsmGraphImporter({
       vfs: nativesCtx.vfs,
       requireBuiltin: require,
