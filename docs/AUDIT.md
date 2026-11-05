@@ -39,7 +39,7 @@
 | npm 12.2.1 | **A** | `vendor/npm-12.2.1/` — upstream tarball, sha256 provenance, 1941 mounted files; real CLI executes: `test-npm-real.ts` **12/12** (init → real-registry install lodash → ls → fresh-process require), browser E2E green through commit 694510d |
 | pnpm 10.34.9 | **A** | `vendor/pnpm-10.34.9/` — unmodified upstream (provenance.json: "modified": false; 10.x = last pure-JS line, ≥11 is a native binary no browser container can exec); browser E2E "downloaded 1, added 1, done" (commit f5ab4a7) + bun harness re-verified this session |
 | npx | **A** | npm's own `libnpmexec` through the vendored npm CLI (`npx --yes cowsay` child-process E2E in 694510d; `_npx` cache + isolation probe in S6 driver) |
-| `npx create-vite`-class generators | **A→E boundary** | install phase real (105 pkgs); generator crashes at the ESM boundary → **E** (module_wrap, §4) — honest exit 1, documented |
+| `npx create-vite` / `npx create-expo-app` generators | **A** | both scaffold end-to-end through the REAL npx machinery + real registry (browsers E2E gate `npx-generators-driver.js` 7/7, commit a24f1e1) — unlocked by webstreams-globals/SAB-alias/setEncoding kernel fixes; the esm-to-cjs facade carries the generators' own ESM |
 | corepack | **D** | stub shim (labeled) |
 | npm-oc / pnpm-oc (legacy DIY) | **C** | first-party fallbacks, demoted to rollback-only (not on default PATH) |
 | Registry network path | **B/C** | `/api/oc-net` CORS bridge (C, allowlist registry.npmjs.org) + fetch-backed http client (B, node http API semantics, 32/32 gate) |
@@ -56,10 +56,10 @@
 
 | Component | Class | Evidence |
 |---|---|---|
-| Static import/export of ESM (npm deps) | **C** | `kernel/esm-to-cjs.ts`: acorn byte-exact import/export surgery → real CJS pipeline; live bindings/TDA/re-exports; powers npm's own ESM deps + `require(esm)` |
+| Static import/export of ESM (npm deps) | **C** | `kernel/esm-to-cjs.ts`: acorn byte-exact import/export surgery → real CJS pipeline; live bindings/TDA/re-exports; powers npm's own ESM deps + `require(esm)` + create-vite/create-expo-app generators (a24f1e1) |
 | Dynamic `import()` graph | **C** | `kernel/esm-graph.ts` (edges, TLA, CJS interop) — E2E 17/17 (S3.1) |
 | `import.meta` | **C** | inline meta object (esm-to-cjs) |
-| Native `ModuleWrap` synchronous instantiation | **E** | browser JS has no sync module instantiation — the fundamental boundary; `create-vite` generator, Vite dev/HMR, Next.js dev blocked here (documented COMPATIBILITY.md §4) |
+| Native `ModuleWrap` synchronous instantiation | **E** | browser JS has no sync module instantiation — the remaining boundary; direct `import()` of arbitrary ESM graphs works via esm-graph, but tooling that needs module_wrap internals (Vite dev-server transforms, Next.js dev) is blocked (COMPATIBILITY.md §4) — the create-* GENERATORS now pass through the esm-to-cjs facade |
 
 ## 5. Filesystem
 
@@ -120,6 +120,7 @@
 - **D**: brotli/zstd, public-key crypto, TLS, external TCP, DNS (local
   only), spawn_sync, fork/ipc channels, receiveMessageOnPort, v8 profilers,
   corepack — all fail loudly with descriptive errors.
-- **E**: native ModuleWrap sync ESM (the create-* generator boundary),
-  WebSockets/HMR transport, PTY, bash, multi-node-version selection
-  (WebContainer offers engines.node/.nvmrc pinning; we pin v26.13.0).
+- **E**: native ModuleWrap sync ESM internals (Vite dev/HMR + Next.js dev
+  remain blocked; the create-* generators NO LONGER are), WebSockets/HMR
+  transport, PTY, bash, multi-node-version selection (WebContainer offers
+  engines.node/.nvmrc pinning; we pin v26.13.0).

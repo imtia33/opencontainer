@@ -498,3 +498,53 @@ Also: fflate added as devDependency (it was inlined in the committed worker but 
 Evidence (this session, bun harness): buffer parity 53/53, http client 32/32, `npm -v` → 12.2.1, zlib 23/23, real-npm 12/12. Kernel worker + blobs rebuilt (content hashes unchanged: d3f3d922/d518032c), dist rebuilt.
 
 Known remaining: pnpm is still the DIY pnpm-oc (honest, labeled); npx/child-spawn requires the browser host (harness has no ProcessManager); browser E2E evidence regeneration pending (lost host app).
+
+## Session 14 — 2026-11-06 (WebContainer parity initiative: research → audit → facade → generators)
+
+The standing directive executed end-to-end. Primary-source WebContainer
+research (docs/webcontainer-research.md — exact API from webcontainers.io,
+COOP/COEP requirement, Node 24 default, their no-persistence model) →
+source-verified A-E audit (docs/AUDIT.md) → implementation → 7 integration
+tests → docs/REPORT-A-F.md.
+
+Landed (commits b2454ba, 8db86df*, a24f1e1):
+1. Shared-realm lifecycle fix (module-scope host timer capture +
+   restoreHostGlobals on kernel exit) — revived the silently-dead
+   test-npm-real (12/12 again).
+2. WebContainer facade (webcontainer-api.ts) + runtime.spawnProgram
+   (host-owned pipe stdio; stdio{pipeId} routing made node-correct).
+   Browser E2E 27/27.
+3. Node webstreams installed as globals (17 classes, realm-restored) —
+   node-brand vs browser-brand clash had killed every stream crossing.
+4. SAB polyfill de-poisoned (isSharedArrayBuffer alias-aware at call time;
+   binding fns never use `this` — node destructures).
+5. fs O_TRUNC/O_APPEND; FetchIncomingMessage.setEncoding.
+6. POSIX rename(2) matrix + HandleWrap.close(cb) (completed prior in-flight
+   work).
+7. NEW GATES: test-node-api.ts (45/45 authenticity), wc-facade-driver.js
+   (27/27), npx-generators-driver.js (7/7).
+
+HEADLINE: npx create-vite AND npx create-expo-app scaffold end-to-end in
+the browser through the REAL npx machinery (the "general capability, no
+shortcuts" requirement) — the ESM-boundary belief was WRONG for generators;
+esm-to-cjs carries them. AUDIT.md corrected accordingly.
+
+Final fresh numbers (all re-run on the final build): node-api 45/45,
+real-npm 12/12, pnpm install done (real registry), zlib 23/23, buffer
+53/53, http 32/32, m1 18/18, facade 27/27, generators 7/7.
+
+Lessons:
+1. A swapped-global realm must be RETURNED to its host (timers/process/
+   console/Buffer/webstreams) — kernel exit is the funnel (onExit wrapper).
+2. Node parity means node's OWN webstreams as globals — the browser's
+   natives break every brand check at the boundary.
+3. A polyfill that aliases a class (SAB→AB) poisons every instanceof of the
+   aliased class — validate the alias, not the name.
+4. E2E drivers must clean state through the REAL fs API — a shell `rm` that
+   "command not found"s turns into interactive prompts that hang the next
+   run.
+5. open(2) semantics (O_TRUNC/O_APPEND) are load-bearing for every
+   atomic-overwrite writer; the authenticity suite (value assertions, never
+   "did not throw") is the tool that surfaces them.
+
+*) facade commit hash — see git log; the report (docs/REPORT-A-F.md) cites it.
