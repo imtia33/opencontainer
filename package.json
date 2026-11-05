@@ -29,7 +29,6 @@
   "engines": {
     "node": ">=18"
   },
-  "sideEffects": false,
   "main": "./dist/opencontainer.mjs",
   "module": "./dist/opencontainer.mjs",
   "types": "./dist-types/index.d.ts",
