@@ -101,6 +101,33 @@ interface ConnectionRoute {
   preview: MessagePort | null;                    // preview bridge end
 }
 
+/** Host-owned end of a guest process's stdio pipe (facade spawnProgram).
+ *  parentPid === 0 in the pipe table marks the HOST as the pipe's reader
+ *  (fd 1/2) or writer (fd 0). */
+interface HostPipeSink {
+  push(bytes: Uint8Array): void;
+  close(): void;
+}
+
+/** Programmatic (WebContainer-API shape) process handle from spawnProgram. */
+export interface ProgramHandle {
+  pid: number;
+  /** Resolves with the exit code when the process exits. */
+  exit: Promise<number>;
+  /** Writable stdin pipe (string chunks). */
+  input: WritableStream<string>;
+  /** Readable stdout pipe. */
+  output: ReadableStream<string>;
+  /** Readable stdout pipe — WebContainer merges stderr here; to stay
+   *  drop-in we do the same (fd1 + fd2 both feed `output`), while
+   *  `stderr` (an OpenContainer extension) stays fd2-only. */
+  stderr: ReadableStream<string>;
+  /** Best-effort terminal-size update (affects TTY-attached children). */
+  resize(size: { cols: number; rows: number }): void;
+  /** Terminate (SIGTERM semantics — hard worker termination). */
+  kill(): void;
+}
+
 const MAX_LIVE_PROCESSES = 8;
 
 export class OpenContainerRuntime {
@@ -108,6 +135,9 @@ export class OpenContainerRuntime {
   private pipes = new Map<number, PipeRoute>();
   private connections = new Map<number, ConnectionRoute>();
   private ports = new Map<number, { pid: number }>();
+  /** Host-owned pipe ends (facade processes): pipeId → sink. */
+  private hostPipeSinks = new Map<number, HostPipeSink>();
+  private nextHostPipeId = 1_000_000; // never collides with guest pipe ids
   private nextPid = 2;              // 1 = shell keeper
   private nextConnId = 1;
   private listeners = new Map<keyof RuntimeEventMap, Set<(...args: never[]) => void>>();
@@ -283,6 +313,16 @@ export class OpenContainerRuntime {
         break;
       case 'stdio': {
         const fd = (msg.fd ?? 1) as 1 | 2;
+        // Piped child output (process.stdout.write with pipe stdio) routes
+        // through the pipe table — node semantics: piped bytes belong to the
+        // pipe's reader (guest parent or the host), NOT the terminal.
+        if (msg.pipeId !== undefined) {
+          const route = this.pipes.get(msg.pipeId);
+          if (route) {
+            this.deliverPipeOutput(msg.pipeId, route, msg.bytes ?? new TextEncoder().encode(msg.chunk ?? ''));
+            break;
+          }
+        }
         if (msg.bytes) {
           this.emit('stdio', fd, new TextDecoder().decode(msg.bytes));
         } else {
@@ -302,10 +342,7 @@ export class OpenContainerRuntime {
               type: 'stdin', data: undefined, bytes: msg.bytes, pipeId: msg.pipeId,
             });
           } else {
-            const parent = this.processes.get(route.parentPid);
-            parent?.worker.postMessage({
-              type: 'pipe-data', pipeId: msg.pipeId, bytes: msg.bytes,
-            });
+            this.deliverPipeOutput(msg.pipeId, route, msg.bytes);
           }
         }
         break;
@@ -360,16 +397,6 @@ export class OpenContainerRuntime {
       case 'child-kill':
         this.killProcess(msg.pid, msg.signal ?? 'SIGTERM');
         break;
-      case 'pipe-write': {
-        const route = this.pipes.get(msg.pipeId);
-        if (route) {
-          const child = this.processes.get(route.childPid);
-          child?.worker.postMessage({
-            type: 'stdin', data: undefined, bytes: msg.bytes, pipeId: msg.pipeId,
-          });
-        }
-        break;
-      }
       case 'pipe-close': {
         const route = this.pipes.get(msg.pipeId);
         if (route) {
@@ -377,6 +404,9 @@ export class OpenContainerRuntime {
             // Parent closed the child's stdin → EOF.
             const child = this.processes.get(route.childPid);
             child?.worker.postMessage({ type: 'stdin-eof' });
+          } else if (route.parentPid === 0) {
+            // Host-owned read end: the child closed its stdout/stderr.
+            this.closeHostPipe(msg.pipeId);
           } else {
             // The write end of a child's stdout/stderr went away.
             const parent = this.processes.get(route.parentPid);
@@ -446,6 +476,28 @@ export class OpenContainerRuntime {
     }
   }
 
+  /** Deliver a child's piped output bytes (fd 1/2) to the pipe's reader:
+   *  a guest parent process or — for parentPid 0 — the host (facade). */
+  private deliverPipeOutput(pipeId: number, route: PipeRoute, bytes: Uint8Array | undefined): void {
+    if (!bytes) return;
+    if (route.parentPid === 0) {
+      this.hostPipeSinks.get(pipeId)?.push(bytes);
+      return;
+    }
+    const parent = this.processes.get(route.parentPid);
+    parent?.worker.postMessage({ type: 'pipe-data', pipeId, bytes });
+  }
+
+  /** Close a host-owned pipe end (stream EOF) and forget its route. */
+  private closeHostPipe(pipeId: number): void {
+    const sink = this.hostPipeSinks.get(pipeId);
+    if (sink) {
+      this.hostPipeSinks.delete(pipeId);
+      sink.close();
+    }
+    this.pipes.delete(pipeId);
+  }
+
   private onProcessExit(proc: KernelProcess, code: number, signal: string | null) {
     if (proc.exited) return;
     proc.exited = true;
@@ -470,6 +522,13 @@ export class OpenContainerRuntime {
         }
       }
       parent?.children.delete(proc.pid);
+    }
+
+    // Host-owned pipes (facade processes): the streams see EOF now.
+    for (const [pipeId, route] of [...this.pipes]) {
+      if (route.childPid === proc.pid && route.parentPid === 0 && route.fd > 0) {
+        this.closeHostPipe(pipeId);
+      }
     }
 
     // Close virtual connections owned by this process.
@@ -1009,6 +1068,129 @@ export class OpenContainerRuntime {
         if (info.pid === proc.pid) { off(); resolve(); }
       });
     });
+  }
+
+  // ------------------------------------------------------- programmatic spawn
+  /**
+   * Spawn a command as a PIPE-STDIO process owned by the HOST — the
+   * WebContainer-API process shape (exit/input/output/kill/resize), no
+   * terminal involvement. Used by the WebContainer facade.
+   *
+   * Command resolution is the same as the terminal spawn (internal bins,
+   * node -e/-p/script forms, PATH + node_modules/.bin walk-up) but resolves
+   * script paths against `opts.cwd` when given.
+   */
+  async spawnProgram(
+    command: string,
+    args: string[],
+    opts: {
+      cwd?: string;
+      env?: Record<string, string>;
+      terminal?: { cols: number; rows: number };
+    } = {},
+  ): Promise<ProgramHandle> {
+    await this.ready;
+    const cwd = opts.cwd ?? this.cwd;
+    const prevCwd = this.cwd;
+    if (opts.cwd) this.cwd = opts.cwd; // resolveShellCommand resolves via cwd
+    let spec: ReturnType<OpenContainerRuntime['resolveShellCommand']>;
+    try {
+      spec = this.resolveShellCommand(command, args);
+    } finally {
+      if (opts.cwd) this.cwd = prevCwd;
+    }
+    if (spec.error || !spec.entry) {
+      throw new Error(spec.error ?? `OpenContainer: cannot spawn '${command}'`);
+    }
+    const pid = this.nextPid++;
+    const stdinId = this.nextHostPipeId++;
+    const stdoutId = this.nextHostPipeId++;
+    const stderrId = this.nextHostPipeId++;
+    const proc = this.createProcess({
+      pid,
+      parentPid: null,
+      stdio: [
+        { type: 'pipe', pipeId: stdinId },
+        { type: 'pipe', pipeId: stdoutId },
+        { type: 'pipe', pipeId: stderrId },
+      ],
+      entry: spec.entry,
+      env: opts.env ? { ...spec.env, ...opts.env } : spec.env,
+      cwd,
+      argv: spec.argv,
+      repl: spec.entry.type === 'repl',
+      background: true,
+    });
+    for (const [pipeId, fd] of [[stdinId, 0], [stdoutId, 1], [stderrId, 2]] as const) {
+      this.pipes.set(pipeId, { parentPid: 0, childPid: pid, fd });
+    }
+
+    // Output streams: `output` merges fd1+fd2 (WebContainer drop-in
+    // semantics); `stderr` is fd2-only (OpenContainer extension).
+    const decoder = new TextDecoder();
+    let outCtrl: ReadableStreamDefaultController<string> | null = null;
+    let errCtrl: ReadableStreamDefaultController<string> | null = null;
+    for (const pipeId of [stdoutId, stderrId]) {
+      this.hostPipeSinks.set(pipeId, {
+        push: (bytes) => {
+          const text = decoder.decode(bytes, { stream: true });
+          if (text) {
+            outCtrl?.enqueue(text); // merged output (drop-in)
+            if (pipeId === stderrId) errCtrl?.enqueue(text);
+          }
+        },
+        close: () => {
+          if (pipeId === stdoutId) {
+            try { outCtrl?.close(); } catch { /* already closed */ }
+          } else {
+            try { errCtrl?.close(); } catch { /* already closed */ }
+          }
+        },
+      });
+    }
+    const output = new ReadableStream<string>({
+      start(c) { outCtrl = c; },
+      cancel() { outCtrl = null; },
+    });
+    const stderr = new ReadableStream<string>({
+      start(c) { errCtrl = c; },
+      cancel() { errCtrl = null; },
+    });
+
+    const input = new WritableStream<string>({
+      write: (chunk) => {
+        if (!proc.exited) proc.worker.postMessage({ type: 'stdin', data: chunk });
+      },
+      close: () => {
+        if (!proc.exited) proc.worker.postMessage({ type: 'stdin-eof' });
+      },
+    });
+
+    const exit = new Promise<number>((resolve) => {
+      const off = this.on('exit', (info) => {
+        if (info.pid === pid) {
+          off();
+          resolve(info.code ?? 0);
+        }
+      });
+    });
+
+    this.emit('processStart', { pid, repl: spec.entry.type === 'repl', background: true });
+    if (opts.terminal) {
+      proc.worker.postMessage({ type: 'resize', cols: opts.terminal.cols, rows: opts.terminal.rows });
+    }
+
+    return {
+      pid,
+      exit,
+      input,
+      output,
+      stderr,
+      resize: (size: { cols: number; rows: number }) => {
+        if (!proc.exited) proc.worker.postMessage({ type: 'resize', cols: size.cols, rows: size.rows });
+      },
+      kill: () => { this.killProcess(pid, 'SIGTERM'); },
+    };
   }
 
   /** Resolve a shell command against the internal bins + VFS PATH. */

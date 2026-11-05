@@ -35,7 +35,7 @@ export interface WebContainerOptions {
 }
 
 /* ------------------------------------------------------------------ */
-/* Filesystem tree (mount format)                                      */
+/* Filesystem tree (mount format — exact @webcontainer/api shapes)      */
 /* ------------------------------------------------------------------ */
 
 export interface DirectoryEntry {
@@ -53,9 +53,16 @@ export interface TextFile {
   contents: string;
 }
 
-export type FileEntry = { file: TextFile | BinaryFile };
+/** Upstream FileNode: `{ file: { contents: string | Uint8Array } }`. */
+export interface FileEntry { file: TextFile | BinaryFile }
 
-export type FileSystemEntry = DirectoryEntry | FileEntry;
+/** Upstream SymlinkNode: `{ file: { symlink: 'target' } }` — first-class
+ *  symlinks in the mount format (webcontainers.io API reference). */
+export interface SymlinkEntry {
+  file: { symlink: string };
+}
+
+export type FileSystemEntry = DirectoryEntry | FileEntry | SymlinkEntry;
 
 export type FileSystemTree = Record<string, FileSystemEntry>;
 
@@ -143,7 +150,8 @@ export interface WebContainerProcess {
 
 export type ServerReadyListener = (port: number, url: string) => void;
 export type PortListener = (port: number, type: 'open' | 'close', url: string) => void;
-export type ErrorListener = (message: string) => void;
+/** Upstream shape: receives `{ message }` (webcontainers.io API reference). */
+export type ErrorListener = (error: { message: string }) => void;
 export type PreviewMessageListener = (data: unknown) => void;
 
 export interface RuntimeInfo {

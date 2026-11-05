@@ -112,6 +112,10 @@ term.onData((d) => {
 });
 
 // ---- preview ServiceWorker + bridge glue ----------------------------------
+// Page-level runtime registry: the terminal runtime PLUS any WebContainer
+// facade runtimes booted by embedders/drivers — the SW bridge asks each
+// until one owns the port (multi-runtime pages, e.g. facade E2E).
+window.__ocRuntimes = [rt];
 try {
   const reg = await navigator.serviceWorker.register('/opencontainer/preview-sw.js', { scope: '/' });
   await navigator.serviceWorker.ready;
@@ -123,8 +127,8 @@ try {
     const m = ev.data;
     if (m && m.type === 'oc-preview-fetch') {
       const channel = ev.ports[0];
-      const ok = rt.connectPreview(m.port, channel, m.bytes);
-      if (!ok) {
+      const owner = window.__ocRuntimes.find((r) => r.connectPreview(m.port, channel, m.bytes));
+      if (!owner) {
         try { channel.postMessage({ type: 'end' }); } catch (e) { /* closed */ }
       }
     }
