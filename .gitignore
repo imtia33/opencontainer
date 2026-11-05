@@ -1,6 +1,9 @@
 # OpenContainer package repo — build noise only; runtime blobs are committed.
-node_modules/
-dist-types/
+# Root-anchored on purpose: vendored trees (vendor/npm-12.2.1/node_modules —
+# npm's bundled deps) MUST stay tracked. A bare `node_modules` pattern
+# silently dropped ~1,500 of npm's files from git once.
+/node_modules/
+/dist-types/
 *.tsbuildinfo
 .DS_Store
 *.log
