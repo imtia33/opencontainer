@@ -1,0 +1,19 @@
+{
+  "name": "npm",
+  "version": "12.2.1",
+  "tarball": "https://registry.npmjs.org/npm/-/npm-12.2.1.tgz",
+  "sha256": "228bd64aaef23270dbdbd2cf3d5ef5c467602ef38c4066246cef1984adab9a67",
+  "dist_shasum_sha1": "2a2765aa5b36f68006ea7132bd3f20b095a85c6e",
+  "fileCount": 1942,
+  "totalBytes": 12430582,
+  "fetchedAt": "2026-11-05T05:00:22Z",
+  "note": "unmodified upstream npm CLI tree — never patch files in this directory",
+  "binaryFiles": [
+    {
+      "path": "node_modules/qrcode-terminal/example/basic.png",
+      "bytes": 46426,
+      "reason": "PNG image (contains NUL bytes); excluded from the UTF-8 OCRT runtime blob and from harness mounts"
+    }
+  ],
+  "layout": "Extracted from the registry tarball with the package/ prefix stripped (tar --strip-components=1); byte-exact, no files added or edited. The only file owned by this repo is this .provenance.json itself (it is likewise excluded from the runtime blob)."
+}

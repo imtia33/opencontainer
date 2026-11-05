@@ -1,0 +1,7 @@
+# OpenContainer package repo — build noise only; runtime blobs are committed.
+node_modules/
+dist-types/
+*.tsbuildinfo
+.DS_Store
+*.log
+.env*

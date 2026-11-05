@@ -1,0 +1,7 @@
+{
+  "name": "@opencontainer/pnpm-oc",
+  "version": "1.0.0",
+  "description": "OpenContainer pnpm-layout installer for scenario-A packages (pure JS, no lifecycle scripts). Symlinked node_modules with a .pnpm virtual store — pnpm's resolution semantics — loaded by node's real CJS loader at /usr/lib/node_modules/pnpm-oc.",
+  "main": "cli.js",
+  "license": "MIT"
+}

@@ -1,0 +1,8 @@
+{
+  "name": "@opencontainer/npm-oc",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OpenContainer registry-faithful npm installer for scenario-A packages (pure JS, no lifecycle scripts). Loaded by node's real CJS loader at /usr/lib/node_modules/npm-oc.",
+  "main": "cli.js",
+  "license": "MIT"
+}

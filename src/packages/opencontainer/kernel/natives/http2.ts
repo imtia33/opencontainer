@@ -1,0 +1,283 @@
+import type { Binding } from './index';
+
+/**
+ * internalBinding('http2') — constants + surface for node's lib/http2.
+ *
+ * npm's vendored undici requires('http2') eagerly (h2 client detection) —
+ * node's internal/http2/{core,compat,util}.js destructure the full constants
+ * table at module load. Actual HTTP/2 SESSIONS are not implemented in the
+ * browser runtime (no sockets); constructing one fails honestly with
+ * ERR_HTTP2 — npm's registry path never opens an h2 session.
+ */
+
+const HEADER_LITERALS: Record<string, string> = {
+  HTTP2_HEADER_AUTHORITY: ':authority',
+  HTTP2_HEADER_METHOD: ':method',
+  HTTP2_HEADER_PATH: ':path',
+  HTTP2_HEADER_SCHEME: ':scheme',
+  HTTP2_HEADER_STATUS: ':status',
+};
+
+/** header-name constants: HTTP2_HEADER_X_Y → 'x-y' (node's llhttp table). */
+function headerNameOf(name: string): string {
+  if (HEADER_LITERALS[name] !== undefined) return HEADER_LITERALS[name];
+  return name.slice('HTTP2_HEADER_'.length).toLowerCase().replace(/_/g, '-');
+}
+
+const NUMERIC: Record<string, number> = {
+  // status codes
+  HTTP_STATUS_SWITCHING_PROTOCOLS: 101,
+  HTTP_STATUS_PROCESSING: 102,
+  HTTP_STATUS_EARLY_HINTS: 103,
+  HTTP_STATUS_OK: 200,
+  HTTP_STATUS_CREATED: 201,
+  HTTP_STATUS_ACCEPTED: 202,
+  HTTP_STATUS_NO_CONTENT: 204,
+  HTTP_STATUS_RESET_CONTENT: 205,
+  HTTP_STATUS_PARTIAL_CONTENT: 206,
+  HTTP_STATUS_MULTIPLE_CHOICES: 300,
+  HTTP_STATUS_MOVED_PERMANENTLY: 301,
+  HTTP_STATUS_FOUND: 302,
+  HTTP_STATUS_SEE_OTHER: 303,
+  HTTP_STATUS_NOT_MODIFIED: 304,
+  HTTP_STATUS_USE_PROXY: 305,
+  HTTP_STATUS_TEMPORARY_REDIRECT: 307,
+  HTTP_STATUS_PERMANENT_REDIRECT: 308,
+  HTTP_STATUS_BAD_REQUEST: 400,
+  HTTP_STATUS_UNAUTHORIZED: 401,
+  HTTP_STATUS_PAYMENT_REQUIRED: 402,
+  HTTP_STATUS_FORBIDDEN: 403,
+  HTTP_STATUS_NOT_FOUND: 404,
+  HTTP_STATUS_METHOD_NOT_ALLOWED: 405,
+  HTTP_STATUS_NOT_ACCEPTABLE: 406,
+  HTTP_STATUS_PROXY_AUTHENTICATION_REQUIRED: 407,
+  HTTP_STATUS_REQUEST_TIMEOUT: 408,
+  HTTP_STATUS_CONFLICT: 409,
+  HTTP_STATUS_GONE: 410,
+  HTTP_STATUS_LENGTH_REQUIRED: 411,
+  HTTP_STATUS_PRECONDITION_FAILED: 412,
+  HTTP_STATUS_PAYLOAD_TOO_LARGE: 413,
+  HTTP_STATUS_URI_TOO_LONG: 414,
+  HTTP_STATUS_UNSUPPORTED_MEDIA_TYPE: 415,
+  HTTP_STATUS_RANGE_NOT_SATISFIABLE: 416,
+  HTTP_STATUS_EXPECTATION_FAILED: 417,
+  HTTP_STATUS_MISDIRECTED_REQUEST: 421,
+  HTTP_STATUS_UNPROCESSABLE_ENTITY: 422,
+  HTTP_STATUS_TOO_MANY_REQUESTS: 429,
+  HTTP_STATUS_REQUEST_HEADER_FIELDS_TOO_LARGE: 431,
+  HTTP_STATUS_UNAVAILABLE_FOR_LEGAL_REASONS: 451,
+  HTTP_STATUS_INTERNAL_SERVER_ERROR: 500,
+  HTTP_STATUS_NOT_IMPLEMENTED: 501,
+  HTTP_STATUS_BAD_GATEWAY: 502,
+  HTTP_STATUS_SERVICE_UNAVAILABLE: 503,
+  HTTP_STATUS_GATEWAY_TIMEOUT: 504,
+  HTTP_STATUS_HTTP_VERSION_NOT_SUPPORTED: 505,
+  HTTP_STATUS_INSUFFICIENT_STORAGE: 507,
+  HTTP_STATUS_LOOP_DETECTED: 508,
+  // methods
+  HTTP2_METHOD_CONNECT: 'CONNECT',
+  HTTP2_METHOD_DELETE: 'DELETE',
+  HTTP2_METHOD_GET: 'GET',
+  HTTP2_METHOD_HEAD: 'HEAD',
+  // nghttp2 frame/header categories + flags
+  NGHTTP2_NO_ERROR: 0,
+  NGHTTP2_INTERNAL_ERROR: 2,
+  NGHTTP2_CANCEL: 8,
+  NGHTTP2_REFUSED_STREAM: 7,
+  NGHTTP2_DEFAULT_WEIGHT: 16,
+  NGHTTP2_FLAG_END_STREAM: 1,
+  NGHTTP2_FLAG_NONE: 0,
+  NGHTTP2_NV_FLAG_NONE: 0,
+  NGHTTP2_NV_FLAG_NO_INDEX: 1,
+  NGHTTP2_HCAT_HEADERS: 0,
+  NGHTTP2_HCAT_PUSH_RESPONSE: 1,
+  NGHTTP2_HCAT_RESPONSE: 2,
+  NGHTTP2_HCAT_REQUEST: 3,
+  NGHTTP2_SESSION_CLIENT: 0,
+  NGHTTP2_SESSION_SERVER: 1,
+  // settings ids
+  NGHTTP2_SETTINGS_HEADER_TABLE_SIZE: 1,
+  NGHTTP2_SETTINGS_ENABLE_PUSH: 2,
+  NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS: 3,
+  NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE: 4,
+  NGHTTP2_SETTINGS_MAX_FRAME_SIZE: 5,
+  NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE: 6,
+  NGHTTP2_SETTINGS_ENABLE_CONNECT_PROTOCOL: 8,
+  // error codes (negative, nghttp2-style)
+  NGHTTP2_ERR_INVALID_ARGUMENT: -501,
+  NGHTTP2_ERR_NOMEM: -901,
+  NGHTTP2_ERR_STREAM_CLOSED: -515,
+  NGHTTP2_ERR_STREAM_ID_NOT_AVAILABLE: -509,
+  // session/stream error categories (used by internal/errors codes)
+  HTTP2_ERROR: 1,
+  HTTP2_SESSION_ERROR: 2,
+  HTTP2_STREAM_ERROR: 3,
+  HTTP2_HEADERS_SENT: 4,
+  HTTP2_HEADERS_AFTER_RESPOND: 5,
+  HTTP2_INFO_STATUS_NOT_ALLOWED: 6,
+  HTTP2_INVALID_HEADER_VALUE: 7,
+  HTTP2_INVALID_INFO_STATUS: 8,
+  HTTP2_INVALID_PACKED_SETTINGS_LENGTH: 9,
+  HTTP2_INVALID_PSEUDOHEADER: 10,
+  HTTP2_INVALID_SESSION: 11,
+  HTTP2_INVALID_SETTING_VALUE: 12,
+  HTTP2_INVALID_STREAM: 13,
+  HTTP2_MAX_PENDING_SETTINGS_ACK: 14,
+  HTTP2_NESTED_PUSH: 15,
+  HTTP2_NO_MEM: 16,
+  HTTP2_NO_SOCKET_MANIPULATION: 17,
+  HTTP2_ORIGIN_LENGTH: 18,
+  HTTP2_OUT_OF_STREAMS: 19,
+  HTTP2_PAYLOAD_FORBIDDEN: 20,
+  HTTP2_PING_CANCEL: 21,
+  HTTP2_PING_LENGTH: 22,
+  HTTP2_PUSH_DISABLED: 23,
+  HTTP2_SEND_FILE: 24,
+  HTTP2_SEND_FILE_NOSEEK: 25,
+  HTTP2_SETTINGS_CANCEL: 26,
+  HTTP2_SOCKET_BOUND: 27,
+  HTTP2_SOCKET_UNBOUND: 28,
+  HTTP2_STATUS_101: 29,
+  HTTP2_STATUS_INVALID: 30,
+  HTTP2_STREAM_CANCEL: 31,
+  HTTP2_STREAM_SELF_DEPENDENCY: 32,
+  HTTP2_TOO_MANY_CUSTOM_SETTINGS: 33,
+  HTTP2_TOO_MANY_ORIGINS: 34,
+  HTTP2_TRAILERS_ALREADY_SENT: 35,
+  HTTP2_TRAILERS_NOT_READY: 36,
+  HTTP2_UNSUPPORTED_PROTOCOL: 37,
+  HTTP2_INVALID_CONNECTION_HEADERS: 38,
+  HTTP2_CONNECT_AUTHORITY: 39,
+  HTTP2_CONNECT_PATH: 40,
+  HTTP2_CONNECT_SCHEME: 41,
+  HTTP2_ALTSVC_INVALID_ORIGIN: 42,
+  HTTP2_ALTSVC_LENGTH: 43,
+  HTTP2_GOAWAY_SESSION: 44,
+  // misc
+  PADDING_STRATEGY_NONE: 0,
+  PADDING_STRATEGY_MAX: 1,
+  PADDING_STRATEGY_ALIGNED: 2,
+  HTTP2_PADDING_BUF_SIZE: 256,
+};
+
+/** all HTTP2_HEADER_* names node's http2 libs reference. */
+const HEADER_CONST_NAMES = [
+  'HTTP2_HEADER_ACCEPT', 'HTTP2_HEADER_ACCEPT_CHARSET',
+  'HTTP2_HEADER_ACCEPT_ENCODING', 'HTTP2_HEADER_ACCEPT_LANGUAGE',
+  'HTTP2_HEADER_ACCEPT_RANGES', 'HTTP2_HEADER_ACCESS_CONTROL_ALLOW_CREDENTIALS',
+  'HTTP2_HEADER_ACCESS_CONTROL_ALLOW_HEADERS',
+  'HTTP2_HEADER_ACCESS_CONTROL_ALLOW_METHODS',
+  'HTTP2_HEADER_ACCESS_CONTROL_ALLOW_ORIGIN',
+  'HTTP2_HEADER_ACCESS_CONTROL_EXPOSE_HEADERS',
+  'HTTP2_HEADER_ACCESS_CONTROL_MAX_AGE',
+  'HTTP2_HEADER_ACCESS_CONTROL_REQUEST_HEADERS',
+  'HTTP2_HEADER_ACCESS_CONTROL_REQUEST_METHOD',
+  'HTTP2_HEADER_AGE', 'HTTP2_HEADER_ALLOW', 'HTTP2_HEADER_AUTHORITY',
+  'HTTP2_HEADER_AUTHORIZATION', 'HTTP2_HEADER_CACHE_CONTROL',
+  'HTTP2_HEADER_CONNECTION', 'HTTP2_HEADER_CONTENT_DISPOSITION',
+  'HTTP2_HEADER_CONTENT_ENCODING', 'HTTP2_HEADER_CONTENT_LANGUAGE',
+  'HTTP2_HEADER_CONTENT_LENGTH', 'HTTP2_HEADER_CONTENT_LOCATION',
+  'HTTP2_HEADER_CONTENT_MD5', 'HTTP2_HEADER_CONTENT_RANGE',
+  'HTTP2_HEADER_CONTENT_TYPE', 'HTTP2_HEADER_COOKIE', 'HTTP2_HEADER_DATE',
+  'HTTP2_HEADER_DNT', 'HTTP2_HEADER_EARLY_DATA', 'HTTP2_HEADER_ETAG',
+  'HTTP2_HEADER_EXPECT', 'HTTP2_HEADER_EXPIRES', 'HTTP2_HEADER_FROM',
+  'HTTP2_HEADER_HOST', 'HTTP2_HEADER_HTTP2_SETTINGS', 'HTTP2_HEADER_IF_MATCH',
+  'HTTP2_HEADER_IF_MODIFIED_SINCE', 'HTTP2_HEADER_IF_NONE_MATCH',
+  'HTTP2_HEADER_IF_RANGE', 'HTTP2_HEADER_IF_UNMODIFIED_SINCE',
+  'HTTP2_HEADER_KEEP_ALIVE', 'HTTP2_HEADER_LAST_MODIFIED',
+  'HTTP2_HEADER_LINK', 'HTTP2_HEADER_LOCATION', 'HTTP2_HEADER_MAX_FORWARDS',
+  'HTTP2_HEADER_METHOD', 'HTTP2_HEADER_PATH', 'HTTP2_HEADER_PROTOCOL',
+  'HTTP2_HEADER_PROXY_AUTHENTICATE', 'HTTP2_HEADER_PROXY_AUTHORIZATION',
+  'HTTP2_HEADER_PROXY_CONNECTION', 'HTTP2_HEADER_RANGE', 'HTTP2_HEADER_REFERER',
+  'HTTP2_HEADER_RETRY_AFTER', 'HTTP2_HEADER_SCHEME', 'HTTP2_HEADER_SERVER',
+  'HTTP2_HEADER_SET_COOKIE', 'HTTP2_HEADER_STATUS', 'HTTP2_HEADER_STRICT_TRANSPORT_SECURITY',
+  'HTTP2_HEADER_TE', 'HTTP2_HEADER_TIMING_ALLOW_ORIGIN', 'HTTP2_HEADER_TK',
+  'HTTP2_HEADER_TRAILER', 'HTTP2_HEADER_TRANSFER_ENCODING', 'HTTP2_HEADER_UPGRADE',
+  'HTTP2_HEADER_UPGRADE_INSECURE_REQUESTS', 'HTTP2_HEADER_USER_AGENT',
+  'HTTP2_HEADER_VARY', 'HTTP2_HEADER_VIA', 'HTTP2_HEADER_WARNING',
+  'HTTP2_HEADER_WWW_AUTHENTICATE', 'HTTP2_HEADER_X_CONTENT_TYPE_OPTIONS',
+  'HTTP2_HEADER_X_FRAME_OPTIONS', 'HTTP2_HEADER_X_XSS_PROTECTION',
+  // header lists used by util.js
+  'HTTP2_HEADER_SINGLE_VALUE',
+];
+
+const NGHTTP2_ERROR_STRINGS: Record<number, string> = {
+  0: 'No error',
+  [-1]: 'Protocol error',
+  [-2]: 'Internal error',
+  [-501]: 'Invalid argument',
+  [-509]: 'Stream ID is not available',
+  [-515]: 'Stream closed',
+  [-901]: 'Out of memory',
+};
+
+const constants: Record<string, any> = { __proto__: null };
+for (const name of HEADER_CONST_NAMES) {
+  if (name === 'HTTP2_HEADER_SINGLE_VALUE') continue;
+  constants[name] = headerNameOf(name);
+}
+// util.js: set of headers that may appear exactly once
+constants.HTTP2_HEADER_SINGLE_VALUE = new Set([
+  ':authority', 'content-length', 'content-type', 'cookie', 'date', 'dnt',
+  'expect', 'from', 'host', 'if-modified-since', 'if-unmodified-since',
+  'max-forwards', 'referer', 'user-agent',
+]);
+for (const [k, v] of Object.entries(NUMERIC)) {
+  if (typeof v === 'string') continue;
+  constants[k] = v;
+}
+constants.HTTP2_METHOD_CONNECT = 'CONNECT';
+constants.HTTP2_METHOD_DELETE = 'DELETE';
+constants.HTTP2_METHOD_GET = 'GET';
+constants.HTTP2_METHOD_HEAD = 'HEAD';
+
+/** Callbacks registered by core.js at load (sessions never start here). */
+let sessionCallbacks: any[] = [];
+
+export function makeHttp2Binding(): Binding {
+  return {
+    constants,
+
+    nameForErrorCode(code: number): string | undefined {
+      return NGHTTP2_ERROR_STRINGS[code];
+    },
+    nghttp2ErrorString(code: number): string {
+      return NGHTTP2_ERROR_STRINGS[code] ?? 'Unknown error code';
+    },
+
+    setCallbackFunctions(...fns: any[]): void {
+      sessionCallbacks = fns;
+    },
+    refreshDefaultSettings(): Record<string, number> {
+      return { __proto__: null };
+    },
+    packSettings(): Uint8Array {
+      // nghttp2 pack of the default settings = no entries → empty payload.
+      return new Uint8Array(0);
+    },
+    unpackSettings(buf: Uint8Array): Record<string, number> {
+      void buf;
+      return { __proto__: null };
+    },
+
+    /** Constructing a real HTTP/2 session in the browser runtime: honest
+     *  failure (npm's registry path only requires the module for h2
+     *  detection — undici h2 is disabled without ALPN sockets). */
+    Http2Session: class Http2Session {
+      constructor(_type: string) {
+        const err: any = new Error(
+          'HTTP/2 sessions are not implemented in the browser runtime');
+        err.code = 'ERR_HTTP2_SUPPORT';
+        throw err;
+      }
+    },
+    Http2Stream: class Http2Stream {
+      constructor() {
+        const err: any = new Error(
+          'HTTP/2 sessions are not implemented in the browser runtime');
+        err.code = 'ERR_HTTP2_SUPPORT';
+        throw err;
+      }
+    },
+  };
+}

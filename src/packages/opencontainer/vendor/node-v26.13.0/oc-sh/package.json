@@ -1,0 +1,1 @@
+{"name":"oc-sh","version":"1.0.0","private":true,"description":"OpenContainer POSIX-subset shell (runs as /bin/sh in the virtual OS)"}
