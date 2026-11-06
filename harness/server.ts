@@ -29,6 +29,7 @@ const MIME: Record<string, string> = {
   '.css': 'text/css; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
   '.gz': 'application/octet-stream',
+  '.ocrt': 'application/octet-stream',
   '.png': 'image/png',
   '.svg': 'image/svg+xml',
 };
@@ -39,6 +40,7 @@ function serveFile(req: Request, path: string, extraHeaders: Record<string, stri
     const headers: Record<string, string> = {
       'content-type': MIME[nodePath.extname(path)] ?? 'application/octet-stream',
       'cache-control': 'no-store',
+      'access-control-allow-origin': '*',
       ...extraHeaders,
     };
     return new Response(body, { status: 200, headers });

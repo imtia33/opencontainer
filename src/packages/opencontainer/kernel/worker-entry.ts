@@ -116,9 +116,17 @@ interface RuntimeIndex {
   nodeVersion: string;
   core: RuntimeIndexEntry;
   amaro: RuntimeIndexEntry;
+  npm?: RuntimeIndexEntry;
+  pnpm?: RuntimeIndexEntry;
 }
 
-const CACHE_NAME = 'opencontainer-runtime-v1';
+// v2: the blobs were renamed .ocrt.gz → .ocrt (static hosts stamp
+// Content-Encoding: gzip on .gz-suffixed files, which the browser then
+// transparently decodes — corrupting the double-gunzip assumption and, in
+// SW-controlled worker contexts, failing the fetch outright). The rename
+// plus the OCRT/gzip magic sniff below make both server behaviors safe; the
+// cache-name bump flushes any v1 entries.
+const CACHE_NAME = 'opencontainer-runtime-v2';
 
 function cacheKeyUrl(file: string): string {
   return `${runtimeBase}/${file}`;
@@ -168,6 +176,34 @@ async function gunzip(buf: ArrayBuffer): Promise<ArrayBuffer> {
   }
   const { gunzipSync } = await import('fflate');
   return gunzipSync(new Uint8Array(buf)).buffer as ArrayBuffer;
+}
+
+/** True when the buffer is a RAW OCRT container (magic "OCRT" at offset 0) —
+ *  i.e. NOT gzip. Used to survive transparent double-decode: a static host
+ *  that serves *.gz (or *.ocrt.gz) with `Content-Encoding: gzip` makes the
+ *  browser decode the transport layer, so fetch() hands us the RAW container
+ *  where the canonical bytes are gzip. Both server behaviors are accepted. */
+function looksLikeOcrt(buf: ArrayBuffer): boolean {
+  if (buf.byteLength < 4) return false;
+  const b = new Uint8Array(buf, 0, 4);
+  return b[0] === 0x4f && b[1] === 0x43 && b[2] === 0x52 && b[3] === 0x54; // "OCRT"
+}
+
+/** Normalize a fetched/cached runtime blob to the RAW OCRT container:
+ *  OCRT magic → as-is (host decoded the transport); gzip magic (1f 8b) →
+ *  gunzip; anything else → a configuration-pointing error. */
+async function toRawOcrt(buf: ArrayBuffer): Promise<ArrayBuffer> {
+  if (looksLikeOcrt(buf)) return buf;
+  if (buf.byteLength >= 2) {
+    const b = new Uint8Array(buf, 0, 2);
+    if (b[0] === 0x1f && b[1] === 0x8b) return gunzip(buf);
+  }
+  throw new Error(
+    'OpenContainer: runtime blob has unexpected leading bytes (expected gzip 1f 8b or OCRT ' +
+    'magic) — your static host is probably transforming the blob body (e.g. serving it with ' +
+    'Content-Encoding: gzip on a .gz suffix, or double-compressing). Serve the .ocrt files ' +
+    'as-is (application/octet-stream, no Content-Encoding).',
+  );
 }
 
 interface BlobEntry { p: string; o: number; l: number }
@@ -265,17 +301,37 @@ async function loadBlob(
   const tStart = performance.now();
   post({ type: 'boot-progress', phase: `${phase}:cache`, loaded: 0, total: entry.gzBytes });
   const cached = await readCache(entry.file);
-  if (cached) {
+  if (cached && looksLikeOcrt(cached)) {
     if (marks) marks[`${phase}CacheMs`] = Math.round(performance.now() - tStart);
     return cached;
   }
+  // Non-OCRT cache payload = a pre-fix poisoned entry → treat as a miss and
+  // self-heal (the write below overwrites it with the canonical raw form).
   post({ type: 'boot-progress', phase: `${phase}:fetch`, loaded: 0, total: entry.gzBytes });
-  const res = await fetch(cacheKeyUrl(entry.file));
+  let res: Response;
+  try {
+    res = await fetch(cacheKeyUrl(entry.file));
+  } catch (first) {
+    // A transient rejection here is almost always the preview ServiceWorker
+    // claiming/updating this client mid-boot (in-flight fetches of a client
+    // can be aborted). Retry once after a beat, bypassing the HTTP cache.
+    await new Promise((r) => setTimeout(r, 150));
+    try {
+      res = await fetch(cacheKeyUrl(entry.file), { cache: 'reload' });
+    } catch (second: any) {
+      throw new Error(
+        `runtime blob fetch failed: ${entry.file} (${second?.message ?? second} — ` +
+        `first error: ${first instanceof Error ? first.message : String(first)})`,
+      );
+    }
+  }
   if (!res.ok) throw new Error(`runtime blob fetch failed: ${entry.file} (${res.status})`);
-  const gz = await res.arrayBuffer();
+  const body = await res.arrayBuffer();
   const tInflate = performance.now();
   post({ type: 'boot-progress', phase: `${phase}:inflate`, loaded: 0, total: entry.rawBytes });
-  const raw = await gunzip(gz);
+  // Normalizes BOTH wire forms: canonical gzip container, or a body the
+  // host's static server transparently decoded (Content-Encoding: gzip).
+  const raw = await toRawOcrt(body);
   if (marks) {
     marks[`${phase}FetchMs`] = Math.round(performance.now() - tStart);
     marks[`${phase}InflateMs`] = Math.round(performance.now() - tInflate);
@@ -563,25 +619,29 @@ async function boot(msg: {
     env: msg.env,
     argv: msg.argv,
     hooks: {
-      // S3.1 Phase 6 — ESM graph transport: publish rewritten module texts
-      // to the app-server endpoint (same origin), then let the engine fetch
-      // `/oc-esm/<nonce>/<vfs-path>` while it links the guest's ESM graph.
-      // (The bun harness uses an equivalent file:// transport.)
+      // ESM graph transport: rewritten module texts become IN-WORKER blob
+      // URLs. No network, no ServiceWorker, no origin dependency — this is
+      // load-bearing for CDN embedding, where the kernel worker itself runs
+      // from a blob: URL: (a) relative URLs cannot resolve from blob: (the
+      // scheme has an opaque path), so the old same-origin '/oc-esm' fetch
+      // transport threw "Failed to parse URL" and killed every npm command
+      // (npm 12 display.js dynamic-imports chalk, an ESM-only package) with
+      // a silent exit 1; (b) even absolute URLs are unreachable — a blob:
+      // worker is never a controlled ServiceWorker client, so SW-served
+      // transports cannot intercept its fetches. Blob URLs are minted and
+      // imported entirely inside this worker: works under the CDN default,
+      // self-hosted same-origin, and hosts without Service-Worker-Allowed.
+      // (Bun harnesses implement the same contract with file:// URLs.)
+      // Blob URLs are never revoked: one per published module per process,
+      // bounded by the guest's ESM graph size; the worker's teardown frees
+      // them all.
       esmServing: {
-        async publish(nonce: string, entries: Map<string, string>): Promise<void> {
-          const flat: [string, string][] = [];
-          for (const [p, text] of entries) flat.push([p, text]);
-          const res = await fetch('/oc-esm', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ nonce, entries: flat }),
-          });
-          if (!res.ok) {
-            throw new Error(`OpenContainer: ESM graph publish failed (${res.status})`);
+        async serve(_nonce: string, entries: Map<string, string>): Promise<Map<string, string>> {
+          const urls = new Map<string, string>();
+          for (const [p, text] of entries) {
+            urls.set(p, URL.createObjectURL(new Blob([text], { type: 'text/javascript' })));
           }
-        },
-        prefix(nonce: string): string {
-          return `/oc-esm/${nonce}`;
+          return urls;
         },
       },
       onExit(code: number, signal?: string | null) {
@@ -645,9 +705,11 @@ async function boot(msg: {
       entryPath.startsWith(`/usr/lib/node_modules/${root}`) ||
       argv0.startsWith(`/usr/local/bin/${root}`) ||
       argv0.startsWith(`/usr/lib/node_modules/${root}`);
+    if (msg.debug) (globalThis as any).__OC_DEBUG = true;
     if (index.npm && (needsPkg('npm') || needsPkg('npx'))) {
       const npmBuf = await loadBlob(index.npm, 'npm');
       const mounted = mountCliTree(npmBuf, '/usr/lib/node_modules/npm');
+      if ((globalThis as any).__OC_DEBUG) console.warn('[oc-debug] npm blob mounted', mounted, 'files');
       lap('npmMountMs');
       post({ type: 'boot-progress', phase: 'npm:mount', loaded: mounted, total: mounted });
     }
@@ -743,6 +805,7 @@ async function runEntry(entry: EntrySpec): Promise<void> {
         break;
     }
   } catch (err: any) {
+    if ((globalThis as any).__OC_DEBUG) console.warn('[oc-debug] entry failed:', err?.stack ?? err);
     post({ type: 'error', message: err?.message ?? String(err), stack: err?.stack });
     // A boot-time entry failure is still a process exit — the host must see
     // an exit code, not a hung worker.

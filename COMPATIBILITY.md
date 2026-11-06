@@ -60,8 +60,9 @@
 | `cd <dir>` / `pwd` | **Fully implemented and tested** | shell cwd tracked; relative script resolution; prompt shows cwd; honest ENOENT |
 | `<cmd> &`, `jobs`, `ps`, `kill <pid> [SIG]` | **Fully implemented and tested** | background processes; listen state in jobs; SIGTERM/SIGINT semantics |
 | `corepack` | **Unsupported with descriptive error** | honest banner: not distributed (real corepack lands with the real npm CLI in S5) |
-| `npx create-vite@latest …` | **Unsupported at the tool level** | the package *installs* (105 deps, real registry) but the generator is ESM-first and crashes at the ESM boundary with a descriptive internal error — see §4 |
-| `pnpm create vite …` | **Unsupported at the tool level** | same boundary (routes to the same create-* packages) |
+| `npx create-vite@latest …` | **Fully implemented and tested (real Chromium)** | ESM generator runs end-to-end; scaffolded tree + file contents verified in the VFS through the facade fs API (package.json, index.html, src/main.js, src/counter.js, public/*.svg) |
+| `npx create-expo-app@latest …` | **Fully implemented and tested (real Chromium)** | binary-exact template extraction; App.js/app.json/assets verified in the VFS |
+| `vite` dev server | **Blocked on esbuild, not ESM** | ESM machinery runs vite's CLI graph, but vite hard-depends on the esbuild NATIVE binary (ELF) for dep-optimization/transforms — a browser container cannot exec it. Same class of block in WebContainer is solved by their vendored esbuild-wasm; an equivalent shim is roadmap |
 | Yarn Classic / Yarn Berry | **Unsupported (roadmap S6+)** | not implemented; honest "command not found" |
 | Git dependencies (`npm i user/repo`) | **Unsupported** | no git client in the browser; honest error at install |
 
@@ -84,6 +85,8 @@
 |---|---|---|
 | `http.createServer` / `net.Server.listen` | **Fully implemented and tested** | node's real http stack on virtual TCP; express 5 serves real requests |
 | Preview URLs `/opencontainer/p/<port>/<path>` | **Fully implemented and tested** | Service Worker synthesizes real HTTP/1.1 wire bytes → MessageChannel → virtual TCP → node's real parser; response bytes parsed back into a browser Response. JSON + HTML + concurrent fetches verified |
+| Preview routing (multi-tab) | **Implemented (ownership protocol)** | runtimes announce port ownership (oc-port-owner) and answer a pull broadcast (oc-who-owns/oc-claim), so the SW routes each preview request to the page whose runtime owns the port — restart-safe. Known edge: cross-tab previews while the OWNING tab's ServiceWorker instance is mid-restart can transiently answer 'upstream closed'; retry recovers |
+| Runtime asset serving | **Self-hosting requirement** | `.ocrt` blobs must be served as-is (application/octet-stream, NO `Content-Encoding: gzip`). The kernel sniffs OCRT/gzip magic and survives transparently-decoded bodies, but hosts that stamp `Content-Encoding: gzip` on `.gz`-suffixed files (vite dev/sirv precompressed, serve-static precompressed, GitHub Pages) made worker-context fetches fail outright — hence the `.ocrt` rename |
 | Multiple simultaneous servers | **Fully implemented and tested** | express :3000 + raw http :4173 concurrently; independent previews; kill A does not affect B; A restarts on the same port |
 | EADDRINUSE | **Fully implemented and tested** | synchronous port mirror in `bind()` + async `emitErrorNT` path; crash prints the real stack, exit 1 |
 | In-guest loopback client (`http.get('http://localhost:3000')`) | **Fully implemented and tested** | virtual connection pairs between processes |
@@ -96,14 +99,17 @@
 | TLS / https server | **Unsupported** | honest errors |
 | UDP / dgram | **Unsupported** | honest errors |
 
-## 4. Module systems — the ESM boundary
+## 4. Module systems
 
 | Feature | Status |
 |---|---|
 | CommonJS (`require`, real loader, package.json resolution, `.bin` shebangs) | **Fully implemented and tested** |
-| ESM (`import`, `import()`, top-level await, `module_wrap`) | **Unsupported with descriptive error** — `ModuleWrap` construction throws a precise "not implemented yet (S5)" message. **This is the single largest compatibility boundary.** It blocks: Vite and all ESM-first tools (`npx create-vite` scaffolding crashes here — the install itself succeeds), Next.js dev, the real npm/pnpm CLIs (ESM-only deps in their trees), Yarn Berry |
-| Dual CJS/ESM packages | **Partial (documented divergence)** | `--require-module false` routes requires to legacy CJS entries (upstream behavior would need ESM) |
-| `require(esm)` | **Unsupported with descriptive error** |
+| ESM entry points (`import` statements, `export`, top-level await) | **Implemented (esm-graph)** — real V8 module linking: resolve + acorn parse + minimal rewrite, modules served as in-worker blob: URLs, linked/evaluated by the engine. Verified by real Chromium E2E: `npx create-vite` and `npx create-expo-app` end-to-end, npm 12's `import('chalk')` (ESM-only dep) |
+| Dynamic `import()` (literal AND computed specifiers) | **Implemented and tested** — rewritten to the importer, resolved at EVALUATION time (node's optional-peer semantics: unresolvable specifiers reject inside the guest's own catch) |
+| `require(esm)` | **🚧 In progress** — the ESM→CJS transform is wired through the real loader, but crashes on real-world graphs (e.g. chalk's `#imports` package specifiers) — repro: `scripts/test-req-esm.ts`. The ESM ENTRY and dynamic-import() paths are the verified ones |
+| Cyclic ESM graphs | **Partial (documented divergence)** — cycle back-edges route through a dynamic-import shim: the edge gets SNAPSHOT bindings instead of live bindings (names from `export * from` are missing on the shimmed edge). Acyclic graphs link statically with full live-binding semantics |
+| `import.meta.url` | `file://<encoded-vfs-path>` (path-derived; `fileURLToPath` round-trips) |
+| data:/file: URL specifiers | **Unsupported with descriptive error** |
 
 ## 5. Node API surface (by module)
 

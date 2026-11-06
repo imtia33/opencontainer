@@ -42,7 +42,11 @@ export interface WebContainerBootOptions {
   coep?: 'require-corp' | 'credentialless' | 'none';
   /** Folder name of the working directory (default 'project'). */
   workdirName?: string;
-  /** Accepted for compatibility; preview error forwarding is not wired. */
+  /** Accepted and implemented: when true, the runtime injects a built-in
+   *  preview script that forwards uncaught exceptions and unhandled
+   * rejections from guest-served pages as 'preview-message' events
+   *  (PREVIEW_UNCAUGHT_EXCEPTION / PREVIEW_UNHANDLED_REJECTION — the
+   *  upstream contract). A later setPreviewScript() call replaces it. */
   forwardPreviewErrors?: boolean | 'exceptions-only';
   /** OpenContainer EXTENSION: adopt an already-booted OpenContainerRuntime
    *  (e.g. a page-level terminal runtime) instead of booting a new one. The
@@ -57,6 +61,37 @@ export interface WebContainerBootOptions {
 }
 
 type RuntimeEventListener = (info: any) => void;
+
+/** Built-in preview error forwarder (the upstream forwardPreviewErrors
+ *  contract): runs first in every guest-served HTML page and posts uncaught
+ *  exceptions / unhandled rejections to the host page, where the runtime
+ *  re-emits them as 'preview-message'. */
+const BUILTIN_PREVIEW_ERROR_SCRIPT = `
+  window.addEventListener('error', function (e) {
+    try {
+      parent.postMessage({
+        type: 'PREVIEW_UNCAUGHT_EXCEPTION',
+        message: String(e.message),
+        stack: e.error && e.error.stack ? String(e.error.stack) : '',
+        pathname: location.pathname,
+        search: location.search,
+        hash: location.hash,
+      }, '*');
+    } catch (_) {}
+  });
+  window.addEventListener('unhandledrejection', function (e) {
+    try {
+      parent.postMessage({
+        type: 'PREVIEW_UNHANDLED_REJECTION',
+        message: String(e.reason && e.reason.message ? e.reason.message : e.reason),
+        stack: e.reason && e.reason.stack ? String(e.reason.stack) : '',
+        pathname: location.pathname,
+        search: location.search,
+        hash: location.hash,
+      }, '*');
+    } catch (_) {}
+  });
+`;
 
 export class WebContainer {
   private runtime: OpenContainerRuntime;
@@ -149,7 +184,6 @@ export class WebContainer {
    *  booting is expensive; call `teardown()` before booting a new one. */
   static async boot(options: WebContainerBootOptions = {}): Promise<WebContainer> {
     void options.coep; // no-op by design (no isolation requirement)
-    void options.forwardPreviewErrors;
     const workdirName = options.workdirName ?? 'project';
     let runtime = options.runtime;
     let adopted = true;
@@ -157,6 +191,12 @@ export class WebContainer {
       runtime = new OpenContainerRuntime({}, { assetsBase: options.assetsBase });
       await runtime.boot();
       adopted = false;
+    }
+    // Upstream contract: forwardPreviewErrors injects a preview script that
+    // surfaces preview-page errors as 'preview-message' events. The built-in
+    // forwarder is replaced wholesale by any later setPreviewScript() call.
+    if (options.forwardPreviewErrors) {
+      runtime.setPreviewScript(BUILTIN_PREVIEW_ERROR_SCRIPT);
     }
     return new WebContainer(runtime, `/home/${workdirName}`, adopted);
   }

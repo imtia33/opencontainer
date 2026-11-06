@@ -12699,10 +12699,16 @@ function makeEsmGraphImporter(deps) {
   const builtinShimPath = (id) => `/__oc_builtin/${id}.mjs`;
   const cjsShimPath = (p) => `/__oc_cjs${p}.mjs`;
   const jsonShimPath = (p) => `/__oc_json${p}.mjs`;
+  const dynShimPath = (p) => `/__oc_dynshim${p}.mjs`;
   const processNonce = Math.random().toString(36).slice(2, 12);
-  const prefix = serving.prefix(processNonce);
   const published = new Set;
-  const urlOf = (p) => `${prefix}${encodePath(p)}`;
+  const urlByPath = new Map;
+  const urlOf = (p) => {
+    const u = urlByPath.get(p);
+    if (u === undefined)
+      throw new Error(`OpenContainer: ESM internal — no URL minted for ${p}`);
+    return u;
+  };
   const readUtf8 = (p) => {
     try {
       return new TextDecoder().decode(vfs.readFile(p));
@@ -12735,17 +12741,13 @@ function makeEsmGraphImporter(deps) {
     }
     return out;
   }
-  function rewriteModule(mod, urlFor2) {
+  async function rewriteModule(mod) {
     const src = mod.source;
     const edits = [];
     let metaUsed = false;
     for (const s of collectStaticSpecifiers(mod.ast)) {
       const r = resolver.resolve(s.value, mod.path);
-      const isRelative = s.value.startsWith("./") || s.value.startsWith("../");
-      if (r.kind === "esm" && isRelative) {
-        continue;
-      }
-      const url = urlFor2(r, s.value);
+      const url = await urlFor(r);
       if (r.kind === "json" && s.isStaticDecl) {
         edits.push({ start: s.node.start, end: s.declNode.end, text: JSON.stringify(url) });
       } else {
@@ -12846,11 +12848,48 @@ export default __j;
 `;
     return text;
   }
+  function dynShimText(p) {
+    let hasDefault = false;
+    const names = new Set;
+    try {
+      const ast = parseModule(readUtf8(p), p);
+      for (const node of ast.body) {
+        if (node.type === "ExportDefaultDeclaration")
+          hasDefault = true;
+        if (node.type === "ExportNamedDeclaration") {
+          for (const spec of node.specifiers ?? []) {
+            if (isSafeIdent(spec.exported.name))
+              names.add(spec.exported.name);
+          }
+          if (node.declaration?.type === "VariableDeclaration") {
+            for (const d of node.declaration.declarations ?? []) {
+              if (d.id.type === "Identifier" && isSafeIdent(d.id.name))
+                names.add(d.id.name);
+            }
+          } else if (node.declaration?.type === "FunctionDeclaration" && node.declaration.id) {
+            if (isSafeIdent(node.declaration.id.name))
+              names.add(node.declaration.id.name);
+          } else if (node.declaration?.type === "ClassDeclaration" && node.declaration.id) {
+            if (isSafeIdent(node.declaration.id.name))
+              names.add(node.declaration.id.name);
+          }
+        }
+      }
+    } catch {}
+    let text = `const __m = await globalThis.__ocDynImport(${JSON.stringify(dirnameOf(p))}, ${JSON.stringify(p)});
+`;
+    if (hasDefault)
+      text += `export default __m.default;
+`;
+    for (const n of names)
+      text += `export const ${n} = __m[${JSON.stringify(n)}];
+`;
+    return text;
+  }
   async function buildGraph(entryPath) {
     if (published.has(entryPath))
       return urlOf(entryPath);
     const modules = new Map;
-    const shimPaths = new Set;
     const stack = [entryPath];
     while (stack.length > 0) {
       const path = stack.pop();
@@ -12864,43 +12903,55 @@ export default __j;
         if (r.kind === "esm") {
           if (!modules.has(r.path) && !published.has(r.path))
             stack.push(r.path);
-        } else if (r.kind === "builtin") {
-          shimPaths.add(builtinShimPath(r.id));
-        } else if (r.kind === "cjs") {
-          shimPaths.add(cjsShimPath(r.path));
-        } else if (r.kind === "json") {
-          shimPaths.add(jsonShimPath(r.path));
         }
       }
     }
-    const publish = new Map;
-    for (const mod of modules.values()) {
-      publish.set(mod.path, rewriteModule(mod, urlFor));
-    }
-    for (const shimPath of shimPaths) {
-      if (published.has(shimPath))
-        continue;
-      if (shimPath.startsWith("/__oc_builtin/")) {
-        const id = shimPath.slice("/__oc_builtin/".length, -".mjs".length);
-        publish.set(shimPath, builtinShimText(id));
-      } else if (shimPath.startsWith("/__oc_cjs/")) {
-        const real = shimPath.slice("/__oc_cjs".length, -".mjs".length);
-        publish.set(shimPath, cjsShimText(real));
-      } else if (shimPath.startsWith("/__oc_json/")) {
-        const real = shimPath.slice("/__oc_json".length, -".mjs".length);
-        publish.set(shimPath, jsonShimText(real));
+    const order = [];
+    const seenOrder = new Set;
+    const visit = (path, stack2) => {
+      if (seenOrder.has(path) || published.has(path))
+        return;
+      if (stack2.has(path))
+        return;
+      stack2.add(path);
+      const mod = modules.get(path);
+      for (const s of collectStaticSpecifiers(mod.ast)) {
+        const r = resolver.resolve(s.value, path);
+        if (r.kind === "esm" && modules.has(r.path))
+          visit(r.path, stack2);
       }
-    }
-    if (publish.size > 0) {
-      await serving.publish(processNonce, publish);
-      for (const p of publish.keys())
-        published.add(p);
+      stack2.delete(path);
+      seenOrder.add(path);
+      order.push(path);
+    };
+    visit(entryPath, new Set);
+    for (const p of modules.keys())
+      if (!seenOrder.has(p))
+        order.push(p);
+    for (const path of order) {
+      if (published.has(path))
+        continue;
+      const mod = modules.get(path);
+      const text = await rewriteModule(mod);
+      const urls = await serving.serve(processNonce, new Map([[path, text]]));
+      const url = urls.get(path);
+      if (!url)
+        throw new Error(`OpenContainer: ESM transport returned no URL for ${path}`);
+      urlByPath.set(path, url);
+      published.add(path);
     }
     return urlOf(entryPath);
   }
-  function urlFor(r) {
-    const shim = r.kind === "builtin" ? builtinShimPath(r.id) : r.kind === "cjs" ? cjsShimPath(r.path) : r.kind === "json" ? jsonShimPath(r.path) : null;
-    return urlOf(shim ?? r.path);
+  async function urlFor(r) {
+    if (r.kind === "builtin")
+      return ensureShim(builtinShimPath(r.id), builtinShimText(r.id));
+    if (r.kind === "cjs")
+      return ensureShim(cjsShimPath(r.path), cjsShimText(r.path));
+    if (r.kind === "json")
+      return ensureShim(jsonShimPath(r.path), jsonShimText(r.path));
+    if (urlByPath.has(r.path))
+      return urlByPath.get(r.path);
+    return ensureShim(dynShimPath(r.path), dynShimText(r.path));
   }
   let pendingImports = 0;
   let keepAliveTimer = null;
@@ -12956,11 +13007,13 @@ export default __j;
   async function ensureShim(shimPath, text) {
     if (published.has(shimPath))
       return urlOf(shimPath);
-    const entries = new Map;
-    entries.set(shimPath, text);
-    await serving.publish(processNonce, entries);
+    const urls = await serving.serve(processNonce, new Map([[shimPath, text]]));
+    const url = urls.get(shimPath);
+    if (!url)
+      throw new Error(`OpenContainer: ESM transport returned no URL for ${shimPath}`);
+    urlByPath.set(shimPath, url);
     published.add(shimPath);
-    return urlOf(shimPath);
+    return url;
   }
   return { importEntry, dynamicImport };
 }
@@ -14338,9 +14391,11 @@ async function bootKernel(opts) {
     mountPkg("oc-sh");
     const binShim = (path, requirePath) => {
       vfs.mkdir(path.slice(0, path.lastIndexOf("/")), true);
+      const trace = "if(process.env.OC_TRACE_EXIT){process.stderr.write('OC-ARGV '+JSON.stringify(process.argv)+'\\n');const oe=process.exit;process.exit=function(c){process.stderr.write('OC-EXIT '+c+'\\n'+new Error().stack+'\\n');return oe.call(process,c);};}";
       vfs.writeFile(path, `#!/usr/bin/env node
 'use strict';
-require(${JSON.stringify(requirePath)});
+${trace}
+try { require(${JSON.stringify(requirePath)}); } catch (e) { process.stderr.write('OC-SHIM-ERROR ' + path + ': ' + (e && e.stack || e) + '\\n'); process.exit(42); }
 `);
     };
     vfs.mkdir("/usr/local/bin", true);
@@ -14930,7 +14985,7 @@ globalThis.__ocHostGunzip = async (gz) => {
 function post(msg) {
   self.postMessage(msg);
 }
-var CACHE_NAME = "opencontainer-runtime-v1";
+var CACHE_NAME = "opencontainer-runtime-v2";
 function cacheKeyUrl(file) {
   return `${runtimeBase}/${file}`;
 }
@@ -14972,6 +15027,22 @@ async function gunzip2(buf) {
   }
   const { gunzipSync: gunzipSync2 } = await Promise.resolve().then(() => (init_browser(), exports_browser));
   return gunzipSync2(new Uint8Array(buf)).buffer;
+}
+function looksLikeOcrt(buf) {
+  if (buf.byteLength < 4)
+    return false;
+  const b = new Uint8Array(buf, 0, 4);
+  return b[0] === 79 && b[1] === 67 && b[2] === 82 && b[3] === 84;
+}
+async function toRawOcrt(buf) {
+  if (looksLikeOcrt(buf))
+    return buf;
+  if (buf.byteLength >= 2) {
+    const b = new Uint8Array(buf, 0, 2);
+    if (b[0] === 31 && b[1] === 139)
+      return gunzip2(buf);
+  }
+  throw new Error("OpenContainer: runtime blob has unexpected leading bytes (expected gzip 1f 8b or OCRT " + "magic) — your static host is probably transforming the blob body (e.g. serving it with " + "Content-Encoding: gzip on a .gz suffix, or double-compressing). Serve the .ocrt files as-is (application/octet-stream, no Content-Encoding).");
 }
 function parseBlob(buf) {
   const bytes = new Uint8Array(buf);
@@ -15033,19 +15104,29 @@ async function loadBlob(entry, phase, marks) {
   const tStart = performance.now();
   post({ type: "boot-progress", phase: `${phase}:cache`, loaded: 0, total: entry.gzBytes });
   const cached = await readCache(entry.file);
-  if (cached) {
+  if (cached && looksLikeOcrt(cached)) {
     if (marks)
       marks[`${phase}CacheMs`] = Math.round(performance.now() - tStart);
     return cached;
   }
   post({ type: "boot-progress", phase: `${phase}:fetch`, loaded: 0, total: entry.gzBytes });
-  const res = await fetch(cacheKeyUrl(entry.file));
+  let res;
+  try {
+    res = await fetch(cacheKeyUrl(entry.file));
+  } catch (first) {
+    await new Promise((r) => setTimeout(r, 150));
+    try {
+      res = await fetch(cacheKeyUrl(entry.file), { cache: "reload" });
+    } catch (second) {
+      throw new Error(`runtime blob fetch failed: ${entry.file} (${second?.message ?? second} — ` + `first error: ${first instanceof Error ? first.message : String(first)})`);
+    }
+  }
   if (!res.ok)
     throw new Error(`runtime blob fetch failed: ${entry.file} (${res.status})`);
-  const gz = await res.arrayBuffer();
+  const body = await res.arrayBuffer();
   const tInflate = performance.now();
   post({ type: "boot-progress", phase: `${phase}:inflate`, loaded: 0, total: entry.rawBytes });
-  const raw = await gunzip2(gz);
+  const raw = await toRawOcrt(body);
   if (marks) {
     marks[`${phase}FetchMs`] = Math.round(performance.now() - tStart);
     marks[`${phase}InflateMs`] = Math.round(performance.now() - tInflate);
@@ -15265,21 +15346,12 @@ async function boot(msg) {
     argv: msg.argv,
     hooks: {
       esmServing: {
-        async publish(nonce, entries) {
-          const flat = [];
-          for (const [p, text] of entries)
-            flat.push([p, text]);
-          const res = await fetch("/oc-esm", {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ nonce, entries: flat })
-          });
-          if (!res.ok) {
-            throw new Error(`OpenContainer: ESM graph publish failed (${res.status})`);
+        async serve(_nonce, entries) {
+          const urls = new Map;
+          for (const [p, text] of entries) {
+            urls.set(p, URL.createObjectURL(new Blob([text], { type: "text/javascript" })));
           }
-        },
-        prefix(nonce) {
-          return `/oc-esm/${nonce}`;
+          return urls;
         }
       },
       onExit(code, signal) {
@@ -15322,9 +15394,13 @@ async function boot(msg) {
     const entryPath = msg.entry?.path ?? "";
     const argv0 = String(msg.argv?.[1] ?? "");
     const needsPkg = (root) => entryPath.startsWith(`/usr/local/bin/${root}`) || entryPath.startsWith(`/usr/lib/node_modules/${root}`) || argv0.startsWith(`/usr/local/bin/${root}`) || argv0.startsWith(`/usr/lib/node_modules/${root}`);
+    if (msg.debug)
+      globalThis.__OC_DEBUG = true;
     if (index.npm && (needsPkg("npm") || needsPkg("npx"))) {
       const npmBuf = await loadBlob(index.npm, "npm");
       const mounted = mountCliTree(npmBuf, "/usr/lib/node_modules/npm");
+      if (globalThis.__OC_DEBUG)
+        console.warn("[oc-debug] npm blob mounted", mounted, "files");
       lap("npmMountMs");
       post({ type: "boot-progress", phase: "npm:mount", loaded: mounted, total: mounted });
     }
@@ -15405,6 +15481,8 @@ async function runEntry(entry) {
         break;
     }
   } catch (err2) {
+    if (globalThis.__OC_DEBUG)
+      console.warn("[oc-debug] entry failed:", err2?.stack ?? err2);
     post({ type: "error", message: err2?.message ?? String(err2), stack: err2?.stack });
     try {
       kernel.process.reallyExit?.(1);

@@ -19,6 +19,7 @@ export { WebContainer } from './webcontainer-api';
 export type { WebContainerBootOptions } from './webcontainer-api';
 export { OpenContainerRuntime, FsRpcError, parseCommand } from './runtime';
 export type { RuntimeEvents, RuntimeEventMap, RuntimeOptions, ParsedCommand, ProgramHandle } from './runtime';
+export type { PreviewChannel } from './runtime';
 export { DEFAULT_ASSETS_BASE } from './runtime';
 export { OPENCONTAINER_VERSION, ENGINE_IDENTITY, NPM_IDENTITY, SHELL_IDENTITY } from './version';
 export * from './types';

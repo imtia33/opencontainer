@@ -249,8 +249,14 @@ export async function bootKernel(opts: BootOptions): Promise<BootedKernel> {
     // itself); everything else is a node program one require() deep.
     const binShim = (path: string, requirePath: string) => {
       vfs.mkdir(path.slice(0, path.lastIndexOf('/')), true);
+      // Diagnostics (guest-side, both opt-in via env):
+      //  - OC_TRACE_EXIT: print argv + a stack at every process.exit — for
+      //    finding WHERE a silent CLI death happens;
+      //  - shim require failure: always printed (a CLI entry that cannot
+      //    even be required would otherwise vanish without a trace).
+      const trace = "if(process.env.OC_TRACE_EXIT){process.stderr.write('OC-ARGV '+JSON.stringify(process.argv)+'\\n');const oe=process.exit;process.exit=function(c){process.stderr.write('OC-EXIT '+c+'\\n'+new Error().stack+'\\n');return oe.call(process,c);};}";
       vfs.writeFile(path,
-        `#!/usr/bin/env node\n'use strict';\nrequire(${JSON.stringify(requirePath)});\n`);
+        `#!/usr/bin/env node\n'use strict';\n${trace}\ntry { require(${JSON.stringify(requirePath)}); } catch (e) { process.stderr.write('OC-SHIM-ERROR ' + path + ': ' + (e && e.stack || e) + '\\n'); process.exit(42); }\n`);
     };
     vfs.mkdir('/usr/local/bin', true);
     vfs.mkdir('/usr/bin', true);

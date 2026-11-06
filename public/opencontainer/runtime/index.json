@@ -1,29 +1,29 @@
 {
   "nodeVersion": "v26.13.0",
-  "generatedAt": "2026-11-06T05:57:00.938Z",
+  "generatedAt": "2026-11-06T07:54:44.990Z",
   "core": {
-    "file": "node-v26.13.0-core-d3f3d922.ocrt.gz",
+    "file": "node-v26.13.0-core-d3f3d922.ocrt",
     "sha256": "d3f3d922",
     "rawBytes": 6817465,
     "gzBytes": 1555204,
     "modules": 511
   },
   "amaro": {
-    "file": "node-v26.13.0-amaro-d518032c.ocrt.gz",
+    "file": "node-v26.13.0-amaro-d518032c.ocrt",
     "sha256": "d518032c",
     "rawBytes": 3806288,
     "gzBytes": 1388218,
     "modules": 6
   },
   "npm": {
-    "file": "npm-12.2.1-d631d83e.ocrt.gz",
+    "file": "npm-12.2.1-d631d83e.ocrt",
     "sha256": "d631d83e",
     "rawBytes": 12521574,
     "gzBytes": 3002702,
     "modules": 1941
   },
   "pnpm": {
-    "file": "pnpm-10.34.9-9e7dd051.ocrt.gz",
+    "file": "pnpm-10.34.9-9e7dd051.ocrt",
     "sha256": "9e7dd051",
     "rawBytes": 18048951,
     "gzBytes": 3924383,

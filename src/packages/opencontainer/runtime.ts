@@ -85,11 +85,42 @@ export interface RuntimeOptions {
   assetsBase?: string;
 }
 
+/**
+ * Channel the preview bridge speaks (structural subset of MessagePort —
+ * deliberately loose so embedders can bridge previews over OTHER pipes:
+ * e.g. a WebSocket to a tunnel relay on a domain they own; a MessagePort
+ * from their own worker. The runtime writes response bytes back through
+ * `postMessage({type:'data'|'end', …})` and reads request bytes from
+ * `onmessage` ({type:'data', bytes} | {type:'end'}), exactly like the
+ * preview ServiceWorker does.)
+ */
+export interface PreviewChannel {
+  postMessage(message: any, transfer?: Transferable[]): void;
+  onmessage: ((ev: MessageEvent) => void) | null;
+  close?(): void;
+}
+
 // Cross-origin worker scripts cannot be passed to `new Worker()` directly —
 // the browser requires same-origin. Standard workaround (used by the
 // WebContainer-style CDNs): fetch the source (CORS) once per page and boot
 // it from a blob URL. Memoized so every guest process reuses one fetch.
 let workerBlobCache: { base: string; url: string } | null = null;
+
+/** Wait (bounded) for a registration's worker to become active — a fresh
+ *  install runs install→activate (the SW itself skipWaiting+claims); an
+ *  already-active registration resolves immediately. Never rejects and
+ *  never waits longer than 3s: boot must not hang on SW lifecycle. */
+function waitForActive(reg: ServiceWorkerRegistration): Promise<void> {
+  const sw = reg.active ?? reg.installing ?? reg.waiting;
+  if (!sw || sw.state === 'activated') return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    const done = () => resolve();
+    sw.addEventListener('statechange', () => {
+      if (sw.state === 'activated' || sw.state === 'redundant') done();
+    });
+    setTimeout(done, 3000);
+  });
+}
 
 async function resolveWorkerUrl(base: string): Promise<string> {
   const bust = /^https?:/.test(base)
@@ -160,7 +191,7 @@ interface PipeRoute {
 interface ConnectionRoute {
   ownerPid: number;        // process whose kernel owns connId
   peer: { pid: number; connId: number } | null;  // local pair
-  preview: MessagePort | null;                    // preview bridge end
+  preview: PreviewChannel | null;                // preview bridge end
 }
 
 /** Host-owned end of a guest process's stdio pipe (facade spawnProgram).
@@ -235,6 +266,7 @@ export class OpenContainerRuntime {
   private nextWatchId = 1;
   /** Preview ServiceWorker state (see registerPreview). */
   private previewRegistered = false;
+  private previewRegistration: ServiceWorkerRegistration | null = null;
   private previewScript: string | null = null;
 
   constructor(events: RuntimeEvents = {}, options: RuntimeOptions = {}) {
@@ -368,6 +400,8 @@ export class OpenContainerRuntime {
       // location is a blob: URL, and the same-origin '/opencontainer'
       // default only holds for self-hosted embeddings.
       runtimeBase: `${this.assetsBase}/runtime`,
+      // Debug tracing (host sets window.__OC_DEBUG_HOST).
+      debug: !!(globalThis as any).__OC_DEBUG_HOST,
     };
     worker.postMessage(bootMsg);
     void proc.ready.catch(() => { /* surfaced via error events */ });
@@ -476,10 +510,11 @@ export class OpenContainerRuntime {
         this.applyDeltas(proc, msg.ops ?? []);
         break;
       case 'error': {
+        // EVERY process's errors surface — facade (spawnProgram) processes
+        // are background and were silently swallowed here before, hiding
+        // e.g. npm-mount failures from embedders.
         const err = { message: msg.message, stack: msg.stack };
-        if (proc.pid === 1 || this.foregroundPid === proc.pid) {
-          this.emit('error', err);
-        }
+        this.emit('error', err);
         break;
       }
       case 'child-spawn':
@@ -513,6 +548,7 @@ export class OpenContainerRuntime {
           proc.worker.postMessage({ type: 'listen-failed', listenId: msg.listenId });
         } else {
           this.ports.set(port, { pid: proc.pid });
+          this.notifyPortOwnership(port, true);
           this.broadcastPorts();
           this.emit('listen', { port, pid: proc.pid });
         }
@@ -523,6 +559,7 @@ export class OpenContainerRuntime {
         const entry = this.ports.get(port);
         if (entry && entry.pid === proc.pid) {
           this.ports.delete(port);
+          this.notifyPortOwnership(port, false);
           this.broadcastPorts();
           this.emit('unlisten', { port, pid: proc.pid });
         }
@@ -775,7 +812,7 @@ export class OpenContainerRuntime {
   /** Preview bridge: SW/page hands us a raw virtual connection to a port.
    *  `initialBytes` is the client's request head+body (the SW builds the full
    *  HTTP/1.1 wire bytes and sends them with the connection request). */
-  connectPreview(port: number, channel: MessagePort, initialBytes?: Uint8Array | null): boolean {
+  connectPreview(port: number, channel: PreviewChannel, initialBytes?: Uint8Array | null): boolean {
     const target = this.ports.get(port);
     if (!target) return false;
     const serverConnId = this.nextConnId++;
@@ -815,6 +852,21 @@ export class OpenContainerRuntime {
         proc.worker.postMessage({ type: 'ports-update', ports });
       }
     }
+  }
+
+  /** Tell the preview ServiceWorker which PAGE owns a guest port. Without
+   *  this, a multi-tab session (two embedder tabs open) cross-routes: the
+   *  SW's clients.matchAll picks an arbitrary window client, whose runtime
+   *  does not own the port and answers 'end' ("upstream closed"). The SW
+   *  keeps port → client id and routes precisely; falls back to the scan
+   *  when no owner is known (e.g. the owning tab died). */
+  private notifyPortOwnership(port: number, owned: boolean): void {
+    const active = (navigator as any)?.serviceWorker?.controller
+      ?? this.previewRegistration?.active
+      ?? null;
+    try {
+      active?.postMessage({ type: 'oc-port-owner', port, owned });
+    } catch { /* SW gone — previews fall back to the client scan */ }
   }
 
   // ------------------------------------------------------------- kill/signal
@@ -1568,10 +1620,9 @@ export class OpenContainerRuntime {
     let lastError: unknown = null;
     for (const path of candidates) {
       try {
-        // Root scope lets the SW also serve the ESM graph transport
-        // (/oc-esm/…). Hosts that refuse it (no Service-Worker-Allowed
-        // header) get the default scope fallback — preview URLs live under
-        // /opencontainer/ and keep working either way.
+        // Root scope when the host allows it (Service-Worker-Allowed: /);
+        // the default scope fallback (/opencontainer/) equally covers every
+        // URL this SW serves — preview URLs live under /opencontainer/.
         try {
           registration = await navigator.serviceWorker.register(path, { scope: '/' });
         } catch {
@@ -1592,7 +1643,14 @@ export class OpenContainerRuntime {
       );
       return null;
     }
-    await navigator.serviceWorker.ready;
+    // Do NOT await navigator.serviceWorker.ready — it only resolves for a
+    // registration whose scope COVERS THIS PAGE, and the default SW scope
+    // (/opencontainer/) does not (the page sits at /). Root-scope hosts
+    // resolve; default-scope hosts hung here forever, leaving the preview
+    // bridge unwired. The registration object itself is all we need; wait
+    // (bounded) for its worker to activate so a fresh install can claim.
+    await waitForActive(registration);
+    this.previewRegistration = registration;
 
     // Page-level runtime registry: the SW message handler below asks every
     // runtime on the page until one owns the port (multi-runtime pages,
@@ -1604,7 +1662,20 @@ export class OpenContainerRuntime {
     // Route the SW's preview fetches into this runtime's virtual TCP.
     navigator.serviceWorker.addEventListener('message', (ev: MessageEvent) => {
       const m = ev.data;
-      if (!m || m.type !== 'oc-preview-fetch') return;
+      if (!m || typeof m.type !== 'string') return;
+      if (m.type === 'oc-who-owns') {
+        // Port-ownership pull (see preview-sw.js): claim only what this
+        // runtime actually owns. The reply goes straight back to the SW;
+        // event.source on the SW side identifies the claiming page.
+        if (typeof m.port === 'number' && this.ports.has(m.port)) {
+          const sw = (navigator as any)?.serviceWorker?.controller
+            ?? this.previewRegistration?.active
+            ?? null;
+          try { sw?.postMessage({ type: 'oc-claim', port: m.port }); } catch { /* SW gone */ }
+        }
+        return;
+      }
+      if (m.type !== 'oc-preview-fetch') return;
       if ((ev as any).__ocHandled) return; // another runtime on this page took it
       const channel = ev.ports[0];
       const registry: OpenContainerRuntime[] = (globalThis as any).__ocRuntimes ?? [this];
@@ -1640,10 +1711,15 @@ export class OpenContainerRuntime {
    */
   setPreviewScript(code: string): void {
     this.previewScript = code;
-    const reg = navigator?.serviceWorker?.controller
-      ? { active: navigator.serviceWorker.controller } as any
-      : null;
-    if (reg) this.postPreviewScript(code, reg);
+    // Deliver to the ACTIVE preview SW — navigator.serviceWorker.controller
+    // is null while this page is outside the SW scope (default-scope hosts);
+    // the registration captured by registerPreview is the reliable handle.
+    const active = navigator?.serviceWorker?.controller
+      ?? this.previewRegistration?.active
+      ?? null;
+    if (active) {
+      try { active.postMessage({ type: 'oc-preview-script', code }); } catch { /* SW gone */ }
+    }
   }
 
   private postPreviewScript(code: string, reg: { active: ServiceWorker | null }): void {

@@ -14,78 +14,14 @@
  *
  * WebSockets cannot be intercepted by a Service Worker (platform limit);
  * HMR sockets need the injected client shim (documented divergence).
+ *
+ * (The guest ESM module graph is NOT served here anymore: the kernel now
+ * mints in-worker blob: URLs for rewritten modules — a transport with no
+ * origin/ServiceWorker dependency, required for CDN-embedded kernels that
+ * run from blob: workers and are never SW-controlled clients.)
  */
 
 const PREVIEW_RE = /^\/opencontainer\/p\/(\d+)(\/.*)?$/;
-
-// ---- ESM graph transport (in-SW, host-route-free) --------------------------
-// Guest ESM graphs are published here by the kernel worker
-// (POST /oc-esm {nonce, entries: [[vfsPath, text], ...]}) and linked by the
-// engine as /oc-esm/<nonce>/<encoded-path> — exactly the URL space
-// kernel/esm-graph.ts computes. Stored in a dedicated Cache API cache so it
-// survives SW termination; FIFO nonce cap keeps growth bounded.
-const ESM_PUBLISH_PATH = '/oc-esm';
-const ESM_GET_RE = /^\/oc-esm\/([A-Za-z0-9_-]+)(\/.+)$/;
-const ESM_CACHE = 'opencontainer-esm-v1';
-const ESM_INDEX_KEY = '/oc-esm/__oc_index__';
-const ESM_MAX_NONCES = 48;
-
-function encodePathSegments(p) {
-  return p.split('/').map((s) => encodeURIComponent(s)).join('/');
-}
-
-async function esmIndex(cache) {
-  try {
-    const hit = await cache.match(ESM_INDEX_KEY);
-    if (hit) return await hit.json();
-  } catch { /* corrupt index → start fresh */ }
-  return [];
-}
-
-async function handleEsmPublish(request) {
-  let body;
-  try {
-    body = await request.json();
-  } catch {
-    return new Response('bad json', { status: 400 });
-  }
-  const nonce = String(body.nonce ?? '');
-  const entries = Array.isArray(body.entries) ? body.entries : [];
-  if (!/^[A-Za-z0-9_-]+$/.test(nonce)) {
-    return new Response('bad nonce', { status: 400 });
-  }
-  const cache = await caches.open(ESM_CACHE);
-  for (const [path, text] of entries) {
-    const url = new URL(`/oc-esm/${nonce}${encodePathSegments(String(path))}`, self.location.origin).href;
-    await cache.put(url, new Response(text, {
-      headers: { 'content-type': 'text/javascript; charset=utf-8' },
-    }));
-  }
-  // FIFO eviction of the oldest nonces past the cap.
-  const index = await esmIndex(cache);
-  const next = index.filter((n) => n !== nonce).concat(nonce);
-  while (next.length > ESM_MAX_NONCES) {
-    const oldest = next.shift();
-    const keys = await cache.keys();
-    for (const req of keys) {
-      const u = new URL(req.url);
-      if (u.pathname.startsWith(`/oc-esm/${oldest}/`)) await cache.delete(req);
-    }
-  }
-  await cache.put(ESM_INDEX_KEY, new Response(JSON.stringify(next), {
-    headers: { 'content-type': 'application/json' },
-  }));
-  return new Response('ok');
-}
-
-async function handleEsmGet(url) {
-  const cache = await caches.open(ESM_CACHE);
-  const hit = await cache.match(url.href);
-  if (hit) return hit;
-  return new Response('OpenContainer: ESM graph entry not found (expired?)', {
-    status: 404, headers: { 'content-type': 'text/plain' },
-  });
-}
 
 self.addEventListener('install', () => {
   self.skipWaiting();
@@ -101,25 +37,29 @@ self.addEventListener('activate', (event) => {
 // every SW restart by the runtime when set again (upstream semantics).
 let previewScript = null;
 
+// ---- port ownership registry (multi-tab-safe routing) ----------------------
+// Runtimes announce which page owns each guest port (oc-port-owner). Without
+// this, clients.matchAll() picks an ARBITRARY window client — in a multi-tab
+// session the wrong page answers 'end' ("upstream closed before responding").
+const portOwners = new Map(); // port number -> client id (warm cache)
+const pendingClaims = new Map(); // port -> [client ids] (pull protocol)
+
 self.addEventListener('message', (event) => {
   const m = event.data;
   if (m && m.type === 'oc-preview-script') {
     previewScript = typeof m.code === 'string' ? m.code : null;
+  } else if (m && m.type === 'oc-port-owner' && event.source) {
+    if (m.owned) portOwners.set(m.port, event.source.id);
+    else if (portOwners.get(m.port) === event.source.id) portOwners.delete(m.port);
+  } else if (m && m.type === 'oc-claim' && event.source) {
+    const list = pendingClaims.get(m.port);
+    if (list) list.push(event.source.id);
   }
 });
 
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
   if (url.origin !== self.location.origin) return;
-  // ESM graph transport (publish + serve) — handled entirely in the SW.
-  if (url.pathname === ESM_PUBLISH_PATH && event.request.method === 'POST') {
-    event.respondWith(handleEsmPublish(event.request));
-    return;
-  }
-  if (ESM_GET_RE.test(url.pathname) && event.request.method === 'GET') {
-    event.respondWith(handleEsmGet(url));
-    return;
-  }
   const m = PREVIEW_RE.exec(url.pathname);
   if (!m) return; // not a preview URL — default network/cache behavior
   const port = Number(m[1]);
@@ -152,7 +92,7 @@ async function proxyFetch(request, port, pathAndQuery) {
   // ---- pipe through the host page into the kernel's virtual TCP ---------
   const channel = new MessageChannel();
   const reply = channel.port1;
-  const hostClient = await matchHostClient();
+  const hostClient = await matchHostClient(port);
   if (hostClient === null) {
     return new Response('OpenContainer: no host page available for the preview bridge', {
       status: 503, headers: { 'content-type': 'text/plain' },
@@ -170,7 +110,7 @@ async function proxyFetch(request, port, pathAndQuery) {
   } catch {
     // Cached client went away (page navigated/closed) — refresh and retry once.
     clientCache = null;
-    const retry = await matchHostClient();
+    const retry = await matchHostClient(port);
     if (retry === null) {
       return new Response('OpenContainer: no host page available for the preview bridge', {
         status: 503, headers: { 'content-type': 'text/plain' },
@@ -330,9 +270,38 @@ async function proxyFetch(request, port, pathAndQuery) {
 // client is effectively session-stable, so cache it for a short TTL and
 // refresh on expiry or postMessage failure. Falls back to the old scan on
 // any doubt — never a behavior change, only fewer awaits.
-let clientCache = null; // { client, at }
+let clientCache = null; // { client, at } — fallback-scan cache only
 const CLIENT_CACHE_TTL = 5000;
-async function matchHostClient() {
+async function matchHostClient(port) {
+  // 1. Warm cache: the page that announced ownership of this port (the map
+  //    is in-memory and dies with the SW — that is fine, the pull below
+  //    rebuilds it after any SW restart).
+  const ownerId = portOwners.get(port);
+  if (ownerId) {
+    const owner = await self.clients.get(ownerId).catch(() => null);
+    if (owner) return owner;
+    portOwners.delete(port); // stale owner (tab died)
+  }
+  // 2. PULL protocol (restart-safe, multi-tab-safe): ask every host page
+  //    who owns this port; the owner claims within a short window. Only the
+  //    owning runtime answers, so the route is precise even with several
+  //    embedder tabs open; a page that owns nothing stays silent.
+  const claims = [];
+  pendingClaims.set(port, claims);
+  const wins = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+  for (const w of wins) {
+    if (!/\/opencontainer\/p\/\d+/.test(w.url ?? '')) {
+      try { w.postMessage({ type: 'oc-who-owns', port }); } catch { /* gone */ }
+    }
+  }
+  await new Promise((r) => setTimeout(r, 120));
+  pendingClaims.delete(port);
+  if (claims.length > 0) {
+    portOwners.set(port, claims[0]);
+    const owner = await self.clients.get(claims[0]).catch(() => null);
+    if (owner) return owner;
+  }
+  // 3. Fallback: no claim in time (owner busy/dead) — first host page.
   const now = Date.now();
   if (clientCache && now - clientCache.at < CLIENT_CACHE_TTL) {
     return clientCache.client;

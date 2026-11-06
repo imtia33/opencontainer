@@ -49,13 +49,15 @@ import type { Vfs } from './vfs';
 // Types
 // ---------------------------------------------------------------------------
 
-/** Transport: publishes rewritten module texts and hands back the URL space
- *  under which `<prefix><encoded VFS path>` serves them. Relative specifiers
- *  resolve back through this space (the prefix carries a per-graph nonce so
- *  concurrent graphs never collide). */
+/** Transport: receives rewritten module texts and hands back ONE importable
+ *  URL per path. Called incrementally (deps before dependents within a
+ *  graph). The returned URLs must be importable from THIS worker context —
+ *  e.g. in-worker blob: URLs (browser kernel) or deterministic file:// URLs
+ *  (bun harnesses). No origin, ServiceWorker, or network dependency is
+ *  implied: a kernel booted from a cross-origin blob worker has no usable
+ *  fetch base, so HTTP-based transports are not viable there. */
 export interface EsmServing {
-  publish(nonce: string, entries: Map<string, string>): Promise<void>;
-  prefix(nonce: string): string;
+  serve(nonce: string, entries: Map<string, string>): Promise<Map<string, string>>;
 }
 
 export interface EsmGraphDeps {
@@ -475,16 +477,21 @@ export function makeEsmGraphImporter(deps: EsmGraphDeps): EsmGraphImporter {
   const builtinShimPath = (id: string) => `/__oc_builtin/${id}.mjs`;
   const cjsShimPath = (p: string) => `/__oc_cjs${p}.mjs`;
   const jsonShimPath = (p: string) => `/__oc_json${p}.mjs`;
+  const dynShimPath = (p: string) => `/__oc_dynshim${p}.mjs`;
 
-  /** ONE URL namespace per process (node's module map is process-wide):
-   *  every graph publishes under the same nonce, so a module reached
-   *  relatively from two graphs resolves to ONE URL — one V8 module record,
-   *  one evaluation, one namespace — exactly node's caching semantics. */
+  /** ONE URL per path per process (node's module map is process-wide): a
+   *  module reached from two graphs resolves to ONE URL — one V8 module
+   *  record, one evaluation, one namespace — exactly node's caching
+   *  semantics. URLs are minted by the transport (serve) and cached here. */
   const processNonce = Math.random().toString(36).slice(2, 12);
-  const prefix = serving.prefix(processNonce);
   const published = new Set<string>(); // VFS/shim paths with served text
+  const urlByPath = new Map<string, string>();
 
-  const urlOf = (p: string): string => `${prefix}${encodePath(p)}`;
+  const urlOf = (p: string): string => {
+    const u = urlByPath.get(p);
+    if (u === undefined) throw new Error(`OpenContainer: ESM internal — no URL minted for ${p}`);
+    return u;
+  };
 
   const readUtf8 = (p: string): string => {
     try { return new TextDecoder().decode(vfs.readFile(p)); }
@@ -528,19 +535,18 @@ export function makeEsmGraphImporter(deps: EsmGraphDeps): EsmGraphImporter {
     return out;
   }
 
-  /** Rewrite one ESM module: minimal, range-based text edits. */
-  function rewriteModule(mod: PendingModule, urlFor: (r: { kind: string; path?: string; id?: string }, spec: string) => string): string {
+  /** Rewrite one ESM module: minimal, range-based text edits. EVERY static
+   *  specifier (relative included) is rewritten to an explicit transport URL —
+   *  blob: URLs cannot resolve relative specifiers, so nothing may be left
+   *  to V8's URL-space mirroring. */
+  async function rewriteModule(mod: PendingModule): Promise<string> {
     const src = mod.source;
     const edits: Array<{ start: number; end: number; text: string }> = [];
     let metaUsed = false;
 
     for (const s of collectStaticSpecifiers(mod.ast)) {
       const r = resolver.resolve(s.value, mod.path);
-      const isRelative = s.value.startsWith('./') || s.value.startsWith('../');
-      if (r.kind === 'esm' && isRelative) {
-        continue; // V8 resolves it against the mirrored URL space — untouched
-      }
-      const url = urlFor(r, s.value);
+      const url = await urlFor(r);
       if (r.kind === 'json' && s.isStaticDecl) {
         // The JSON shim is a JS module — the `with { type: 'json' }`
         // attribute must go (replacing through the declaration end drops it).
@@ -658,6 +664,42 @@ export function makeEsmGraphImporter(deps: EsmGraphDeps): EsmGraphImporter {
     return text;
   }
 
+  /** Cycle back-edge shim: re-exports the target's namespace through a
+   *  dynamic import at evaluation time (the one place where a static import
+   * cannot be used — the target's URL does not exist yet when the importer
+   * is minted). Named exports are parsed statically from the target; they
+   * are SNAPSHOT bindings (the documented divergence for cyclic ESM graphs).
+   * `export * from` in the target cannot be enumerated — such names are
+   * missing on the shimmed edge only. */
+  function dynShimText(p: string): string {
+    let hasDefault = false;
+    const names = new Set<string>();
+    try {
+      const ast = parseModule(readUtf8(p), p);
+      for (const node of ast.body) {
+        if (node.type === 'ExportDefaultDeclaration') hasDefault = true;
+        if (node.type === 'ExportNamedDeclaration') {
+          for (const spec of node.specifiers ?? []) {
+            if (isSafeIdent(spec.exported.name)) names.add(spec.exported.name);
+          }
+          if (node.declaration?.type === 'VariableDeclaration') {
+            for (const d of node.declaration.declarations ?? []) {
+              if (d.id.type === 'Identifier' && isSafeIdent(d.id.name)) names.add(d.id.name);
+            }
+          } else if (node.declaration?.type === 'FunctionDeclaration' && node.declaration.id) {
+            if (isSafeIdent(node.declaration.id.name)) names.add(node.declaration.id.name);
+          } else if (node.declaration?.type === 'ClassDeclaration' && node.declaration.id) {
+            if (isSafeIdent(node.declaration.id.name)) names.add(node.declaration.id.name);
+          }
+        }
+      }
+    } catch { /* unparseable target — the dyn import will surface the error */ }
+    let text = `const __m = await globalThis.__ocDynImport(${JSON.stringify(dirnameOf(p))}, ${JSON.stringify(p)});\n`;
+    if (hasDefault) text += `export default __m.default;\n`;
+    for (const n of names) text += `export const ${n} = __m[${JSON.stringify(n)}];\n`;
+    return text;
+  }
+
   // ---- graph build ---------------------------------------------------------
 
   async function buildGraph(entryPath: string): Promise<string> {
@@ -666,10 +708,11 @@ export function makeEsmGraphImporter(deps: EsmGraphDeps): EsmGraphImporter {
     if (published.has(entryPath)) return urlOf(entryPath);
 
     const modules = new Map<string, PendingModule>();
-    const shimPaths = new Set<string>();
 
     // phase 1 — resolve + parse walk (skipping already-published paths: their
-    // subgraphs are served and their URLs are deterministic)
+    // subgraphs are served and their URLs are final). Shims (builtin/cjs/json)
+    // are NOT collected here — they are minted on demand by urlFor during
+    // phase 2, which also covers dynamic-import subgraphs.
     const stack: string[] = [entryPath];
     while (stack.length > 0) {
       const path = stack.pop()!;
@@ -681,12 +724,6 @@ export function makeEsmGraphImporter(deps: EsmGraphDeps): EsmGraphImporter {
         const r = resolver.resolve(s.value, path);
         if (r.kind === 'esm') {
           if (!modules.has(r.path!) && !published.has(r.path!)) stack.push(r.path!);
-        } else if (r.kind === 'builtin') {
-          shimPaths.add(builtinShimPath(r.id!));
-        } else if (r.kind === 'cjs') {
-          shimPaths.add(cjsShimPath(r.path!));
-        } else if (r.kind === 'json') {
-          shimPaths.add(jsonShimPath(r.path!));
         }
       }
       // Dynamic imports are NOT pre-walked: every dynamic import() is
@@ -695,39 +732,58 @@ export function makeEsmGraphImporter(deps: EsmGraphDeps): EsmGraphImporter {
       // arms the keep-alive while in flight — node's exact semantics.
     }
 
-    // phase 2 — rewrite + generate shims + publish (one batch)
-    const publish = new Map<string, string>();
-    for (const mod of modules.values()) {
-      publish.set(mod.path, rewriteModule(mod, urlFor));
-    }
-    for (const shimPath of shimPaths) {
-      if (published.has(shimPath)) continue;
-      if (shimPath.startsWith('/__oc_builtin/')) {
-        const id = shimPath.slice('/__oc_builtin/'.length, -'.mjs'.length);
-        publish.set(shimPath, builtinShimText(id));
-      } else if (shimPath.startsWith('/__oc_cjs/')) {
-        const real = shimPath.slice('/__oc_cjs'.length, -'.mjs'.length);
-        publish.set(shimPath, cjsShimText(real));
-      } else if (shimPath.startsWith('/__oc_json/')) {
-        const real = shimPath.slice('/__oc_json'.length, -'.mjs'.length);
-        publish.set(shimPath, jsonShimText(real));
+    // phase 2 — rewrite + mint, DEPENDENCIES FIRST (post-order over static
+    // ESM edges). Minting is incremental because a module's rewritten text
+    // must embed its dependencies' final URLs (blob: URLs are minted
+    // per-text and cannot be precomputed). A dependency that is not yet
+    // minted at rewrite time is a CYCLE back-edge (or a forward reference)
+    // — those get a dynamic-import shim instead (real static linking
+    // everywhere else; live bindings are lost ONLY on the shimmed edge).
+    const order: string[] = [];
+    const seenOrder = new Set<string>();
+    const visit = (path: string, stack: Set<string>) => {
+      if (seenOrder.has(path) || published.has(path)) return;
+      if (stack.has(path)) return; // cycle back-edge — do not recurse
+      stack.add(path);
+      const mod = modules.get(path)!;
+      for (const s of collectStaticSpecifiers(mod.ast)) {
+        const r = resolver.resolve(s.value, path);
+        if (r.kind === 'esm' && modules.has(r.path!)) visit(r.path!, stack);
       }
-    }
-    if (publish.size > 0) {
-      await serving.publish(processNonce, publish);
-      for (const p of publish.keys()) published.add(p);
+      stack.delete(path);
+      seenOrder.add(path);
+      order.push(path);
+    };
+    visit(entryPath, new Set());
+    // Modules unreachable post-order from the entry (shouldn't happen —
+    // phase 1 walks from the entry) are appended defensively.
+    for (const p of modules.keys()) if (!seenOrder.has(p)) order.push(p);
+
+    for (const path of order) {
+      if (published.has(path)) continue;
+      const mod = modules.get(path)!;
+      const text = await rewriteModule(mod);
+      const urls = await serving.serve(processNonce, new Map([[path, text]]));
+      const url = urls.get(path);
+      if (!url) throw new Error(`OpenContainer: ESM transport returned no URL for ${path}`);
+      urlByPath.set(path, url);
+      published.add(path);
     }
     return urlOf(entryPath);
   }
 
-  /** URL for a dependency (shim for cjs/json/builtin; the module's own URL
-   *  for esm — deterministic under the process nonce). */
-  function urlFor(r: { kind: string; path?: string; id?: string }): string {
-    const shim = r.kind === 'builtin' ? builtinShimPath(r.id!)
-      : r.kind === 'cjs' ? cjsShimPath(r.path!)
-      : r.kind === 'json' ? jsonShimPath(r.path!)
-      : null;
-    return urlOf(shim ?? r.path!);
+  /** URL for a dependency, minting shims on demand:
+   *  - builtin/cjs/json → their shim modules (minted here if needed);
+   *  - esm already minted → its URL (the common case: deps-first ordering);
+   *  - esm NOT yet minted → cycle back-edge / forward reference → a
+   *    dynamic-import shim (snapshot re-exports of the real module — the
+   *    documented divergence for cyclic ESM graphs). */
+  async function urlFor(r: { kind: string; path?: string; id?: string }): Promise<string> {
+    if (r.kind === 'builtin') return ensureShim(builtinShimPath(r.id!), builtinShimText(r.id!));
+    if (r.kind === 'cjs') return ensureShim(cjsShimPath(r.path!), cjsShimText(r.path!));
+    if (r.kind === 'json') return ensureShim(jsonShimPath(r.path!), jsonShimText(r.path!));
+    if (urlByPath.has(r.path!)) return urlByPath.get(r.path!)!;
+    return ensureShim(dynShimPath(r.path!), dynShimText(r.path!));
   }
 
   // ---- process lifetime (node semantics: pending import() keeps the loop) --
@@ -801,14 +857,16 @@ export function makeEsmGraphImporter(deps: EsmGraphDeps): EsmGraphImporter {
     }
   }
 
-  /** Publish a single shim module under the process nonce. */
+  /** Mint a single shim module (no static deps — always mintable) and
+   *  return its URL. */
   async function ensureShim(shimPath: string, text: string): Promise<string> {
     if (published.has(shimPath)) return urlOf(shimPath);
-    const entries = new Map<string, string>();
-    entries.set(shimPath, text);
-    await serving.publish(processNonce, entries);
+    const urls = await serving.serve(processNonce, new Map([[shimPath, text]]));
+    const url = urls.get(shimPath);
+    if (!url) throw new Error(`OpenContainer: ESM transport returned no URL for ${shimPath}`);
+    urlByPath.set(shimPath, url);
     published.add(shimPath);
-    return urlOf(shimPath);
+    return url;
   }
 
   return { importEntry, dynamicImport };

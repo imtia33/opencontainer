@@ -86,15 +86,15 @@ async function runNpm(
     argv: ['node', ...argv],
     hooks: {
       esmServing: {
-        async publish(nonce: string, entries: Map<string, string>): Promise<void> {
+        async serve(nonce: string, entries: Map<string, string>): Promise<Map<string, string>> {
+          const urls = new Map<string, string>();
           for (const [p, text] of entries) {
             const real = nodePath.join(ESM_TMP, nonce, p);
             nodeFs.mkdirSync(nodePath.dirname(real), { recursive: true });
             nodeFs.writeFileSync(real, text);
+            urls.set(p, `file://${real}`);
           }
-        },
-        prefix(nonce: string): string {
-          return `file://${ESM_TMP}/${nonce}`;
+          return urls;
         },
       },
       outboundRewrite: (u: string) => u,

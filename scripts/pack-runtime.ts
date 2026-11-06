@@ -1,7 +1,7 @@
 /**
  * OpenContainer — Runtime blob packer.
  *
- * Packs the vendored Node.js sources into ONE gzip'd binary blob (.ocrt.gz)
+ * Packs the vendored Node.js sources into ONE gzip'd binary blob (.ocrt)
  * so the kernel worker boots with a single HTTP request instead of 455.
  *
  * Blob layout (little-endian):
@@ -28,9 +28,9 @@
  * WebContainers), so 10.x — the last pure-JS upstream line — is vendored.
  *
  * Output (content-addressed by sha256 prefix):
- *   public/opencontainer/runtime/node-<ver>-core-<hash8>.ocrt.gz
- *   public/opencontainer/runtime/node-<ver>-amaro-<hash8>.ocrt.gz
- *   public/opencontainer/runtime/npm-<npmver>-<hash8>.ocrt.gz
+ *   public/opencontainer/runtime/node-<ver>-core-<hash8>.ocrt
+ *   public/opencontainer/runtime/node-<ver>-amaro-<hash8>.ocrt
+ *   public/opencontainer/runtime/npm-<npmver>-<hash8>.ocrt
  *   public/opencontainer/runtime/index.json   (tiny pointer file)
  *
  * Run: bun run scripts/pack-runtime.ts
@@ -135,7 +135,7 @@ function main() {
     const { blob } = pack(files, vendorDir);
     const hash = sha(blob);
     const gz = gzipSync(blob, { level: 9 });
-    const file = `${filePrefix ?? `node-${nodeVersion}-${name}`}-${hash}.ocrt.gz`;
+    const file = `${filePrefix ?? `node-${nodeVersion}-${name}`}-${hash}.ocrt`;
     fs.writeFileSync(path.join(OUT_DIR, file), gz);
     const ms = ((Bun.nanoseconds() - t0) / 1e6).toFixed(0);
     console.log(

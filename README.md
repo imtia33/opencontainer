@@ -49,13 +49,15 @@ No cross-origin isolation is required (no SharedArrayBuffer anywhere) — your a
 
 ## Preview URLs (the one same-origin file)
 
-Guest servers are reachable at `/opencontainer/p/<port>/` through a ServiceWorker — and service workers must live on your own origin (browser spec; the same rule StackBlitz works under, they just host it on their side). The runtime auto-registers it at boot; you only need the file to exist:
+Your guest servers (the `server-ready` event) are reachable at `/opencontainer/p/<port>/` — loadable in an iframe, exactly like the starter's `iframe.src = url`. The bridge is a ServiceWorker, and by browser spec a service worker must live on your own origin. The runtime registers it automatically at boot; the only setup step for previews is having the file on your origin:
 
 ```bash
 cp -r node_modules/opencontainer/public/opencontainer ./public/
 ```
 
-Without it, everything works except preview URLs (a console warning explains the same). `setPreviewScript` and `server-ready`/`port` events follow the upstream contracts.
+Without it, everything except preview URLs works (a console warning explains the same). `setPreviewScript`, `server-ready`, `port`, and `preview-message` follow the upstream contracts (`forwardPreviewErrors: true` injects a built-in error forwarder). Previews route to the page whose runtime owns the port — a second tab of your app gets its own previews independently.
+
+**Self-hosting note:** serve the runtime blobs (`.ocrt` files) as-is — `application/octet-stream`, no `Content-Encoding`. Static hosts that auto-gzip `.gz`-suffixed files were the reason for the `.ocrt` naming.
 
 ## Status
 
@@ -68,7 +70,8 @@ Without it, everything works except preview URLs (a console warning explains the
 | Guest `http` servers through the preview bridge | ✅ |
 | Buffer binding parity vs native Node | ✅ 53/53 byte-identical |
 | OPFS persistence + reload hydration | ✅ |
-| `require(esm)` (module_wrap shim) | 🚧 in progress |
+| ESM entry points + dynamic `import()` (esm-graph, in-worker blob modules) | ✅ verified by create-vite/create-expo-app E2E |
+| `vite` dev server | 🔒 blocked by the esbuild native binary (roadmap: wasm shim) |
 | pnpm (genuine CLI, vendored) | 🚧 P2 |
 | Lifecycle scripts | 🔒 off by default (permission model pending) |
 
