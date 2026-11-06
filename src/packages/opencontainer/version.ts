@@ -12,7 +12,7 @@
  *  - npm is the genuine, unmodified upstream CLI (vendored, provenance
  *    recorded in vendor/npm-12.2.1/.provenance.json).
  */
-export const OPENCONTAINER_VERSION = '1.0.0-beta.1';
+export const OPENCONTAINER_VERSION = '1.0.0-beta.2';
 
 export const ENGINE_IDENTITY = {
   /** Product identity of the `node` command provided by this runtime. */

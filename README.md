@@ -1,102 +1,91 @@
 # OpenContainer
 
-**A browser-native Node.js runtime.** Run real Node.js projects, the real `npm` CLI, and real servers — entirely inside the browser, with no remote development VM in the loop. An open-source, MIT-licensed alternative to StackBlitz WebContainers.
-
-> Status: **1.0.0-beta** — milestone P1 ("npm is npm") reached in the development sandbox. See [Status](#status) below for the honest, verified state of every subsystem.
-
----
-
-## What it is
-
-OpenContainer executes the **actual Node.js JavaScript standard library** (vendored, unmodified, currently `v26.13.0`) inside a Web Worker, on the browser's own JS engine:
-
-- **Real Node, not a look-alike.** Node's own `lib/*.js` (511 modules) runs on a thin native-binding shim that implements the ~40 C++ `internalBinding` surfaces (fs → virtual filesystem, uv → browser event loop, zlib, http_parser, tcp/pipe wraps → virtual sockets) on browser primitives. No Node binary, no WASM Node, no code interpreter faking it.
-- **Real npm.** The unmodified upstream npm CLI (`12.2.1`, vendored from Node's `deps/npm`, 1,941 files) runs as a guest process. `npm install express` talks to the real registry, downloads the real tarball, verifies integrity, and extracts into the guest `node_modules`.
-- **A real filesystem.** OPFS-backed virtual filesystem with Node semantics (wx/EEXIST, atomic rename, symlinks for npm bin-links, watchers) and persistence across reloads.
-- **Real child processes and servers.** `child_process.spawn` between guest processes, `http` servers in the guest, and a ServiceWorker-based preview bridge so guest servers are reachable from the page.
-- **Honest by design.** Every intentional divergence from Node.js is documented in [COMPATIBILITY.md](./COMPATIBILITY.md). `process.platform: 'linux'`, `process.arch: 'wasm32'` — same observable shape as the incumbent. Nothing is mocked to make a demo pass.
-
-## Architecture (60 seconds)
-
-```
-main thread                    worker (kernel)                 browser platform
-──────────────                 ───────────────                 ─────────────────
-OpenContainerRuntime  ⇄ postMessage ⇄  node lib/*.js (v26.13)        OPFS (VFS persistence)
-  terminal (xterm.js)               │   ├─ natives: fs/uv/zlib/…    Cache API (runtime blobs)
-  editor bridge                     │   ├─ VFS (in-memory + OPFS)   fetch() (registry, CORS bridge)
-  preview SW bridge                 │   └─ process manager          ServiceWorker (preview URLs)
-                                     └─ npm 12.2.1 (vendored)       IndexedDB (IDE metadata)
-```
-
-The vendored Node sources and the npm tree are packed into content-addressed `.ocrt.gz` blobs (served from `public/opencontainer/runtime/`, cached via the Cache API) — warm kernel boot is ~220 ms.
-
-## Quick start (embedding)
+**A browser-native Node.js runtime.** An open-source, MIT-licensed drop-in alternative to StackBlitz WebContainers: real Node.js stdlib, the real `npm` CLI, real servers — running entirely in the browser. No remote development VM, no COOP/COEP headers, no license.
 
 ```bash
 npm install opencontainer
 ```
 
-1. Copy the runtime assets so the browser can fetch them:
+```ts
+import { WebContainer } from 'opencontainer';
+
+const wc = await WebContainer.boot();
+await wc.mount(files);
+const p = await wc.spawn('npm', ['install']);
+p.output.pipeTo(new WritableStream({ write: console.log }));
+await p.exit;
+await wc.spawn('npm', ['run', 'start']);
+wc.on('server-ready', (port, url) => { iframe.src = url; });
+```
+
+That's the whole setup. Code written against `@webcontainer/api` runs by changing the import.
+
+## What runs inside
+
+- **Real Node, not a look-alike.** Node's own `lib/*.js` standard library (511 modules, vendored unmodified from v26.13.0) executes on the browser's own JS engine, on a shim that implements the ~40 C++ `internalBinding` surfaces (fs → virtual filesystem, uv → browser event loop, zlib, http_parser, tcp/pipe wraps → virtual sockets) on browser primitives. No Node binary, no WASM Node.
+- **Real npm.** The unmodified upstream npm CLI (v12.2.1) runs as a guest process; `npm install` talks to the real registry directly from the browser.
+- **A real filesystem.** OPFS-backed virtual filesystem with Node semantics (wx/EEXIST, atomic rename, symlinks, watchers), persisted across reloads.
+- **Real child processes and servers.** `child_process.spawn` between guest processes, guest `http` servers, and a ServiceWorker-based preview bridge.
+
+Every intentional divergence from Node.js and from WebContainer is documented in [COMPATIBILITY.md](./COMPATIBILITY.md). Nothing is mocked to make a demo pass.
+
+## Zero hosting, by design
+
+Like WebContainer (whose runtime is fetched at boot from StackBlitz's own origin), the npm package is just the API. The runtime assets — kernel worker + Node/npm blobs — are fetched at boot from the jsDelivr CDN, pinned to the installed version, and cached via the browser's Cache API:
+
+```ts
+// default: https://cdn.jsdelivr.net/npm/opencontainer@<version>/public/opencontainer
+const wc = await WebContainer.boot();
+```
+
+Self-hosting instead (offline, air-gapped, or you just prefer your own origin):
+
+```ts
+const wc = await WebContainer.boot({ assetsBase: '/opencontainer' });
+// serve node_modules/opencontainer/public/opencontainer/ from that path
+```
+
+No cross-origin isolation is required (no SharedArrayBuffer anywhere) — your app keeps loading cross-origin images, fonts, and iframes untouched.
+
+## Preview URLs (the one same-origin file)
+
+Guest servers are reachable at `/opencontainer/p/<port>/` through a ServiceWorker — and service workers must live on your own origin (browser spec; the same rule StackBlitz works under, they just host it on their side). The runtime auto-registers it at boot; you only need the file to exist:
 
 ```bash
 cp -r node_modules/opencontainer/public/opencontainer ./public/
 ```
 
-2. Boot and use it:
-
-```ts
-import { OpenContainerRuntime } from 'opencontainer';
-
-const rt = new OpenContainerRuntime();
-await rt.boot();                    // fetches + caches the runtime blobs
-
-const proc = await rt.runCommand('npm --version');
-// → "12.2.1" (the vendored upstream CLI)
-
-await rt.write('/home/project/server.js`, `...`);   // VFS write
-const server = await rt.runCommand('node server.js'); // guest process
-```
-
-3. Serve the **registry bridge** (see [bridge/](./bridge/)) from your host app. The guest's npm networking runs on worker `fetch()`; the registry allow-list bridge provides the same-origin hop that browser CORS requires for npm's preflighted registry calls. It is npm-registry-scoped by construction (no general proxy, no credential forwarding, https-only, SSRF-safe).
-
-4. Register the preview ServiceWorker (`public/opencontainer/preview-sw.js`) to expose guest servers under preview URLs.
-
-A full working embedding is a standard SPA page + terminal component; see [docs/](./docs/) for the API surface and the compatibility contract.
+Without it, everything works except preview URLs (a console warning explains the same). `setPreviewScript` and `server-ready`/`port` events follow the upstream contracts.
 
 ## Status
-
-Verified in real Chromium (E2E drivers, evidence logs in the development sandbox):
 
 | Capability | State |
 |---|---|
 | `node -v` (vendored Node v26.13.0 lib tree) | ✅ |
 | `npm -v` → 12.2.1 (upstream CLI, unmodified) | ✅ |
-| `npm init -y` / `npm view <pkg> version` | ✅ |
-| `npm install express` from the real registry | ✅ 65 pkgs, ~16 s cold, integrity-checked |
-| Express 5 serving through preview bridge | ✅ `200 P1-GATE-OK` |
-| `npx create-expo-app` (interactive, end-to-end) | ✅ binary-exact extraction |
-| Buffer binding parity vs native Node | ✅ 53/53 byte-identical cases |
-| HTTP client (make-fetch-happen path) | ✅ 32/32 tests |
+| `npm init` / `npm view` / `npm install` from the real registry | ✅ |
+| `npx create-vite` / `npx create-expo-app` end-to-end | ✅ |
+| Guest `http` servers through the preview bridge | ✅ |
+| Buffer binding parity vs native Node | ✅ 53/53 byte-identical |
 | OPFS persistence + reload hydration | ✅ |
-| `require(esm)` (module_wrap shim) | 🚧 in progress (design in docs/reality-initiative) |
-| pnpm / Yarn (genuine CLIs) | 🚧 P2 |
-| Lifecycle scripts | 🔒 blocked by default (permission model pending) |
+| `require(esm)` (module_wrap shim) | 🚧 in progress |
+| pnpm (genuine CLI, vendored) | 🚧 P2 |
+| Lifecycle scripts | 🔒 off by default (permission model pending) |
 
 ## Repository layout
 
 ```
-src/packages/opencontainer/   the package source
+src/packages/opencontainer/
   kernel/                     worker entry, VFS, natives, ESM graph, HTTP client
-  ide/                        IDE glue (project store, import pipeline)
   node-std/                   main-thread node std shapes
-  vendor/node-v26.13.0/       vendored Node lib tree (+ oc-sh shell, shims)
-  runtime.ts                  OpenContainerRuntime — the public runtime class
-  types.ts                    WebContainer-compatible public types
+  webcontainer-api.ts         the @webcontainer/api-compatible facade
+  runtime.ts                  OpenContainerRuntime (process manager, preview bridge)
+  vendor/node-v26.13.0/       vendored Node lib tree
 public/opencontainer/         served assets: kernel-worker.js, runtime blobs, preview-sw.js
 vendor/npm-12.2.1/            vendored upstream npm CLI (unmodified; Artistic-2.0)
-bridge/                       host-side server routes (registry CORS bridge, tarball import proxy)
+harness/                      browser E2E harness (a minimal host app)
 scripts/                      build, pack, harness, drivers, parity tests
-docs/                         architecture, ADRs, compatibility matrix
+docs/webcontainer-research.md primary-source WebContainer API reference (parity target)
 ```
 
 ## Legal
@@ -109,8 +98,9 @@ docs/                         architecture, ADRs, compatibility matrix
 
 ```bash
 bun install
-npm run build          # kernel worker + runtime blobs + dist bundles
+npm run build          # kernel worker + runtime blobs + dist bundle
 npm run test:harness   # boots the vendored npm CLI in the kernel harness
+bun run harness/server.ts   # browser E2E harness at http://localhost:7800
 ```
 
-The kernel harness (`scripts/npm-harness.ts`) runs the exact worker code path under Bun, which is the fastest way to debug binding-surface gaps ("crash-driven porting").
+The kernel harness (`scripts/npm-harness.ts`) runs the exact worker code path under Bun — the fastest way to debug binding-surface gaps ("crash-driven porting").

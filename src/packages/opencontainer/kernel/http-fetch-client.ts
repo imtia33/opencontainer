@@ -91,10 +91,17 @@ export interface FetchHttpClientOptions {
   https: any;
   /**
    * URL rewrite applied to the absolute outbound URL right before fetch.
-   * Default: identity. The integration owner passes something built on
-   * `defaultOutboundRewrite` (registry → same-origin bridge), usually
-   * `(url) => location.origin + defaultOutboundRewrite(url)` since the
-   * helper returns a relative path.
+   * Default: NONE — outbound requests go DIRECT to their destination.
+   *
+   * The npm registry serves `Access-Control-Allow-Origin: *` on simple
+   * requests, so the default guest networking (npm install against
+   * registry.npmjs.org) needs no same-origin hop: cross-origin requests are
+   * reduced to CORS-simple requests by dropping every non-safelisted request
+   * header (npm-*, referer, user-agent, authorization — see
+   * isCrossOriginUrl/isCorsSafelistedRequestHeader below). Embedders with
+   * special needs (private registry auth, an auditing proxy) can pass their
+   * own rewrite; returning a same-origin path also bypasses the safelist
+   * filter.
    */
   rewrite?: (url: string) => string;
   /** fetch implementation to use (default: globalThis.fetch). */
@@ -110,25 +117,55 @@ export interface FetchHttpClientOptions {
   now?: () => number;
 }
 
-/** Registry hosts that must be routed over the same-origin server bridge. */
-const REGISTRY_HOSTS = new Set(['registry.npmjs.org', 'registry.npmjs.com']);
-
-/**
- * Default rewrite: registry URLs → relative `/api/oc-net?u=<enc>` bridge URL
- * (prefix the worker's own origin when installing). Everything else is
- * returned untouched — direct fetch, honest CORS failure if the host does
- * not allow it. Only https URLs are rewritten (the bridge rejects non-https).
+/** CORS-safelisted request headers (fetch spec). These are the ONLY ones a
+ * browser may send cross-origin without triggering a preflight OPTIONS —
+ * which registry.npmjs.org does not answer (404). Content-type needs value
+ * restrictions (only form types are simple); if-none-match/if-modified-since
+ * were added to the spec's safelist in 2022 (Chromium 104+, Firefox,
+ * Safari 16+ — the supported browser floor for etag revalidation).
+ *
+ * Everything else (npm-*, referer, user-agent, authorization, cookie, …)
+ * is DROPPED on cross-origin requests: the browser would preflight and the
+ * registry would 404 the OPTIONS. npm's advisory headers are telemetry,
+ * not protocol — anonymous npm does not need them. Documented divergence
+ * (COMPATIBILITY.md: outbound HTTP).
  */
-export function defaultOutboundRewrite(url: string): string {
-  try {
-    const u = new URL(url);
-    if (u.protocol === 'https:' && REGISTRY_HOSTS.has(u.hostname)) {
-      return `/api/oc-net?u=${encodeURIComponent(url)}`;
-    }
-  } catch {
-    // not a parseable absolute URL — leave it alone
+const CORS_SAFELISTED_REQUEST_HEADERS = new Set([
+  'accept',
+  'accept-language',
+  'content-language',
+  'if-modified-since',
+  'if-none-match',
+  'if-range',
+  'range',
+]);
+
+function isCorsSafelistedRequestHeader(name: string, value: unknown): boolean {
+  const n = name.toLowerCase();
+  if (CORS_SAFELISTED_REQUEST_HEADERS.has(n)) return true;
+  if (n === 'content-type') {
+    const v = String(Array.isArray(value) ? value[0] : (value ?? '')).toLowerCase();
+    return (
+      v === '' ||
+      v === 'application/x-www-form-urlencoded' ||
+      v === 'multipart/form-data' ||
+      v.startsWith('text/plain')
+    );
   }
-  return url;
+  return false;
+}
+
+/** True when the fetch target is an http(s) URL on another origin than this
+ *  worker. Relative URLs (same-origin rewrites) and unparseable inputs are
+ *  treated as same-origin. */
+function isCrossOriginUrl(url: string): boolean {
+  try {
+    const u = new URL(url, (self as any).location?.href);
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') return false;
+    return u.origin !== (self as any).location?.origin;
+  } catch {
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -818,10 +855,15 @@ class FetchClientRequest extends TinyEmitter {
     this._destroy(nodeError('ETIMEDOUT', `network timeout at: ${this._targetUrl || this._init.absoluteUrl}`));
   }
 
-  private _buildHeaders(): Headers {
+  private _buildHeaders(crossOrigin = false): Headers {
     const out = new Headers();
     const apply = (name: string, value: unknown) => {
       if (isDroppedRequestHeader(name)) return; // silent drop (divergence #1)
+      if (crossOrigin && !isCorsSafelistedRequestHeader(name, value)) {
+        // Would trigger a preflight the destination does not answer —
+        // silently reduced to a CORS-simple request (see COMPATIBILITY.md).
+        return;
+      }
       if (value === null || value === undefined) return;
       try {
         if (Array.isArray(value)) {
@@ -854,8 +896,9 @@ class FetchClientRequest extends TinyEmitter {
 
     const absUrl = this._init.absoluteUrl;
     this._targetUrl = this._rewrite ? this._rewrite(absUrl) : absUrl;
+    const crossOrigin = isCrossOriginUrl(this._targetUrl);
 
-    const headers = this._buildHeaders();
+    const headers = this._buildHeaders(crossOrigin);
     let body: BodyInit | undefined;
     if (this.method !== 'GET' && this.method !== 'HEAD' && this._bodyChunks.length > 0) {
       body = concatBytes(this._bodyChunks) as unknown as BodyInit;

@@ -32,6 +32,8 @@ const setStatus = (text, cls) => {
 
 window.__ocStdioLog = [];
 const rt = new OpenContainerRuntime({
+  // Self-hosted layout: this harness serves /opencontainer/* itself. (The
+  // default is the jsDelivr CDN — tested by the standalone IDE test app.)
   onStdio(fd, chunk) {
     window.__ocStdioLog.push(String(chunk));
     if (window.__ocStdioLog.length > 400) window.__ocStdioLog.shift();
@@ -58,7 +60,7 @@ const rt = new OpenContainerRuntime({
   onError(err) {
     term.write(`\r\n\x1b[31m[error] ${err.message}\x1b[0m\r\n`);
   },
-});
+}, { assetsBase: '/opencontainer' });
 window.__ocRuntime = rt;
 
 function prompt() {
@@ -111,37 +113,19 @@ term.onData((d) => {
   for (const ch of d) handleChar(ch);
 });
 
-// ---- preview ServiceWorker + bridge glue ----------------------------------
-// Page-level runtime registry: the terminal runtime PLUS any WebContainer
-// facade runtimes booted by embedders/drivers — the SW bridge asks each
-// until one owns the port (multi-runtime pages, e.g. facade E2E).
-window.__ocRuntimes = [rt];
+// ---- preview ServiceWorker -----------------------------------------------
+// Nothing to wire: OpenContainerRuntime.boot() registers the preview SW
+// (same-origin /opencontainer/preview-sw.js) and routes preview fetches
+// into the kernel TCP stack itself. Only a status flag for the drivers.
 try {
-  const reg = await navigator.serviceWorker.register('/opencontainer/preview-sw.js', { scope: '/' });
-  await navigator.serviceWorker.ready;
-  state.swReady = true;
-  // The SW routes /opencontainer/p/<port>/ fetches here; we hand them to the
-  // runtime's virtual TCP stack. (This ~15 lines is what M1's registerPreview()
-  // will absorb into the package.)
-  navigator.serviceWorker.addEventListener('message', (ev) => {
-    const m = ev.data;
-    if (m && m.type === 'oc-preview-fetch') {
-      const channel = ev.ports[0];
-      const owner = window.__ocRuntimes.find((r) => r.connectPreview(m.port, channel, m.bytes));
-      if (!owner) {
-        try { channel.postMessage({ type: 'end' }); } catch (e) { /* closed */ }
-      }
-    }
-  });
-} catch (e) {
-  state.error = String((e && e.message) || e);
-  setStatus('SW registration failed', 'bad');
-  term.write(`\r\n\x1b[31m[sw] ${state.error}\x1b[0m\r\n`);
-}
+  const reg = await navigator.serviceWorker.getRegistration();
+  if (reg) state.swReady = true;
+} catch { /* no SW support — preview disabled */ }
 
 // ---- boot ------------------------------------------------------------------
 try {
   await rt.boot();
+  if (navigator.serviceWorker.controller) state.swReady = true;
 } catch (e) {
   state.error = String((e && e.message) || e);
   setStatus('boot failed', 'bad');

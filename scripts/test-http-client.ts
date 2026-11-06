@@ -7,24 +7,17 @@
  *
  *   1. https.get packument        → 200 JSON, every chunk Uint8Array
  *   2. https.get tarball          → 200, >100KB bytes, gzip/tar magic check
- *   3. https.request POST         → advisories/bulk with JSON body (the
- *                                    endpoint whose CORS failure in the
- *                                    browser is exactly why the bridge exists)
+ *   3. https.request POST         → advisories/bulk with JSON body
  *   4. abort/destroy              → 'error'/'abort', no crash, no unhandled rejection
  *   5. loopback delegation        → real node stack via isLoopback ()=>true
- *   6. (OC_BRIDGE=1 only)         → same traffic through the dev-server
- *                                    bridge /api/oc-net — full chain check
  *
  * Run:  bun run scripts/test-http-client.ts
- * With: OC_BRIDGE=1 bun run scripts/test-http-client.ts   (needs `bun run dev`
- *       answering on localhost:3000 first)
  */
 import * as httpNs from 'node:http';
 import * as httpsNs from 'node:https';
 import { gunzipSync } from 'node:zlib';
 import {
   installFetchHttpClient,
-  defaultOutboundRewrite,
 } from '../src/packages/opencontainer/kernel/http-fetch-client';
 
 // ESM module namespaces are frozen — patch a mutable copy instead (this is
@@ -32,9 +25,6 @@ import {
 // object, whose http.request/get are assignable).
 const http: any = { ...httpNs };
 const https: any = { ...httpsNs };
-
-const BRIDGE = process.env.OC_BRIDGE === '1';
-const BRIDGE_BASE = 'http://localhost:3000';
 
 let pass = 0;
 let fail = 0;
@@ -109,25 +99,13 @@ async function doGet(url: string): Promise<{ req: any; res: any }> {
 
 async function main() {
   console.log('test-http-client — fetch-backed node http/https client (bun, live network, no mocks)');
-  console.log(
-    BRIDGE
-      ? `mode: OC_BRIDGE=1 → registry traffic rewrites to ${BRIDGE_BASE}/api/oc-net (defaultOutboundRewrite)`
-      : 'mode: direct bun fetch to registry.npmjs.org (rewrite: identity)',
-  );
-
-  const rewrite = BRIDGE
-    ? (url: string) => {
-        const r = defaultOutboundRewrite(url);
-        return r === url ? url : BRIDGE_BASE + r;
-      }
-    : undefined;
+  console.log('mode: direct fetch to registry.npmjs.org (no rewrite — the browser default)');
 
   const handleA = installFetchHttpClient({
     http,
     https,
     isLoopback: () => false,
     fetchImpl: fetch,
-    rewrite,
   });
 
   // ---- [1] packument ------------------------------------------------------
@@ -173,12 +151,7 @@ async function main() {
     check('body parses as JSON', !!parsed);
     check('JSON name === "express"', parsed?.name === 'express', String(parsed?.name));
     check(`body size plausible (${total} bytes)`, total > 10000);
-    if (BRIDGE) {
-      check('x-oc-bridge: oc-net (through the bridge)', res.headers['x-oc-bridge'] === 'oc-net');
-      check('cache-control: no-store (bridge)', res.headers['cache-control'] === 'no-store');
-    } else {
-      check('no x-oc-bridge header (direct fetch)', res.headers['x-oc-bridge'] === undefined);
-    }
+    check('no x-oc-bridge header (direct fetch)', res.headers['x-oc-bridge'] === undefined);
   }
 
   // ---- [2] tarball ---------------------------------------------------------

@@ -1,7 +1,7 @@
 {
   "name": "opencontainer",
-  "version": "1.0.0-beta.1",
-  "description": "Browser-native Node.js runtime \u2014 real Node v26 lib tree, the real npm CLI, OPFS-backed VFS, and preview networking, running entirely in the browser. Open-source WebContainers alternative.",
+  "version": "1.0.0-beta.2",
+  "description": "Browser-native Node.js runtime \u2014 real Node v26 lib tree, the real npm CLI, OPFS-backed VFS. A drop-in, open-source WebContainers alternative: npm install and boot, nothing to host.",
   "type": "module",
   "license": "MIT",
   "private": false,
@@ -22,7 +22,6 @@
     "virtual-filesystem",
     "opfs",
     "web-worker",
-    "ide",
     "stackblitz-alternative",
     "in-browser"
   ],
@@ -37,21 +36,15 @@
       "types": "./dist-types/index.d.ts",
       "import": "./dist/opencontainer.mjs"
     },
-    "./ide": {
-      "types": "./dist-types/ide/container.d.ts",
-      "import": "./dist/ide.mjs"
-    },
     "./package.json": "./package.json"
   },
   "files": [
     "dist",
     "dist-types",
     "public",
-    "bridge",
     "README.md",
     "LICENSE",
-    "COMPATIBILITY.md",
-    "docs"
+    "COMPATIBILITY.md"
   ],
   "scripts": {
     "build": "bash scripts/build-opencontainer.sh && bun run scripts/build-dist.ts",

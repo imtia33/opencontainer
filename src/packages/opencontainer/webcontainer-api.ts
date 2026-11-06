@@ -34,6 +34,8 @@ import type {
   PreviewMessageListener,
 } from './types';
 
+export { type OpenContainerRuntime };
+
 export interface WebContainerBootOptions {
   /** Accepted for API compatibility. OpenContainer needs NO cross-origin
    *  isolation (no SharedArrayBuffer requirement) — this is a no-op. */
@@ -43,9 +45,15 @@ export interface WebContainerBootOptions {
   /** Accepted for compatibility; preview error forwarding is not wired. */
   forwardPreviewErrors?: boolean | 'exceptions-only';
   /** OpenContainer EXTENSION: adopt an already-booted OpenContainerRuntime
-   *  (e.g. an IDE's terminal runtime) instead of booting a new one. The
+   *  (e.g. a page-level terminal runtime) instead of booting a new one. The
    *  facade does not own its lifecycle — teardown() is a no-op then. */
   runtime?: OpenContainerRuntime;
+  /** OpenContainer EXTENSION: base URL that serves the runtime assets
+   *  (kernel worker + .ocrt.gz blobs). Default: jsDelivr, pinned to the
+   *  installed package version — nothing to copy, nothing to host. Pass a
+   *  same-origin path (e.g. '/opencontainer') or any CORS-enabled URL to
+   *  self-host. Ignored when `runtime` is adopted. */
+  assetsBase?: string;
 }
 
 type RuntimeEventListener = (info: any) => void;
@@ -68,6 +76,11 @@ export class WebContainer {
    *  register the runtime with a page-level preview router). */
   get _runtime(): OpenContainerRuntime {
     return this.runtime;
+  }
+
+  /** Base URL the runtime assets are loaded from (CDN by default). */
+  get assetsBase(): string {
+    return (this.runtime as any).assetsBase ?? '';
   }
 
   /** Full path of the working directory. */
@@ -141,7 +154,7 @@ export class WebContainer {
     let runtime = options.runtime;
     let adopted = true;
     if (!runtime) {
-      runtime = new OpenContainerRuntime({});
+      runtime = new OpenContainerRuntime({}, { assetsBase: options.assetsBase });
       await runtime.boot();
       adopted = false;
     }
@@ -218,23 +231,29 @@ export class WebContainer {
     this.assertNotTornDown();
     const rt = this.runtime;
     const wrap = (fn: (a: any, b: any) => void): RuntimeEventListener => (info: any) => fn(info.port, info);
+    // The loadable preview URL (upstream's is on their origin; ours is the
+    // same-origin ServiceWorker path — iframe.src = url works identically).
+    const previewUrl = (port: number): string => {
+      try { return new URL(`/opencontainer/p/${port}/`, (globalThis as any).location?.href ?? 'http://localhost').href; }
+      catch { return `http://localhost:${port}`; }
+    };
     let off: () => void;
     switch (event) {
       case 'server-ready': {
-        // 'listen' is our server-ready signal; the URL is the preview origin
-        // (same-origin path form, like upstream's http://localhost:<port>).
-        off = rt.on('listen', wrap((port, info) => {
-          (listener as ServerReadyListener)(port, `http://localhost:${port}`);
-          void info;
+        // 'listen' is our server-ready signal; the URL is the loadable
+        // preview origin (SW-intercepted path, same shape as upstream's
+        // directly-embeddable http://localhost:<port> URL).
+        off = rt.on('listen', wrap((port) => {
+          (listener as ServerReadyListener)(port, previewUrl(port));
         }) as any);
         break;
       }
       case 'port': {
         const openOff = rt.on('listen', wrap((port) => {
-          (listener as PortListener)(port, 'open', `http://localhost:${port}`);
+          (listener as PortListener)(port, 'open', previewUrl(port));
         }) as any);
         const closeOff = rt.on('unlisten', wrap((port) => {
-          (listener as PortListener)(port, 'close', `http://localhost:${port}`);
+          (listener as PortListener)(port, 'close', previewUrl(port));
         }) as any);
         off = () => { openOff(); closeOff(); };
         break;
@@ -246,9 +265,11 @@ export class WebContainer {
         break;
       }
       case 'preview-message': {
-        // Preview error forwarding is not implemented; accept the listener
-        // (no-op) so upstream code runs unmodified.
-        off = () => {};
+        // Forwarded from preview iframes (uncaught exceptions, unhandled
+        // rejections, custom posts) via setPreviewScript's injected shim.
+        off = rt.on('previewMessage', ((message: unknown) => {
+          (listener as PreviewMessageListener)(message);
+        }) as any);
         break;
       }
       default:
@@ -259,6 +280,15 @@ export class WebContainer {
   }
 
   // ---------------------------------------------------------------- teardown
+  /** Inject a script into every guest-served HTML page (upstream contract:
+   *  error forwarding + preview tooling — e.g. webcontainer.on(
+   *  'preview-message') surfaces PREVIEW_UNCAUGHT_EXCEPTION and
+   *  PREVIEW_UNHANDLED_REJECTION posts). */
+  setPreviewScript(code: string): void {
+    this.assertNotTornDown();
+    this.runtime.setPreviewScript(code);
+  }
+
   /** Destroy the container and release every resource. */
   teardown(): void {
     if (this.tornDown) return;

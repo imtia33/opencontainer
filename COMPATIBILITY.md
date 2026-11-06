@@ -12,7 +12,7 @@
 
 **Engine identity:**
 - `process.version` → `v26.13.0` (derived from the vendored source; never hardcoded)
-- `process.platform` → `browser` · `process.arch` → `wasm32` (same observable class as the incumbent)
+- `process.platform` → `linux` · `process.arch` → `wasm32` (same observable class as the incumbent)
 - Genuine Node.js JS source execution: `lib/**` from nodejs.org (MIT), loaded by the real CJS loader
 - Reimplemented native bindings: all `internalBinding` surfaces (TypeScript)
 - Browser API substitutions: fetch (outbound HTTP), OPFS (disk), WebCrypto (crypto), DecompressionStream/fflate (zlib), MessageChannel (IPC)
@@ -23,6 +23,17 @@
 2. `--require-module false` boot option (node v26 adds `module-sync` to CJS resolution conditions → dual packages resolve to `.mjs` → `require(esm)`, which needs ESM. Disabling it routes dual packages to their legacy CJS entries — a documented divergence until S5).
 
 ---
+
+## 0. Embedding & hosting model (vs WebContainer)
+
+| Aspect | WebContainer | OpenContainer |
+|---|---|---|
+| Install | `npm i @webcontainer/api` | `npm i opencontainer` — swap the import, same API surface (boot/mount/spawn/fs/on/teardown/setPreviewScript) |
+| Runtime assets | fetched at boot from StackBlitz's origin | fetched at boot from jsDelivr, pinned to the installed version (`assetsBase` overrides; same-origin path = self-hosted) |
+| Cross-origin isolation | **required** (SharedArrayBuffer for the WASM thread → COOP+COEP headers on your page) | **not required** (no WASM thread, no SAB anywhere: worker↔host is postMessage, sync fs never crosses threads) — `coep` boot option is an accepted no-op |
+| Registry networking | their infra | browser → registry.npmjs.org directly (see §3 outbound HTTP) |
+| Preview URLs | their origin | `/opencontainer/p/<port>/` via a ServiceWorker that must sit on your origin (browser spec); auto-registered at boot, `cp -r node_modules/opencontainer/public/opencontainer ./public/` is the only setup step |
+| License | commercial for production | MIT |
 
 ## 1. Developer commands
 
@@ -77,6 +88,8 @@
 | EADDRINUSE | **Fully implemented and tested** | synchronous port mirror in `bind()` + async `emitErrorNT` path; crash prints the real stack, exit 1 |
 | In-guest loopback client (`http.get('http://localhost:3000')`) | **Fully implemented and tested** | virtual connection pairs between processes |
 | Outbound HTTP to external hosts | **Partially implemented** | `fetch`-bridged where tools use it (registry.npmjs.org verified: packuments, tarballs, integrity); raw `net.connect`/`http.request` to non-local hosts fails ENOSYS honestly |
+| Cross-origin request headers | **Documented divergence** | cross-origin requests are reduced to CORS-simple requests: non-safelisted request headers (`npm-*` advisory telemetry, `referer`, `user-agent`, `authorization`, …) are silently dropped — registry.npmjs.org answers `Access-Control-Allow-Origin: *` on simple requests but 404s preflights; npm's advisory headers are telemetry, not protocol. Etag revalidation survives (`if-none-match` is spec-safelisted). An embedder `outboundRewrite` hook remains for private-registry setups |
+| `npm audit` | **Off by default (documented divergence)** | audit's bulk-advisories POST has a JSON content-type (never CORS-simple → would preflight → registry 404s OPTIONS); it is optional telemetry, not install correctness. Override per-process: spawn with env `{ npm_config_audit: 'true' }` behind your own bridge |
 | DNS (`dns.lookup`) | **Partial (documented divergence)** | local names resolve for the loopback path; external names are NOT resolved — never a fake IP (the S2 "lying stub" was scoped to localhost) |
 | WebSockets | **Unsupported (platform limit, documented)** | a Service Worker cannot intercept WebSocket upgrades; HMR sockets need an injected client shim (roadmap S4) |
 | Vite dev server / HMR | **Unsupported — blocked on ESM (S5)** | vite is ESM-only; see §4 |

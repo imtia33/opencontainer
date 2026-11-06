@@ -92,12 +92,40 @@ void (async () => {
   const viteOut = await run('npx -y create-vite@latest cv-app --template vanilla', 180000);
   check('create-vite banner', /Done\. Now run|Scaffolding project/.test(viteOut),
     viteOut.split('\n').filter((l) => l.trim()).slice(-4).join(' | '));
+  // VFS deltas fan out from the generator process asynchronously — settle
+  // before reading (expo is slower so it never raced; vite did).
+  const readSettled = async (p, tries = 20) => {
+    for (let i = 0; i < tries; i++) {
+      const b = await rt.readFile(p).catch(() => null);
+      if (b) return b;
+      await sleep(250);
+    }
+    return null;
+  };
   const viteFiles = await rt.readdir('/home/project/cv-app').catch(() => null);
   check('create-vite scaffolded tree', !!viteFiles && viteFiles.length >= 4,
     viteFiles ? viteFiles.map((e) => e.name).join(',') : 'missing');
   const vitePkg = await readJson('/home/project/cv-app/package.json');
   check('create-vite package.json', vitePkg?.name === 'cv-app' && !!vitePkg?.devDependencies?.vite,
     vitePkg ? `name=${vitePkg.name}` : 'missing');
+  // VFS depth check: the files the generator actually wrote, contents intact.
+  // (Vanilla template: index.html at root, main.js + counter.js in src/, NO
+  // vite.config.js — that ships only with framework templates.)
+  const viteHtml = await readSettled('/home/project/cv-app/index.html');
+  const viteHtmlText = viteHtml ? new TextDecoder().decode(viteHtml) : null;
+  check('create-vite index.html content', !!viteHtmlText && /<title>.*cv-app|src="\/main.js"|src="\/src\/main.js"/.test(viteHtmlText),
+    viteHtmlText ? viteHtmlText.slice(0, 60) : 'missing');
+  const viteMain = await readSettled('/home/project/cv-app/src/main.js');
+  const viteMainText = viteMain ? new TextDecoder().decode(viteMain) : null;
+  check('create-vite src/main.js content', typeof viteMainText === 'string' && /querySelector|getElementById/.test(viteMainText),
+    viteMainText ? `${viteMainText.length} chars` : 'missing');
+  const viteCounter = await readSettled('/home/project/cv-app/src/counter.js');
+  const viteCounterText = viteCounter ? new TextDecoder().decode(viteCounter) : null;
+  check('create-vite src/counter.js content', typeof viteCounterText === 'string' && viteCounterText.includes('setupCounter'),
+    viteCounterText ? `${viteCounterText.length} chars` : 'missing');
+  const vitePublic = await rt.readdir('/home/project/cv-app/public').catch(() => null);
+  check('create-vite public/ dir in VFS', !!vitePublic && vitePublic.some((e) => e.name.endsWith('.svg')),
+    vitePublic ? vitePublic.map((e) => e.name).join(',') : 'missing');
 
   // ---- create-expo-app ----------------------------------------------------
   const expoOut = await run('npx -y create-expo-app@latest expo-app --template blank --no-install', 300000);
@@ -109,6 +137,17 @@ void (async () => {
   const expoPkg = await readJson('/home/project/expo-app/package.json');
   check('create-expo-app package.json', expoPkg?.name === 'expo-app' && !!expoPkg?.dependencies?.expo,
     expoPkg ? `name=${expoPkg.name} deps=${Object.keys(expoPkg.dependencies || {}).length}` : 'missing');
+  // VFS depth check: nested dirs + real file contents from the tarball.
+  const expoApp = await readSettled('/home/project/expo-app/App.js');
+  const expoAppText = expoApp ? new TextDecoder().decode(expoApp) : null;
+  check('create-expo-app App.js content', typeof expoAppText === 'string' && expoAppText.length > 200,
+    expoAppText ? `${expoAppText.length} chars` : 'missing');
+  const expoAppJson = await readJson('/home/project/expo-app/app.json');
+  check('create-expo-app app.json', !!expoAppJson && expoAppJson?.expo?.name === 'expo-app',
+    expoAppJson ? `name=${expoAppJson?.expo?.name}` : 'missing');
+  const expoAssets = await rt.readdir('/home/project/expo-app/assets').catch(() => null);
+  check('create-expo-app assets dir in VFS', !!expoAssets && expoAssets.length >= 2,
+    expoAssets ? expoAssets.map((e) => e.name).join(',') : 'missing');
 
   // no hard-fatal errors in either run
   check('no fatal errors', !/not implemented|MODULE_NOT_FOUND/.test(viteOut + expoOut));

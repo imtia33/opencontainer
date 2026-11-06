@@ -12997,15 +12997,34 @@ function installNetPendingGlobalFetch() {
 }
 
 // src/packages/opencontainer/kernel/http-fetch-client.ts
-var REGISTRY_HOSTS = new Set(["registry.npmjs.org", "registry.npmjs.com"]);
-function defaultOutboundRewrite(url) {
+var CORS_SAFELISTED_REQUEST_HEADERS = new Set([
+  "accept",
+  "accept-language",
+  "content-language",
+  "if-modified-since",
+  "if-none-match",
+  "if-range",
+  "range"
+]);
+function isCorsSafelistedRequestHeader(name, value) {
+  const n = name.toLowerCase();
+  if (CORS_SAFELISTED_REQUEST_HEADERS.has(n))
+    return true;
+  if (n === "content-type") {
+    const v = String(Array.isArray(value) ? value[0] : value ?? "").toLowerCase();
+    return v === "" || v === "application/x-www-form-urlencoded" || v === "multipart/form-data" || v.startsWith("text/plain");
+  }
+  return false;
+}
+function isCrossOriginUrl(url) {
   try {
-    const u = new URL(url);
-    if (u.protocol === "https:" && REGISTRY_HOSTS.has(u.hostname)) {
-      return `/api/oc-net?u=${encodeURIComponent(url)}`;
-    }
-  } catch {}
-  return url;
+    const u = new URL(url, self.location?.href);
+    if (u.protocol !== "https:" && u.protocol !== "http:")
+      return false;
+    return u.origin !== self.location?.origin;
+  } catch {
+    return false;
+  }
 }
 var LOOPBACK_HOSTS = new Set([
   "localhost",
@@ -13601,11 +13620,14 @@ class FetchClientRequest extends TinyEmitter {
     }
     this._destroy(nodeError("ETIMEDOUT", `network timeout at: ${this._targetUrl || this._init.absoluteUrl}`));
   }
-  _buildHeaders() {
+  _buildHeaders(crossOrigin = false) {
     const out = new Headers;
     const apply = (name, value) => {
       if (isDroppedRequestHeader(name))
         return;
+      if (crossOrigin && !isCorsSafelistedRequestHeader(name, value)) {
+        return;
+      }
       if (value === null || value === undefined)
         return;
       try {
@@ -13633,7 +13655,8 @@ class FetchClientRequest extends TinyEmitter {
     this.headersSent = true;
     const absUrl = this._init.absoluteUrl;
     this._targetUrl = this._rewrite ? this._rewrite(absUrl) : absUrl;
-    const headers = this._buildHeaders();
+    const crossOrigin = isCrossOriginUrl(this._targetUrl);
+    const headers = this._buildHeaders(crossOrigin);
     let body;
     if (this.method !== "GET" && this.method !== "HEAD" && this._bodyChunks.length > 0) {
       body = concatBytes(this._bodyChunks);
@@ -14351,6 +14374,7 @@ require(${JSON.stringify(requirePath)});
     LANG: "en_US.UTF-8",
     TERM: "xterm-256color",
     npm_config_registry: "https://registry.npmjs.org/",
+    npm_config_audit: "false",
     npm_config_ignore_scripts: "true",
     NAPI_RS_FORCE_WASI: "true",
     ...opts.env
@@ -14596,7 +14620,7 @@ require(${JSON.stringify(requirePath)});
     installFetchHttpClient({
       http: httpMod,
       https: httpsMod,
-      rewrite: opts.hooks.outboundRewrite ?? defaultOutboundRewrite
+      rewrite: opts.hooks.outboundRewrite
     });
     __stage("http_client");
   }
@@ -14891,7 +14915,7 @@ function setProto(obj, proto) {
 
 // src/packages/opencontainer/kernel/worker-entry.ts
 init_browser();
-var RUNTIME_BASE = "/opencontainer/runtime";
+var runtimeBase = "/opencontainer/runtime";
 var OPFS_ROOT_DIR = "opencontainer-vfs";
 var NativeDecompressionStream = globalThis.DecompressionStream;
 globalThis.__ocHostGunzip = async (gz) => {
@@ -14908,7 +14932,7 @@ function post(msg) {
 }
 var CACHE_NAME = "opencontainer-runtime-v1";
 function cacheKeyUrl(file) {
-  return `${RUNTIME_BASE}/${file}`;
+  return `${runtimeBase}/${file}`;
 }
 async function readCache(file) {
   try {
@@ -14941,7 +14965,7 @@ async function writeCache(file, buf) {
   } catch {}
 }
 async function gunzip2(buf) {
-  const ds = globalThis.DecompressionStream;
+  const ds = NativeDecompressionStream;
   if (typeof ds === "function") {
     const stream = new Response(buf).body.pipeThrough(new ds("gzip"));
     return await new Response(stream).arrayBuffer();
@@ -15190,10 +15214,13 @@ async function boot(msg) {
   const lap = (key) => {
     marks[key] = Math.round(performance.now() - t0);
   };
+  if (typeof msg.runtimeBase === "string" && msg.runtimeBase) {
+    runtimeBase = msg.runtimeBase.replace(/\/+$/, "");
+  }
   post({ type: "boot-progress", phase: "index", loaded: 0, total: 0 });
   let index = msg.runtimeIndex ?? null;
   if (!index) {
-    const indexRes = await fetch(`${RUNTIME_BASE}/index.json`, { cache: "no-cache" });
+    const indexRes = await fetch(`${runtimeBase}/index.json`, { cache: "no-cache" });
     if (!indexRes.ok)
       throw new Error(`runtime index fetch failed (${indexRes.status})`);
     index = await indexRes.json();

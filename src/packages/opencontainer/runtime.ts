@@ -25,6 +25,7 @@ export interface RuntimeEvents {
   onUnlisten?(info: { port: number; pid: number }): void;
   onProcessStart?(info: { pid: number; repl: boolean; background: boolean }): void;
   onFsChange?(event: { type: 'rename' | 'change'; filename: string | null }): void;
+  onPreviewMessage?(message: unknown): void;
 }
 
 export type RuntimeEventMap = {
@@ -39,6 +40,7 @@ export type RuntimeEventMap = {
   unlisten: (info: { port: number; pid: number }) => void;
   processStart: (info: { pid: number; repl: boolean; background: boolean }) => void;
   fsChange: (event: { type: 'rename' | 'change'; filename: string | null }) => void;
+  previewMessage: (message: unknown) => void;
 };
 
 /** Typed error for IDE filesystem RPCs (node-style code + path). */
@@ -57,6 +59,66 @@ export class FsRpcError extends Error {
 // into every worker boot message (S3.1: removes the per-worker index.json
 // fetch; the worker still falls back to fetching when absent).
 import { RUNTIME_INDEX } from './runtime-index';
+import { OPENCONTAINER_VERSION } from './version';
+
+/**
+ * Where the kernel worker + runtime blobs are loaded from.
+ *
+ * Default: jsDelivr, pinned to the installed package version — the
+ * WebContainer model (their runtime is fetched at boot from StackBlitz's
+ * own origin; the npm package is just the API). jsDelivr serves any file of
+ * the npm package with `Access-Control-Allow-Origin: *`, so embedders need
+ * to copy or host NOTHING: `npm install opencontainer` is the whole setup.
+ *
+ * Self-hosting / offline: pass `{ assetsBase: '/my-hosted-path' }` (a path
+ * on your own origin that serves the package's `public/opencontainer/`
+ * directory) or an absolute URL to any CORS-enabled mirror.
+ */
+export const DEFAULT_ASSETS_BASE =
+  `https://cdn.jsdelivr.net/npm/opencontainer@${OPENCONTAINER_VERSION}/public/opencontainer`;
+
+/** Runtime options (second constructor argument). */
+export interface RuntimeOptions {
+  /** Base URL that serves `kernel-worker.js` and `runtime/` blobs.
+   *  Absolute URL (CORS-enabled) or a same-origin path. Default: the
+   *  jsDelivr CDN, pinned to the installed version — zero setup. */
+  assetsBase?: string;
+}
+
+// Cross-origin worker scripts cannot be passed to `new Worker()` directly —
+// the browser requires same-origin. Standard workaround (used by the
+// WebContainer-style CDNs): fetch the source (CORS) once per page and boot
+// it from a blob URL. Memoized so every guest process reuses one fetch.
+let workerBlobCache: { base: string; url: string } | null = null;
+
+async function resolveWorkerUrl(base: string): Promise<string> {
+  const bust = /^https?:/.test(base)
+    ? `?v=${OPENCONTAINER_VERSION}` // CDN: version-pinned and immutable
+    : `?v=${(globalThis as any).__ocWorkerBust ?? ((globalThis as any).__ocWorkerBust = Date.now())}`;
+  const direct = `${base}/kernel-worker.js${bust}`;
+  // Same-origin path → spawnable directly, no fetch hop.
+  if (!/^https?:/.test(base)) return direct;
+  if (workerBlobCache?.base === base) return workerBlobCache.url;
+  let res: Response;
+  try {
+    res = await fetch(direct);
+  } catch (err: any) {
+    throw new Error(
+      `OpenContainer: could not load the kernel worker from ${base} (${err?.message ?? err}). ` +
+      'If you are offline or behind a CORS-restricting proxy, self-host the assets and pass { assetsBase: \'/your-path\' }.',
+    );
+  }
+  if (!res.ok) {
+    throw new Error(
+      `OpenContainer: could not load the kernel worker from ${direct} (HTTP ${res.status}). ` +
+      'If the version is not published yet, or you are offline, self-host the assets and pass { assetsBase: \'/your-path\' }.',
+    );
+  }
+  const src = await res.text();
+  const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+  workerBlobCache = { base, url };
+  return url;
+}
 
 export interface ParsedCommand { cmd: string; args: string[] }
 
@@ -156,6 +218,11 @@ export class OpenContainerRuntime {
 
   private foregroundPid: number | null = null;
   private bootedOnce = false;
+  /** Base URL the kernel worker + runtime blobs load from (see
+   *  DEFAULT_ASSETS_BASE). */
+  private assetsBase: string;
+  /** Resolved spawnable worker URL (direct path or blob URL). */
+  private workerUrl: string | null = null;
   ready: Promise<{ nodeVersion: string; modules?: number; bootMs?: number }>;
   exited = false;
   nodeVersion: string | null = null;
@@ -163,12 +230,16 @@ export class OpenContainerRuntime {
   private _bootStart = 0;
   /** Shell keeper — pid 1; performs OPFS hydration + persistence RPCs. */
   private keeper: KernelProcess | null = null;
-  /** IDE filesystem watchers (host watchId → callback). */
+  /** fs.watch callbacks (facade fs.watch / embedder watchers). */
   private fsWatchers = new Map<number, (event: { type: 'rename' | 'change'; filename: string | null }) => void>();
   private nextWatchId = 1;
+  /** Preview ServiceWorker state (see registerPreview). */
+  private previewRegistered = false;
+  private previewScript: string | null = null;
 
-  constructor(events: RuntimeEvents = {}) {
+  constructor(events: RuntimeEvents = {}, options: RuntimeOptions = {}) {
     this.events = events;
+    this.assetsBase = (options.assetsBase ?? DEFAULT_ASSETS_BASE).replace(/\/+$/, '');
     this.ready = new Promise((res, rej) => {
       this._readyResolve = res;
       this._readyReject = rej;
@@ -182,6 +253,21 @@ export class OpenContainerRuntime {
     if (this.bootedOnce) return this.ready;
     this.bootedOnce = true;
     this._bootStart = performance.now();
+    // Resolve the spawnable worker URL first: a same-origin path spawns
+    // directly; an absolute (CDN) base is fetched once and booted from a
+    // blob URL. Failing here (offline, unpublished version) rejects `ready`
+    // with a self-describing error instead of a worker 404.
+    try {
+      this.workerUrl = await resolveWorkerUrl(this.assetsBase);
+    } catch (err: any) {
+      this._readyReject(err);
+      this.events.onError?.({ message: err?.message ?? String(err) });
+      throw err;
+    }
+    // Preview URL support (server-ready → iframe.src): best-effort, never
+    // blocks boot — the runtime works without the SW except for preview
+    // URLs (see registerPreview for the failure warning).
+    void this.registerPreview().catch(() => { /* warned inside */ });
     // The shell keeper: a real kernel process with no entry (idle). It
     // hydrates the VFS from OPFS on a fresh page load and owns persistence.
     const keeper = this.createProcess({
@@ -232,11 +318,11 @@ export class OpenContainerRuntime {
       proc.readyReject = rej;
     });
 
-    // Cache-bust: HTTP caching of kernel-worker.js would pin stale kernels
-    // across rebuilds (dev + user upgrades). The runtime index content hash
-    // changes with every rebuild, making the URL unique per build.
-    const bust = (globalThis as any).__ocWorkerBust ?? ((globalThis as any).__ocWorkerBust = Date.now());
-    const worker = new Worker(`/opencontainer/kernel-worker.js?v=${bust}`, { type: 'module' });
+    // Cache-bust: for same-origin dev bases the query defeats HTTP caching
+    // of kernel-worker.js across rebuilds (dev + user upgrades); CDN bases
+    // are version-pinned in the URL and immutable. The worker URL itself
+    // was resolved in boot() (direct path or blob URL).
+    const worker = new Worker(this.workerUrl ?? `/opencontainer/kernel-worker.js`, { type: 'module' });
     proc.worker = worker;
     worker.onmessage = (ev: MessageEvent) => this.handleProcessMessage(proc, ev.data);
     worker.onerror = (e) => {
@@ -277,6 +363,11 @@ export class OpenContainerRuntime {
       // S3.1: embed the runtime index (generated with the blobs) — saves one
       // index.json round trip per worker boot.
       runtimeIndex: RUNTIME_INDEX,
+      // Where this build's runtime blobs (.ocrt.gz) are served from. The
+      // worker cannot guess it: with the default CDN base the worker's own
+      // location is a blob: URL, and the same-origin '/opencontainer'
+      // default only holds for self-hosted embeddings.
+      runtimeBase: `${this.assetsBase}/runtime`,
     };
     worker.postMessage(bootMsg);
     void proc.ready.catch(() => { /* surfaced via error events */ });
@@ -1442,6 +1533,125 @@ export class OpenContainerRuntime {
     this.ports.clear();
     this.foregroundPid = null;
     this.exited = false;
+  }
+
+  // ----------------------------------------------------------------- preview
+  /**
+   * Register the preview ServiceWorker and wire the preview URL bridge
+   * (`/opencontainer/p/<port>/…` → this runtime's virtual TCP stack).
+   *
+   * Called automatically by boot() — embedders normally never call this.
+   * The SW file must live on THIS origin (browser spec: service workers
+   * are same-origin only), so with the default CDN assetsBase the runtime
+   * probes the conventional same-origin locations:
+   *   /opencontainer/preview-sw.js   (the documented copy: `cp -r
+   *                                   node_modules/opencontainer/public/opencontainer ./public/`
+   *                                   — only needed for preview support)
+   *   /preview-sw.js                 (flat-copy convention)
+   * A same-origin assetsBase ({ assetsBase: '/opencontainer' }) is probed
+   * first. Returns the registration, or null when no same-origin SW was
+   * found (a console warning explains the copy step; everything except
+   * preview URLs keeps working).
+   */
+  async registerPreview(): Promise<ServiceWorkerRegistration | null> {
+    if (this.previewRegistered) return null;
+    this.previewRegistered = true;
+    if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return null;
+
+    const candidates: string[] = [];
+    if (!/^https?:/.test(this.assetsBase)) {
+      candidates.push(`${this.assetsBase}/preview-sw.js`);
+    }
+    candidates.push('/opencontainer/preview-sw.js', '/preview-sw.js');
+
+    let registration: ServiceWorkerRegistration | null = null;
+    let lastError: unknown = null;
+    for (const path of candidates) {
+      try {
+        // Root scope lets the SW also serve the ESM graph transport
+        // (/oc-esm/…). Hosts that refuse it (no Service-Worker-Allowed
+        // header) get the default scope fallback — preview URLs live under
+        // /opencontainer/ and keep working either way.
+        try {
+          registration = await navigator.serviceWorker.register(path, { scope: '/' });
+        } catch {
+          registration = await navigator.serviceWorker.register(path);
+        }
+        break;
+      } catch (err) {
+        lastError = err;
+      }
+    }
+    if (!registration) {
+      console.warn(
+        '[opencontainer] preview ServiceWorker not registered ' +
+        (lastError ? `(${(lastError as Error)?.message ?? lastError}) ` : '') +
+        '— preview URLs need the SW on your origin. Copy the runtime assets to your public ' +
+        'folder: cp -r node_modules/opencontainer/public/opencontainer ./public/ — everything ' +
+        'else (terminal, fs, npm) works without it.',
+      );
+      return null;
+    }
+    await navigator.serviceWorker.ready;
+
+    // Page-level runtime registry: the SW message handler below asks every
+    // runtime on the page until one owns the port (multi-runtime pages,
+    // e.g. a facade runtime booted next to a terminal runtime).
+    const g = globalThis as any;
+    if (!Array.isArray(g.__ocRuntimes)) g.__ocRuntimes = [];
+    if (!g.__ocRuntimes.includes(this)) g.__ocRuntimes.push(this);
+
+    // Route the SW's preview fetches into this runtime's virtual TCP.
+    navigator.serviceWorker.addEventListener('message', (ev: MessageEvent) => {
+      const m = ev.data;
+      if (!m || m.type !== 'oc-preview-fetch') return;
+      if ((ev as any).__ocHandled) return; // another runtime on this page took it
+      const channel = ev.ports[0];
+      const registry: OpenContainerRuntime[] = (globalThis as any).__ocRuntimes ?? [this];
+      const owner = registry.find((r) => r.connectPreview(m.port, channel, m.bytes));
+      (ev as any).__ocHandled = true;
+      if (!owner) {
+        try { channel.postMessage({ type: 'end' }); } catch { /* closed */ }
+      }
+    });
+
+    // Preview iframes forward console errors here (via setPreviewScript's
+    // injected shim) — re-emit as 'preview-message' for embedders.
+    window.addEventListener('message', (ev: MessageEvent) => {
+      const data: any = ev.data;
+      if (data && typeof data.type === 'string' && data.type.startsWith('PREVIEW_')) {
+        this.emit('previewMessage', data);
+      }
+    });
+
+    // Deliver a preview script registered before the SW was ready.
+    if (this.previewScript !== null) {
+      this.postPreviewScript(this.previewScript, registration);
+    }
+    return registration;
+  }
+
+  /**
+   * Inject a script into every guest-served HTML page (the upstream
+   * WebContainer `setPreviewScript` contract: error forwarding, preview
+   * tooling). The script runs FIRST in the page; posting
+   * `{ type: 'PREVIEW_*', ... }` to window.parent surfaces as a
+   * 'preview-message' event on the runtime / facade.
+   */
+  setPreviewScript(code: string): void {
+    this.previewScript = code;
+    const reg = navigator?.serviceWorker?.controller
+      ? { active: navigator.serviceWorker.controller } as any
+      : null;
+    if (reg) this.postPreviewScript(code, reg);
+  }
+
+  private postPreviewScript(code: string, reg: { active: ServiceWorker | null }): void {
+    try {
+      reg.active?.postMessage({ type: 'oc-preview-script', code });
+    } catch {
+      /* SW not ready — redelivered on the next registerPreview */
+    }
   }
 }
 

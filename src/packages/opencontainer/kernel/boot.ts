@@ -15,7 +15,7 @@ import { wireBuiltinCompile } from './natives/builtins';
 import { makeEsmGraphImporter, fileUrlOf, dirnameOf as esmDirname } from './esm-graph';
 import { installNetPendingGlobalFetch, netPendingCount } from './net-pending';
 import { zlibPendingCount } from './natives/zlib';
-import { installFetchHttpClient, defaultOutboundRewrite } from './http-fetch-client';
+import { installFetchHttpClient } from './http-fetch-client';
 import { transformEsmToCjs, RequireAsyncModuleError } from './esm-to-cjs';
 
 export interface BootedKernel {
@@ -288,6 +288,13 @@ export async function bootKernel(opts: BootOptions): Promise<BootedKernel> {
     LANG: 'en_US.UTF-8',
     TERM: 'xterm-256color',
     npm_config_registry: 'https://registry.npmjs.org/',
+    // npm's audit posts JSON to /-/npm/v1/security/advisories/bulk — a
+    // cross-origin POST that preflights (JSON content-type is never
+    // CORS-simple), and registry.npmjs.org does not answer OPTIONS. Audit
+    // is optional telemetry, not install correctness — OFF by default in
+    // the browser container (overridable per-process: spawn with env
+    // { npm_config_audit: 'true' } behind a bridge of your own).
+    npm_config_audit: 'false',
     // Lifecycle scripts stay OFF by default until the explicit permission
     // model exists (P1 security rule): npm skips them with its own notice —
     // safe + transparent, no silent host execution.
@@ -628,16 +635,18 @@ export async function bootKernel(opts: BootOptions): Promise<BootedKernel> {
   // browser worker can only be `fetch()` (no sockets) — so the client
   // surface is fetch-backed (kernel/http-fetch-client.ts) while GUEST
   // LOOPBACK (guest↔guest, guest↔preview) keeps node's real stack through
-  // tcp_wrap. The rewrite maps registry hosts onto the same-origin bridge
-  // (/api/oc-net) when the host provides one — the browser worker passes
-  // `outboundRewrite`; the bun harness fetches the registry directly.
+  // tcp_wrap. No same-origin bridge by default: cross-origin requests are
+  // reduced to CORS-simple requests inside the client (safelisted headers
+  // only — the registry answers ACAO:* on simple requests), and an
+  // embedder-supplied `outboundRewrite` hook stays available for private
+  // registry setups.
   {
     const httpMod = require('http');
     const httpsMod = require('https');
     installFetchHttpClient({
       http: httpMod,
       https: httpsMod,
-      rewrite: (opts.hooks as any).outboundRewrite ?? defaultOutboundRewrite,
+      rewrite: (opts.hooks as any).outboundRewrite,
     });
     __stage('http_client');
   }

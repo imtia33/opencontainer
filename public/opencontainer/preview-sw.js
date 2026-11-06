@@ -95,6 +95,19 @@ self.addEventListener('activate', (event) => {
   event.waitUntil(self.clients.claim());
 });
 
+// ---- preview script injection (setPreviewScript contract) ------------------
+// The host page (OpenContainerRuntime.setPreviewScript) sends the script to
+// inject into every guest-served HTML response. Kept in memory; re-sent on
+// every SW restart by the runtime when set again (upstream semantics).
+let previewScript = null;
+
+self.addEventListener('message', (event) => {
+  const m = event.data;
+  if (m && m.type === 'oc-preview-script') {
+    previewScript = typeof m.code === 'string' ? m.code : null;
+  }
+});
+
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
   if (url.origin !== self.location.origin) return;
@@ -235,6 +248,33 @@ async function proxyFetch(request, port, pathAndQuery) {
         }
       }
       const isChunked = (responseHeaders.get('transfer-encoding') ?? '').includes('chunked');
+      const isHtml = (responseHeaders.get('content-type') ?? '').includes('text/html');
+      // setPreviewScript: buffer HTML responses and inject the script FIRST
+      // in the document (upstream contract: error forwarding, tooling). The
+      // body must be fully collected, so content-length is dropped.
+      if (isHtml && previewScript) {
+        responseHeaders.delete('content-length');
+        collectBody(bodyStreamFactory(bodyInChunk))
+          .then((bytes) => {
+            let text = new TextDecoder().decode(bytes);
+            const tag = `<script>${previewScript}</script>`;
+            const headOpen = /<head[^>]*>/i.exec(text);
+            text = headOpen
+              ? text.slice(0, headOpen.index + headOpen[0].length) + tag + text.slice(headOpen.index + headOpen[0].length)
+              : tag + text;
+            resolve(new Response(request.method === 'HEAD' ? null : text, {
+              status, statusText: statusText || undefined, headers: responseHeaders,
+            }));
+            resolved = true;
+            closeReplyNow();
+          })
+          .catch(() => {
+            if (!resolved) {
+              resolve(new Response('OpenContainer: preview script injection failed', { status: 502 }));
+            }
+          });
+        return;
+      }
       const bodyStream = new ReadableStream({
         start(controller) {
           bodyController = controller;
@@ -249,6 +289,29 @@ async function proxyFetch(request, port, pathAndQuery) {
         request.method === 'HEAD' ? null : dechunk(bodyStream, isChunked),
         { status, statusText: statusText || undefined, headers: responseHeaders },
       ));
+    }
+
+    function bodyStreamFactory(bodyInChunk) {
+      return new ReadableStream({
+        start(controller) {
+          bodyController = controller;
+          if (bodyInChunk && bodyInChunk.length > 0) controller.enqueue(bodyInChunk);
+          for (const c of chunks) controller.enqueue(c);
+          chunks.length = 0;
+          if (closed) controller.close();
+        },
+      });
+    }
+
+    function closeReplyNow() {
+      // Stop the body pump: with the injected-script path the stream is
+      // collected synchronously from the buffered chunks; any LATER data
+      // messages just miss an already-closed controller (harmless).
+      try { reply.close(); } catch { /* already closed */ }
+    }
+
+    function collectBody(stream) {
+      return new Response(stream).arrayBuffer().then((buf) => new Uint8Array(buf));
     }
 
     // Safety timeout: 60s with zero response bytes → 502.

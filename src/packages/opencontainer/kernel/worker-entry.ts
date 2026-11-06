@@ -26,7 +26,11 @@ import { VENDOR_ROOT } from './id-map';
 import type { VfsTree, VfsPersistOp } from './vfs';
 import { gunzipSync } from 'fflate';
 
-const RUNTIME_BASE = '/opencontainer/runtime';
+// Where the runtime blobs (.ocrt.gz) are fetched from. The HOST decides:
+// it is sent in every boot message (default CDN base or the embedder's
+// self-hosted base), because the worker cannot guess it — under the CDN
+// default the worker itself runs from a blob: URL with no useful location.
+let runtimeBase = '/opencontainer/runtime';
 const OPFS_ROOT_DIR = 'opencontainer-vfs';
 
 // Host bridge: capture the BROWSER's native DecompressionStream BEFORE the
@@ -117,7 +121,7 @@ interface RuntimeIndex {
 const CACHE_NAME = 'opencontainer-runtime-v1';
 
 function cacheKeyUrl(file: string): string {
-  return `${RUNTIME_BASE}/${file}`;
+  return `${runtimeBase}/${file}`;
 }
 
 async function readCache(file: string): Promise<ArrayBuffer | null> {
@@ -152,7 +156,12 @@ async function writeCache(file: string, buf: ArrayBuffer): Promise<void> {
 }
 
 async function gunzip(buf: ArrayBuffer): Promise<ArrayBuffer> {
-  const ds = (globalThis as any).DecompressionStream;
+  // ALWAYS the native DecompressionStream captured at module load — this
+  // function runs in the kernel-boot RACE window (the parallel amaro load)
+  // where globalThis.DecompressionStream may already be node's webstreams
+  // shim, whose stream objects the browser's pipeThrough rejects
+  // ("Failed to convert value to 'ReadableStream'").
+  const ds: any = NativeDecompressionStream;
   if (typeof ds === 'function') {
     const stream = new Response(buf).body!.pipeThrough(new ds('gzip'));
     return await new Response(stream).arrayBuffer();
@@ -481,10 +490,15 @@ async function boot(msg: {
   pid?: number;
   ppid?: number;
   runtimeIndex?: RuntimeIndex | null;
+  /** Base URL for runtime blob fetches (host-decided; see runtimeBase above). */
+  runtimeBase?: string;
 }): Promise<void> {
   const t0 = performance.now();
   const marks: Record<string, number> = {};
   const lap = (key: string) => { marks[key] = Math.round(performance.now() - t0); };
+  if (typeof msg.runtimeBase === 'string' && msg.runtimeBase) {
+    runtimeBase = msg.runtimeBase.replace(/\/+$/, '');
+  }
   post({ type: 'boot-progress', phase: 'index', loaded: 0, total: 0 });
 
   // S3.1: the host embeds the runtime index in the boot message (it is
@@ -493,7 +507,7 @@ async function boot(msg: {
   // per-worker index.json round trip.
   let index: RuntimeIndex | null = msg.runtimeIndex ?? null;
   if (!index) {
-    const indexRes = await fetch(`${RUNTIME_BASE}/index.json`, { cache: 'no-cache' });
+    const indexRes = await fetch(`${runtimeBase}/index.json`, { cache: 'no-cache' });
     if (!indexRes.ok) throw new Error(`runtime index fetch failed (${indexRes.status})`);
     index = await indexRes.json();
   }

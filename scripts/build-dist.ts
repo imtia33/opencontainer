@@ -3,13 +3,12 @@
  *
  * Produces (same relative layout in the app monorepo and the standalone
  * package repo):
- *   dist/opencontainer.mjs   the public entry (runtime + types + version)
- *   dist/ide.mjs             the IDE glue (project store, import pipeline)
- *   dist-types/**            TypeScript declarations for both entries
+ *   dist/opencontainer.mjs   the public entry (facade + runtime + types + version)
+ *   dist-types/**            TypeScript declarations
  *
  * Zero runtime dependencies: the browser entry imports nothing external;
- * everything the kernel needs is already bundled into the served worker
- * (public/opencontainer/kernel-worker.js) and the runtime blobs.
+ * everything the kernel needs is fetched at boot from the runtime assets
+ * (CDN by default, self-hosted via assetsBase).
  *
  *   bun run scripts/build-dist.ts
  */
@@ -17,7 +16,6 @@ import { $ } from 'bun';
 
 const entries: Array<[string, string]> = [
   ['src/packages/opencontainer/index.ts', 'dist/opencontainer.mjs'],
-  ['src/packages/opencontainer/ide/container.ts', 'dist/ide.mjs'],
 ];
 
 for (const [entry, outfile] of entries) {
