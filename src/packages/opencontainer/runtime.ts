@@ -216,6 +216,15 @@ interface ConnectionRoute {
   ownerPid: number;        // process whose kernel owns connId
   peer: { pid: number; connId: number } | null;  // local pair
   preview: PreviewChannel | null;                // preview bridge end
+  /** Preview routes only: last sign of life from the shim's MessagePort.
+   *  The shim pings every 10s (idle sockets included); a route silent for
+   *  PREVIEW_STALE_MS is a page that died without a closing handshake —
+   *  the guest socket is torn down (abnormal closure) and the route freed.
+   *  This is transport-level keepalive (TCP does the same), not an ordering
+   *  workaround: ordering-sensitive events all carry explicit messages. */
+  lastSeen?: number;
+  /** Set once teardown ran — every cleanup path is idempotent. */
+  dead?: boolean;
 }
 
 /** Host-owned end of a guest process's stdio pipe (facade spawnProgram).
@@ -247,7 +256,16 @@ export interface ProgramHandle {
 
 const MAX_LIVE_PROCESSES = 8;
 
+/** Preview-route keepalive: shim ping interval is 10s; a route is stale
+ *  after 90s of silence (tolerates background-tab timer throttling to 1/min).
+ *  Checked on a 15s sweep — bounded work, per-route state, no retries. */
+const PREVIEW_PING_MS = 10_000;
+const PREVIEW_STALE_MS = 90_000;
+const PREVIEW_SWEEP_MS = 15_000;
+
 export class OpenContainerRuntime {
+  private previewRouteSweep: ReturnType<typeof setInterval> | null = null;
+
   private processes = new Map<number, KernelProcess>();
   private pipes = new Map<number, PipeRoute>();
   private connections = new Map<number, ConnectionRoute>();
@@ -626,15 +644,32 @@ export class OpenContainerRuntime {
             const peerProc = this.processes.get(route.peer.pid);
             peerProc?.worker.postMessage({ type: 'tcp-eof', connId: route.peer.connId });
           } else if (route.preview) {
+            // Guest FIN (shutdown) or full close (tcp-close): the preview
+            // transport's server→client direction ends. After a normal WS
+            // closing handshake the shim is already CLOSED and ignores this;
+            // otherwise it surfaces as abnormal closure. On a half-close the
+            // route STAYS: the shim may still send its close-frame echo to
+            // the guest's open read side (channel.onmessage is independent of
+            // the route), and the stale sweep still needs the route to reap
+            // it if the page dies silently. We never send tcp-eof back to the
+            // guest on its own FIN — that would break half-open semantics.
             route.preview.postMessage({ type: 'end' });
-            this.connections.delete(msg.connId);
+            if (msg.type === 'tcp-close') this.teardownPreviewRoute(msg.connId, route);
           }
           if (msg.type === 'tcp-close') this.connections.delete(msg.connId);
         }
         break;
       }
       case 'tcp-unaccepted': {
-        // Nobody was listening in that kernel — drop silently.
+        // The guest kernel could not accept (no live listener in that
+        // process). Tear the route down and tell the preview end — never
+        // leak a connection nobody owns.
+        const route = this.connections.get(msg.connId);
+        if (route?.preview) {
+          route.preview.postMessage({ type: 'end' });
+          this.teardownPreviewRoute(msg.connId, route);
+        }
+        this.connections.delete(msg.connId);
         break;
       }
     }
@@ -702,7 +737,11 @@ export class OpenContainerRuntime {
           const peerProc = this.processes.get(route.peer.pid);
           peerProc?.worker.postMessage({ type: 'tcp-eof', connId: route.peer.connId });
         } else if (route.preview) {
-          route.preview.postMessage({ type: 'end' });
+          // The guest died: preview side must see the transport end. The
+          // worker is going away — teardownPreviewRoute's tcp-eof post is a
+          // no-op on a dead worker, the channel close is what matters.
+          try { route.preview.postMessage({ type: 'end' }); } catch { /* gone */ }
+          this.teardownPreviewRoute(connId, route);
         }
         this.connections.delete(connId);
       }
@@ -868,20 +907,24 @@ export class OpenContainerRuntime {
     const target = this.ports.get(port);
     if (!target) return false;
     const serverConnId = this.nextConnId++;
-    this.connections.set(serverConnId, {
+    const route: ConnectionRoute = {
       ownerPid: target.pid, peer: null, preview: channel,
-    });
+      lastSeen: Date.now(),
+    };
+    this.connections.set(serverConnId, route);
     channel.onmessage = (ev: MessageEvent) => {
       const m = ev.data;
+      route.lastSeen = Date.now();
       if (m.type === 'data') {
         const listener = this.processes.get(target.pid);
         listener?.worker.postMessage({
           type: 'tcp-data', connId: serverConnId, bytes: new Uint8Array(m.bytes),
         });
       } else if (m.type === 'end') {
-        const listener = this.processes.get(target.pid);
-        listener?.worker.postMessage({ type: 'tcp-eof', connId: serverConnId });
-        this.connections.delete(serverConnId);
+        // The SW never half-closes an in-flight request — 'end' here means
+        // the fetch side went away. Teardown (idempotent) delivers EOF to
+        // the guest socket and closes our channel end.
+        this.teardownPreviewRoute(serverConnId, route);
       }
     };
     const listener = this.processes.get(target.pid);
@@ -895,6 +938,41 @@ export class OpenContainerRuntime {
       bytes: initialBytes && initialBytes.byteLength > 0 ? initialBytes : undefined,
     });
     return true;
+  }
+
+  /** Idempotent teardown of a preview-routed virtual connection: EOF to
+   *  the guest socket (abnormal closure if no closing handshake completed),
+   *  close the channel end we hold, drop the route. Safe to call from every
+   *  cleanup path (ws-close, port death sweep, process exit, tcp-close). */
+  private teardownPreviewRoute(connId: number, route: ConnectionRoute): void {
+    if (route.dead) return;
+    route.dead = true;
+    const proc = this.processes.get(route.ownerPid);
+    if (proc && !proc.exited) {
+      proc.worker.postMessage({ type: 'tcp-eof', connId });
+    }
+    try { route.preview?.close?.(); } catch { /* already gone */ }
+    if (this.connections.get(connId) === route) this.connections.delete(connId);
+  }
+
+  /** Sweep preview routes whose shim side went silent (page death without a
+   *  closing handshake — crashed tabs, destroyed iframes). MessagePorts
+   * deliver no remote-close event in Chromium (verified), so the shim pings
+   * every PREVIEW_PING_MS and we reclaim routes silent past the stale
+   * window. Purely a GC of dead transports — live connections keep pinging. */
+  private startPreviewRouteSweep(): void {
+    if (this.previewRouteSweep) return;
+    this.previewRouteSweep = setInterval(() => {
+      const now = Date.now();
+      for (const [connId, route] of [...this.connections]) {
+        if (!route.preview || route.dead) continue;
+        if (route.lastSeen !== undefined && now - route.lastSeen > PREVIEW_STALE_MS) {
+          this.teardownPreviewRoute(connId, route);
+        }
+      }
+    }, PREVIEW_SWEEP_MS);
+    // The sweep must never keep the host page alive on unload.
+    try { (this.previewRouteSweep as any).unref?.(); } catch { /* browsers: no-op */ }
   }
 
   private broadcastPorts(): void {
@@ -931,10 +1009,26 @@ export class OpenContainerRuntime {
       proc.worker.postMessage({ type: 'signal', sig: signal });
       return true;
     }
-    // SIGTERM / SIGKILL: terminate the worker. The exit surfaces with the
-    // signal name (node reports exitCode null + signal).
-    proc.worker.terminate();
-    this.onProcessExit(proc, 0, signal);
+    // SIGTERM / SIGKILL: terminate the process TREE, children first. A real
+    // OS reaps the process group when a session dies, and npm itself
+    // forwards TERM to the script it runs — killing `npm run dev` must stop
+    // the dev server it spawned or its port stays occupied forever (the
+    // stale-port bug: the restarted server silently moved 5173 → 5174).
+    const tree: KernelProcess[] = [];
+    const collect = (p: KernelProcess): void => {
+      tree.push(p);
+      for (const cpid of [...p.children]) {
+        const c = this.processes.get(cpid);
+        if (c && !c.exited) collect(c);
+      }
+    };
+    collect(proc);
+    for (let i = tree.length - 1; i >= 0; i--) {
+      const p = tree[i];
+      if (p.exited) continue;
+      try { p.worker.terminate(); } catch { /* already gone */ }
+      this.onProcessExit(p, 0, signal);
+    }
     return true;
   }
 
@@ -1894,7 +1988,12 @@ export class OpenContainerRuntime {
 
   /** Preview WebSocket tunnel: the shim's MessagePort is one end of a raw
    *  byte pipe; the guest server sees a real HTTP upgrade on the wire
-   *  (handshake bytes arrive as initialBytes, frames flow both ways). */
+   *  (handshake bytes arrive as initialBytes, frames flow both ways).
+   *
+   *  Lifecycle: every message from the shim refreshes lastSeen (keepalive —
+   * the shim also pings idle sockets); `oc-ws-close` (closing handshake done
+   * or transport cut by the client) tears the route down with EOF to the
+   * guest; the stale sweep reaps routes whose page died silently. */
   private connectPreviewWs(
     port: number, id: number, url: string,
     initialBytes: Uint8Array | null, channel: MessagePort,
@@ -1916,27 +2015,40 @@ export class OpenContainerRuntime {
       postMessage(msg: any) {
         try {
           if (msg.type === 'data') channel.postMessage({ type: 'oc-ws-data', bytes: msg.bytes });
-          else if (msg.type === 'end') { channel.postMessage({ type: 'oc-ws-end', id }); channel.close(); }
+          else if (msg.type === 'end') {
+            // Guest FIN. Do NOT close the channel here: the shim still has
+            // to deliver its terminal oc-ws-close (its half of the closing
+            // handshake echo), and closing our end would silently drop it —
+            // the guest socket then lingered until the stale sweep. The
+            // channel is closed exactly once, by teardownPreviewRoute.
+            channel.postMessage({ type: 'oc-ws-end', id });
+          }
         } catch { /* page gone */ }
       },
       close() { try { channel.close(); } catch { /* gone */ } },
     };
-    this.connections.set(serverConnId, {
+    const route: ConnectionRoute = {
       ownerPid: target.pid, peer: null, preview: wsChannel as any,
-    });
+      lastSeen: Date.now(),
+    };
+    this.connections.set(serverConnId, route);
     channel.onmessage = (ev: MessageEvent) => {
       const msg: any = ev.data;
       if (!msg || typeof msg !== 'object') return;
+      route.lastSeen = Date.now();
       if (msg.type === 'oc-ws-data') {
         listener?.worker.postMessage({
           type: 'tcp-data', connId: serverConnId, bytes: new Uint8Array(msg.bytes),
         });
+      } else if (msg.type === 'oc-ws-ping') {
+        // keepalive only — no reply needed (the ping itself proves liveness)
       } else if (msg.type === 'oc-ws-close') {
-        listener?.worker.postMessage({ type: 'tcp-eof', connId: serverConnId });
-        this.connections.delete(serverConnId);
-        try { channel.close(); } catch { /* gone */ }
+        // Client finished its closing handshake OR cut the transport: the
+        // guest must see EOF so its socket can complete/close.
+        this.teardownPreviewRoute(serverConnId, route);
       }
     };
+    this.startPreviewRouteSweep();
     listener?.worker.postMessage({
       type: 'tcp-connect', port, connId: serverConnId, remotePort: 0,
       bytes: initialBytes && initialBytes.byteLength > 0 ? initialBytes : undefined,

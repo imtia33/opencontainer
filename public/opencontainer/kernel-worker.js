@@ -11428,6 +11428,14 @@ var TCP_SOCKET = 0;
 var TCP_SERVER = 1;
 var LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "0.0.0.0", "::"]);
 var tcpAsyncId = 0;
+function tcpTrace(ev, connId, extra) {
+  const hook = globalThis.__ocTcpTrace;
+  if (typeof hook !== "function")
+    return;
+  try {
+    hook(`[tcp ${Date.now()}] ${ev} conn=${connId ?? "-"}${extra ? " " + JSON.stringify(extra) : ""}`);
+  } catch {}
+}
 function makeTcpWrapBinding(ctx) {
   const hooks = ctx.hooks;
   const sockets = new Map;
@@ -11450,6 +11458,8 @@ function makeTcpWrapBinding(ctx) {
     remotePort = 0;
     closed = false;
     pending = [];
+    eofPending = false;
+    eofDelivered = false;
     constructor(handleType = TCP_SOCKET) {
       this.handleType = handleType;
     }
@@ -11544,11 +11554,14 @@ function makeTcpWrapBinding(ctx) {
       client.remotePort = remotePort;
       client.localPort = this.localPort;
       sockets.set(connId, client);
+      tcpTrace("accept", connId, { port: this.localPort, remotePort });
       return client;
     }
     out(data) {
-      if (this.connId !== null && !this.closed)
+      if (this.connId !== null && !this.closed) {
+        tcpTrace("write", this.connId, { bytes: data.byteLength });
         hooks.onTcpWrite?.(this.connId, data);
+      }
     }
     writeUtf8String(req, data, cb) {
       this.out(new TextEncoder().encode(data));
@@ -11580,12 +11593,18 @@ function makeTcpWrapBinding(ctx) {
     }
     readStart() {
       this.reading = true;
+      tcpTrace("readStart", this.connId, { pending: this.pending.length, eofPending: this.eofPending });
       while (this.pending.length > 0 && this.reading && typeof this.onread === "function") {
         deliverChunk(this, this.pending.shift());
+      }
+      if (this.eofPending && this.reading && typeof this.onread === "function") {
+        this.eofPending = false;
+        deliverEof(this);
       }
     }
     readStop() {
       this.reading = false;
+      tcpTrace("readStop", this.connId, { pending: this.pending.length, eofPending: this.eofPending });
     }
     shutdown(req) {
       if (this.connId !== null)
@@ -11594,7 +11613,10 @@ function makeTcpWrapBinding(ctx) {
       return 0;
     }
     close(cb) {
+      tcpTrace("close", this.connId, { closed: this.closed, pending: this.pending.length, eofPending: this.eofPending });
       this.closed = true;
+      this.pending.length = 0;
+      this.eofPending = false;
       if (this.connId !== null) {
         if (sockets.get(this.connId) === this)
           sockets.delete(this.connId);
@@ -11656,8 +11678,10 @@ function makeTcpWrapBinding(ctx) {
   function deliverChunk(handle, bytes) {
     if (typeof handle.onread !== "function" || !handle.reading) {
       handle.pending.push(bytes);
+      tcpTrace("data→pending", handle.connId, { bytes: bytes.byteLength, queued: handle.pending.length });
       return;
     }
+    tcpTrace("data", handle.connId, { bytes: bytes.byteLength });
     const state = getStreamBaseState();
     const ab = new ArrayBuffer(bytes.byteLength);
     new Uint8Array(ab).set(bytes);
@@ -11670,8 +11694,17 @@ function makeTcpWrapBinding(ctx) {
     }
   }
   function deliverEof(handle) {
-    if (typeof handle.onread !== "function")
+    if (handle.eofDelivered) {
+      tcpTrace("eof(dup,dropped)", handle.connId);
       return;
+    }
+    if (!handle.reading || typeof handle.onread !== "function") {
+      handle.eofPending = true;
+      tcpTrace("eof→deferred", handle.connId, { pending: handle.pending.length });
+      return;
+    }
+    handle.eofDelivered = true;
+    tcpTrace("eof", handle.connId);
     const state = getStreamBaseState();
     state[kReadBytesOrError] = UV_EOF;
     state[kArrayBufferOffset] = 0;
@@ -11695,14 +11728,19 @@ function makeTcpWrapBinding(ctx) {
     ownerSymbol: OWNER,
     deliverTcpData(connId, bytes) {
       const handle = sockets.get(Number(connId));
-      globalThis.__ocDebugHook?.(`[tcp deliver] connId=${connId} handle=${handle ? "yes" : "MISSING"} reading=${handle?.reading} onread=${typeof handle?.onread}`);
-      if (handle)
-        deliverChunk(handle, bytes);
+      if (!handle) {
+        tcpTrace("data(no-handle,dropped)", Number(connId), { bytes: bytes?.byteLength ?? 0 });
+        return;
+      }
+      deliverChunk(handle, bytes);
     },
     deliverTcpEof(connId) {
       const handle = sockets.get(Number(connId));
-      if (handle)
-        deliverEof(handle);
+      if (!handle) {
+        tcpTrace("eof(no-handle)", Number(connId));
+        return;
+      }
+      deliverEof(handle);
     },
     __connectComplete(reqId, status) {
       const entry = pendingConnects.get(Number(reqId));
@@ -11734,13 +11772,18 @@ function makeTcpWrapBinding(ctx) {
     acceptConnection(port, connId, remotePort) {
       for (const server of servers.values()) {
         if (server.localPort === port) {
+          if (typeof server.onconnection !== "function") {
+            tcpTrace("accept(no-onconnection)", connId, { port });
+            return false;
+          }
           const client = server.__accept(connId, remotePort);
-          globalThis.__ocDebugHook?.(`[tcp accept] port=${port} connId=${connId} onconnection=${typeof server.onconnection}`);
+          tcpTrace("accept→onconnection", connId, { port, onread: typeof client.onread, reading: client.reading });
           server.onconnection?.(0, client);
-          globalThis.__ocDebugHook?.(`[tcp accept done] client.reading=${client.reading} onread=${typeof client.onread}`);
+          tcpTrace("accept-done", connId, { onread: typeof client.onread, reading: client.reading, pending: client.pending.length });
           return true;
         }
       }
+      tcpTrace("accept(no-listener)", connId, { port });
       return false;
     },
     setPortsInUse(ports) {
@@ -11911,6 +11954,7 @@ class HTTPParser {
       if (this.messageDone) {
         this.messageDone = false;
         if (this.upgrade) {
+          this.emitMessageComplete();
           const cb = this[K_ON_EXECUTE];
           if (typeof cb === "function") {
             try {
@@ -16708,6 +16752,14 @@ async function boot(msg) {
     }
   }
   wireVfsDeltas();
+  if (msg.env && String(msg.env.OC_TRACE_TCP) === "1") {
+    globalThis.__ocTcpTrace = (s) => {
+      try {
+        post({ type: "stdio", fd: 2, chunk: s + `
+` });
+      } catch {}
+    };
+  }
   if (msg.env && String(msg.env.OC_TRACE_IMMEDIATE) === "1") {
     try {
       const g = globalThis;

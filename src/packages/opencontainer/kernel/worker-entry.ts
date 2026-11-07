@@ -816,6 +816,16 @@ async function boot(msg: {
 
   wireVfsDeltas();
 
+  // Connection-level TCP lifecycle trace (OC_TRACE_TCP=1): tcp_wrap logs
+  // every accept/readStart/readStop/data/EOF/close with connId + delivery
+  // state through the IMMEDIATE host channel (guest stdio is buffered; this
+  // trace must survive hangs). Off by default — diagnostics only.
+  if (msg.env && String((msg.env as any).OC_TRACE_TCP) === '1') {
+    (globalThis as any).__ocTcpTrace = (s: string) => {
+      try { post({ type: 'stdio', fd: 2, chunk: s + '\n' }); } catch { /* noop */ }
+    };
+  }
+
   // TEMP diagnostic (OC_TRACE_IMMEDIATE=1): guest setImmediate calls —
   // emnapi's async-work engine rides setImmediate; a work item that never
   // executes (immediate never fires) or one whose callback never returns

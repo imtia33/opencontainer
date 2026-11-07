@@ -183,7 +183,22 @@
       for (var i = 0; i < this._closeReason.length; i++) payload[2 + i] = this._closeReason.charCodeAt(i);
       this._sendFrame(0x8, payload);
       var self = this;
-      setTimeout(function () { self._finishClose(this._closeCode || 1000, ''); }, 500);
+      // RFC6455 §7.1.1: after starting the closing handshake the client may
+      // wait for the server's Close frame, but MUST NOT wait forever — a
+      // real browser times out and completes the close. 500ms is that cap.
+      setTimeout(function () { self._finishClose(self._closeCode || 1000, ''); }, 500);
+    },
+    /** Abrupt transport teardown, browser-style: the WS closing handshake is
+     *  skipped (no close frame), the local side gets the 1006 abnormal-close
+     *  event, and the runtime is told the transport is gone so the guest
+     *  socket sees EOF. This is what a real browser does when the underlying
+     *  TCP connection dies mid-session. Test/lab hook + internal use. */
+    _abort: function () {
+      if (this.readyState === OCWebSocket.CLOSED) return;
+      this.readyState = OCWebSocket.CLOSED;
+      this._notifyClosed();
+      this._emit('close', { type: 'close', code: 1006, reason: 'abnormal closure', wasClean: false, target: this });
+      wsInstances.delete(this.id);
     },
     addEventListener: function (type, fn) {
       if (this._eventListeners[type]) this._eventListeners[type].push(fn);
@@ -215,6 +230,7 @@
     _fail: function (message) {
       if (this.readyState === OCWebSocket.CLOSED) return;
       this.readyState = OCWebSocket.CLOSED;
+      this._notifyClosed(); // the runtime must reap the guest socket (EOF)
       this._emit('error', { type: 'error', message: message, target: this });
       this._emit('close', { type: 'close', code: 1006, reason: message, wasClean: false, target: this });
       wsInstances.delete(this.id);
@@ -222,10 +238,18 @@
     _finishClose: function (code, reason) {
       if (this.readyState === OCWebSocket.CLOSED) return;
       this.readyState = OCWebSocket.CLOSED;
-      try { this._channel && this._channel.postMessage({ type: 'oc-ws-close', id: this.id }); } catch (e) { /* noop */ }
-      try { this._channel && this._channel.close(); } catch (e) { /* noop */ }
+      this._notifyClosed();
       this._emit('close', { type: 'close', code: code, reason: reason, wasClean: true, target: this });
       wsInstances.delete(this.id);
+    },
+    /** Terminal cleanup shared by every close path: tell the runtime the
+     *  transport is done (it EOFs the guest socket and frees the route) and
+     *  tell the SW to drop its tunnel entry. Both are try/catch no-ops on an
+     *  already-dead channel — cleanup is idempotent. */
+    _notifyClosed: function () {
+      try { this._channel && this._channel.postMessage({ type: 'oc-ws-close', id: this.id }); } catch (e) { /* noop */ }
+      try { this._channel && this._channel.close(); } catch (e) { /* noop */ }
+      try { controller && controller.postMessage({ type: 'oc-ws-closed', id: this.id }); } catch (e) { /* noop */ }
     },
     _onChannelMessage: function (msg) {
       if (!msg || typeof msg !== 'object') return;
@@ -310,6 +334,37 @@
   };
 
   window.WebSocket = OCWebSocket;
+
+  /* -------------------------------------------- keepalive + page lifecycle */
+
+  // Transport keepalive: Chromium fires NO close event on a MessagePort
+  // whose remote end died (verified in-browser). The runtime therefore
+  // reclaims routes silent for 90s; we ping every 10s per live socket
+  // (idle HMR connections included) so a healthy route is never reaped.
+  // This mirrors TCP keepalive — it detects dead peers, it never affects
+  // event ordering.
+  setInterval(function () {
+    wsInstances.forEach(function (ws) {
+      if (ws.readyState !== OCWebSocket.CLOSED) {
+        try { ws._channel && ws._channel.postMessage({ type: 'oc-ws-ping', id: ws.id }); } catch (e) { /* dead */ }
+      }
+    });
+  }, 10000);
+
+  // Page death (reload / navigation / iframe removal): no further events can
+  // run, so terminate every live socket NOW — the guest gets EOF instead of
+  // waiting for the keepalive sweep. Hard crashes still fall back to the
+  // runtime's stale-route sweep.
+  window.addEventListener('pagehide', function () {
+    wsInstances.forEach(function (ws) {
+      if (ws.readyState !== OCWebSocket.CLOSED) {
+        ws.readyState = OCWebSocket.CLOSED; // no close event can be delivered now
+        try { ws._channel && ws._channel.postMessage({ type: 'oc-ws-close', id: ws.id }); } catch (e) { /* dead */ }
+        try { ws._channel && ws._channel.close(); } catch (e) { /* dead */ }
+      }
+    });
+    wsInstances.clear();
+  });
 
   /* ------------------------------------------ SW → shim ws control messages */
 

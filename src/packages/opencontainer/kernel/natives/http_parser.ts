@@ -174,7 +174,18 @@ class HTTPParser {
         // A message just completed — dispatch completion, then continue.
         this.messageDone = false;
         if (this.upgrade) {
-          // Pause with the body head unconsumed.
+          // llhttp contract (verified against real node v24 http.Server,
+          // /tmp ground-truth): for an Upgrade request the parser fires
+          // on_message_complete at the end of the message (headers + any
+          // body) and THEN pauses with the leftover as the upgrade payload.
+          // node's onParserExecuteCommon reads parser.incoming.complete —
+          // set by kOnMessageComplete — to decide between handing the app
+          // the RAW socket (complete) or an UpgradeStream wrapper that only
+          // activates after the body finishes (incomplete). Skipping the
+          // completion callback here left req.complete=false: the app got
+          // the wrapper, the old parser stayed attached to the socket and
+          // silently ate every post-handshake byte (all WS frames).
+          this.emitMessageComplete();
           const cb = this[K_ON_EXECUTE];
           if (typeof cb === 'function') {
             try { cb.call(this, pos); } catch { /* surfaced by node's own error paths */ }

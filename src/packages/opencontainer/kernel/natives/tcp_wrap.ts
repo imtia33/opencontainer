@@ -31,6 +31,19 @@ const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '0.0.0.0', '::']);
 
 let tcpAsyncId = 0;
 
+/** Connection-level lifecycle trace, OFF by default. Enable per process with
+ *  env OC_TRACE_TCP=1 (worker-entry sets __ocTcpTrace from it). Every event
+ *  carries the connId, the handle's delivery state and a timestamp so the
+ *  ordering of data/EOF/close across the virtual transport is provable from
+ *  the logs. Diagnostic only — never changes behavior. */
+function tcpTrace(ev: string, connId: number | null, extra?: Record<string, unknown>): void {
+  const hook = (globalThis as any).__ocTcpTrace;
+  if (typeof hook !== 'function') return;
+  try {
+    hook(`[tcp ${Date.now()}] ${ev} conn=${connId ?? '-'}${extra ? ' ' + JSON.stringify(extra) : ''}`);
+  } catch { /* diagnostics must never throw */ }
+}
+
 export function makeTcpWrapBinding(ctx: NativesContext): Binding {
   const hooks: any = ctx.hooks;
   /** connId → live TCP handle. */
@@ -58,6 +71,13 @@ export function makeTcpWrapBinding(ctx: NativesContext): Binding {
     remotePort = 0;
     closed = false;
     pending: Uint8Array[] = [];
+    /** EOF arrived while reads were stopped — delivered on the next readStart
+     *  AFTER the pending bytes, never dropped (libuv observes EOF only during
+     *  an active read cycle; deferring preserves byte-then-EOF ordering). */
+    eofPending = false;
+    /** EOF delivered once — re-delivery on a raced cleanup would push a second
+     *  `null` into the readable side and corrupt the stream state. */
+    eofDelivered = false;
 
     constructor(public handleType: number = TCP_SOCKET) {}
 
@@ -157,12 +177,16 @@ export function makeTcpWrapBinding(ctx: NativesContext): Binding {
       client.remotePort = remotePort;
       client.localPort = this.localPort;
       sockets.set(connId, client);
+      tcpTrace('accept', connId, { port: this.localPort, remotePort });
       return client;
     }
 
     // ---- stream protocol (both sides) ---------------------------------------
     private out(data: Uint8Array): void {
-      if (this.connId !== null && !this.closed) hooks.onTcpWrite?.(this.connId, data);
+      if (this.connId !== null && !this.closed) {
+        tcpTrace('write', this.connId, { bytes: data.byteLength });
+        hooks.onTcpWrite?.(this.connId, data);
+      }
     }
     writeUtf8String(req: any, data: string, cb?: (err?: Error | null) => void): number {
       this.out(new TextEncoder().encode(data));
@@ -187,18 +211,30 @@ export function makeTcpWrapBinding(ctx: NativesContext): Binding {
     }
     readStart() {
       this.reading = true;
+      tcpTrace('readStart', this.connId, { pending: this.pending.length, eofPending: this.eofPending });
       while (this.pending.length > 0 && this.reading && typeof this.onread === 'function') {
         deliverChunk(this, this.pending.shift()!);
       }
+      // A deferred EOF flushes only after every queued byte was delivered.
+      if (this.eofPending && this.reading && typeof this.onread === 'function') {
+        this.eofPending = false;
+        deliverEof(this);
+      }
     }
-    readStop() { this.reading = false; }
+    readStop() {
+      this.reading = false;
+      tcpTrace('readStop', this.connId, { pending: this.pending.length, eofPending: this.eofPending });
+    }
     shutdown(req: any): number {
       if (this.connId !== null) hooks.onTcpShutdown?.(this.connId);
       queueMicrotask(() => req?.oncomplete?.(0));
       return 0;
     }
     close(cb?: () => void): void {
+      tcpTrace('close', this.connId, { closed: this.closed, pending: this.pending.length, eofPending: this.eofPending });
       this.closed = true;
+      this.pending.length = 0; // the handle is gone; queued bytes die with it
+      this.eofPending = false;
       if (this.connId !== null) {
         if (sockets.get(this.connId) === this) sockets.delete(this.connId);
         hooks.onTcpClose?.(this.connId);
@@ -255,8 +291,10 @@ export function makeTcpWrapBinding(ctx: NativesContext): Binding {
   function deliverChunk(handle: TCP, bytes: Uint8Array): void {
     if (typeof handle.onread !== 'function' || !handle.reading) {
       handle.pending.push(bytes);
+      tcpTrace('data→pending', handle.connId, { bytes: bytes.byteLength, queued: handle.pending.length });
       return;
     }
+    tcpTrace('data', handle.connId, { bytes: bytes.byteLength });
     const state = getStreamBaseState();
     const ab = new ArrayBuffer(bytes.byteLength);
     new Uint8Array(ab).set(bytes);
@@ -268,7 +306,24 @@ export function makeTcpWrapBinding(ctx: NativesContext): Binding {
   }
 
   function deliverEof(handle: TCP): void {
-    if (typeof handle.onread !== 'function') return;
+    // Idempotent: EOF is a one-shot per connection. A raced cleanup path
+    // (WS close frame + transport EOF both arriving) must not push null
+    // twice into the readable side.
+    if (handle.eofDelivered) {
+      tcpTrace('eof(dup,dropped)', handle.connId);
+      return;
+    }
+    // libuv observes EOF only while a read cycle is active. If reads are
+    // stopped — or the socket has not adopted the handle yet — remember the
+    // EOF and deliver it on the next readStart, AFTER queued bytes. This is
+    // what keeps `end` from firing before buffered data on a paused socket.
+    if (!handle.reading || typeof handle.onread !== 'function') {
+      handle.eofPending = true;
+      tcpTrace('eof→deferred', handle.connId, { pending: handle.pending.length });
+      return;
+    }
+    handle.eofDelivered = true;
+    tcpTrace('eof', handle.connId);
     const state = getStreamBaseState();
     state[kReadBytesOrError] = UV_EOF;
     state[kArrayBufferOffset] = 0;
@@ -293,13 +348,20 @@ export function makeTcpWrapBinding(ctx: NativesContext): Binding {
     /** Host: bytes for a connection (either an accepted socket or a client). */
     deliverTcpData(connId: number, bytes: Uint8Array): void {
       const handle = sockets.get(Number(connId));
-      (globalThis as any).__ocDebugHook?.(`[tcp deliver] connId=${connId} handle=${handle ? 'yes' : 'MISSING'} reading=${handle?.reading} onread=${typeof handle?.onread}`);
-      if (handle) deliverChunk(handle, bytes);
+      if (!handle) {
+        tcpTrace('data(no-handle,dropped)', Number(connId), { bytes: bytes?.byteLength ?? 0 });
+        return;
+      }
+      deliverChunk(handle, bytes);
     },
     /** Host: connection closed by the remote end → EOF. */
     deliverTcpEof(connId: number): void {
       const handle = sockets.get(Number(connId));
-      if (handle) deliverEof(handle);
+      if (!handle) {
+        tcpTrace('eof(no-handle)', Number(connId));
+        return;
+      }
+      deliverEof(handle);
     },
     /** Host: the virtual connect resolved (reqId → pendingConnects entry). */
     __connectComplete(reqId: number, status: number): void {
@@ -328,13 +390,21 @@ export function makeTcpWrapBinding(ctx: NativesContext): Binding {
     acceptConnection(port: number, connId: number, remotePort: number): boolean {
       for (const server of servers.values()) {
         if (server.localPort === port) {
+          // A listening handle without net.js's onconnection is not
+          // accepting — report that honestly so the host can tear the
+          // connection down instead of leaking a socket nobody owns.
+          if (typeof server.onconnection !== 'function') {
+            tcpTrace('accept(no-onconnection)', connId, { port });
+            return false;
+          }
           const client = server.__accept(connId, remotePort);
-          (globalThis as any).__ocDebugHook?.(`[tcp accept] port=${port} connId=${connId} onconnection=${typeof server.onconnection}`);
+          tcpTrace('accept→onconnection', connId, { port, onread: typeof client.onread, reading: client.reading });
           server.onconnection?.(0, client);
-          (globalThis as any).__ocDebugHook?.(`[tcp accept done] client.reading=${client.reading} onread=${typeof client.onread}`);
+          tcpTrace('accept-done', connId, { onread: typeof client.onread, reading: client.reading, pending: client.pending.length });
           return true;
         }
       }
+      tcpTrace('accept(no-listener)', connId, { port });
       return false;
     },
     /** Host: full port registry (broadcast) — the EADDRINUSE mirror. */
