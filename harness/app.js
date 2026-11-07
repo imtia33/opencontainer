@@ -12,11 +12,41 @@
  */
 import { OpenContainerRuntime } from '/opencontainer.mjs';
 
+// Amplify terminal theme + config (ported from Amplytic-Labs/Amplify —
+// app/components/workbench/terminal/theme.ts, MIT): the "Snazzy" palette on
+// #1e1e21, Geist Mono 12, 1000 lines of scrollback, word-select on right
+// click. convertEol stays FALSE — the harness writes \r\n explicitly.
 const term = new window.Terminal({
   convertEol: false,
   cursorBlink: true,
-  fontSize: 13,
-  theme: { background: '#1e1e21' },
+  fontSize: 12,
+  fontFamily: "'Geist Mono', Menlo, courier-new, courier, monospace",
+  scrollback: 1000,
+  rightClickSelectsWord: true,
+  allowProposedApi: true,
+  theme: {
+    background: '#1e1e21',
+    foreground: '#eff0eb',
+    cursor: '#eff0eb',
+    cursorAccent: '#1e1e21',
+    selectionBackground: '#363639',
+    black: '#000000',
+    red: '#ff5c57',
+    green: '#5af78e',
+    yellow: '#f3f99d',
+    blue: '#57c7ff',
+    magenta: '#ff6ac1',
+    cyan: '#9aedfe',
+    white: '#f1f1f0',
+    brightBlack: '#686868',
+    brightRed: '#ff5c57',
+    brightGreen: '#5af78e',
+    brightYellow: '#f3f99d',
+    brightBlue: '#57c7ff',
+    brightMagenta: '#ff6ac1',
+    brightCyan: '#9aedfe',
+    brightWhite: '#f1f1f0',
+  },
 });
 term.open(document.getElementById('term'));
 window.__ocTerm = term;
@@ -46,7 +76,9 @@ const rt = new OpenContainerRuntime({
     state.nodeVersion = info.nodeVersion;
     state.booted = true;
     setStatus(`node ${info.nodeVersion} ready`, 'ok');
-    term.write(`\x1b[90m# OpenContainer harness — real Node.js ${info.nodeVersion}, genuine npm CLI\x1b[0m\r\n`);
+    term.write(`\x1b[38;2;13;159;255m  OpenContainer\x1b[0m \x1b[90m— real Node.js ${info.nodeVersion}, genuine npm CLI\x1b[0m\r\n` +
+      `\x1b[90m  temporary session environment\x1b[0m\r\n` +
+      `\x1b[90m  try \x1b[38;2;13;159;255mnpm init -y\x1b[0m\x1b[90m · \x1b[38;2;13;159;255mnpm install lodash\x1b[0m\x1b[90m · \x1b[38;2;13;159;255mnpx create-vite\x1b[0m\x1b[0m\r\n\r\n`);
     prompt();
   },
   onListen(info) {
@@ -88,7 +120,8 @@ const rt = new OpenContainerRuntime({
 window.__ocRuntime = rt;
 
 function prompt() {
-  term.write(`oc ${state.nodeVersion || 'v?'} ❯ `);
+  // Amplify-styled prompt: brand-blue `oc` + muted version + blue chevron
+  term.write(`\x1b[38;2;13;159;255moc\x1b[0m \x1b[90m${state.nodeVersion || 'v?'}\x1b[0m \x1b[38;2;13;159;255m❯\x1b[0m `);
 }
 
 // ---- the shell loop (a thin readline over rt.spawn) -----------------------

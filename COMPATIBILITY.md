@@ -76,7 +76,7 @@
 | `child_process.spawnSync/execSync` | **Unsupported with descriptive error** | honest ENOSYS (never a silent no-op) |
 | Exit codes & signals | **Fully implemented and tested** | SIGINT → JS listener or 130; SIGTERM/SIGKILL → worker terminate; `kill <pid>` from the shell |
 | Foreground/background, job messages | **Fully implemented and tested** | bash-style prompt redraw after background output (job messages, listen events) |
-| stdin/stdout/stderr | **Fully implemented and tested** | tty passthrough, pipes between guest processes, ignore |
+| stdin/stdout/stderr | **Fully implemented and tested** | tty passthrough, pipes between guest processes, ignore. Terminal (tty) output carries the kernel line discipline: NL is translated to CR-NL (termios OPOST/ONLCR) exactly like a real TTY, so hosts run xterm with `convertEol:false` and multi-line guest output renders flush-left; piped/programmatic stdio (`spawnProgram` output streams) stays byte-exact |
 | Process limits | **Partial (documented)** | max 8 live processes per session; child spawn beyond → EAGAIN (surfaced as `spawn … EAGAIN`) |
 
 ## 3. Networking (the S3 milestone)

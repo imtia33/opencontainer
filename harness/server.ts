@@ -30,6 +30,7 @@ const MIME: Record<string, string> = {
   '.json': 'application/json; charset=utf-8',
   '.gz': 'application/octet-stream',
   '.ocrt': 'application/octet-stream',
+  '.ttf': 'font/ttf',
   '.png': 'image/png',
   '.svg': 'image/svg+xml',
 };
@@ -60,6 +61,7 @@ const server = Bun.serve({
     if (p === '/app.js') return serveFile(req, nodePath.join(HARNESS, 'app.js'));
     if (p === '/xterm.js') return serveFile(req, nodePath.join(HARNESS, 'node_modules/xterm/lib/xterm.js'));
     if (p === '/xterm.css') return serveFile(req, nodePath.join(HARNESS, 'node_modules/xterm/css/xterm.css'));
+    if (p.startsWith('/fonts/')) return serveFile(req, nodePath.join(HARNESS, p));
     if (p === '/opencontainer.mjs') return serveFile(req, nodePath.join(ROOT, 'dist/opencontainer.mjs'));
     if (p.startsWith('/e2e/')) return serveFile(req, nodePath.join(HARNESS, p));
     if (p.startsWith('/opencontainer/')) {

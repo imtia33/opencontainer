@@ -112,6 +112,20 @@ export interface PreviewChannel {
 // it from a blob URL. Memoized so every guest process reuses one fetch.
 let workerBlobCache: { base: string; url: string } | null = null;
 
+/** Terminal output line discipline for TTY stdio (termios OPOST/ONLCR): a
+ *  real kernel TTY translates NL → CR-NL on OUTPUT, so guest programs that
+ *  print bare "\n" still return the cursor to column 0 of the next line.
+ *  Host terminals run xterm with convertEol:false (they write \r\n for
+ *  their own echo/prompt), which makes the translation load-bearing —
+ *  without it every multi-line guest write renders as a staircase. NLs
+ *  already preceded by CR pass through untouched (no \r\r\n inflation);
+ *  the per-chunk statelessness is safe: a CR|NL split across chunks can
+ *  only produce the visually-identical \r\r\n. Piped stdio never passes
+ *  through here — pipe consumers get byte-exact output. */
+function ttyOut(text: string): string {
+  return text.includes('\n') ? text.replace(/(?<!\r)\n/g, '\r\n') : text;
+}
+
 /** Wait (bounded) for a registration's worker to become active — a fresh
  *  install runs install→activate (the SW itself skipWaiting+claims); an
  *  already-active registration resolves immediately. Never rejects and
@@ -497,11 +511,17 @@ export class OpenContainerRuntime {
             break;
           }
         }
-        if (msg.bytes) {
-          this.emit('stdio', fd, new TextDecoder().decode(msg.bytes));
-        } else {
-          this.emit('stdio', fd, msg.chunk ?? '');
-        }
+        // TTY stdio — apply the terminal output line discipline (termios
+        // OPOST/ONLCR) before the chunk reaches the host terminal: a real
+        // kernel TTY translates NL → CR-NL on output, so a program printing
+        // bare "\n" still returns the cursor to column 0. Without this,
+        // xterm (convertEol:false) renders a staircase — every line starts
+        // at the column the previous one ended — which mangled multi-line
+        // guest output (npm/npx prompts, npm ls, compiler diagnostics).
+        // Piped/programmatic output (above) stays byte-exact.
+        this.emit('stdio', fd, ttyOut(msg.bytes
+          ? new TextDecoder().decode(msg.bytes)
+          : (msg.chunk ?? '')));
         break;
       }
       case 'pipe-write': {
@@ -1308,7 +1328,7 @@ export class OpenContainerRuntime {
     const background = opts.background === true;
     const spec = this.resolveShellCommand(cmd, args);
     if (spec.error) {
-      this.emit('stdio', 2, `${spec.error}\n`);
+      this.emit('stdio', 2, ttyOut(`${spec.error}\n`));
       this.emit('exit', { pid: -1, code: 127, signal: null, foreground: !background });
       return;
     }

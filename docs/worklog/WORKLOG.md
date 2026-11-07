@@ -747,3 +747,75 @@ temporaryEnvironment true; m1 18/18; wc-facade 27/27; npx-generators
    same-tab state, no dependency on npm publication state.
 5. The product boundary is the arbiter of "bug vs expected": cross-reload
    loss is EXPECTED; the persistence layer itself was the violation.
+
+## Session 19 — 2026-11-07 (user-reported "NOTHING works" on the demo + broken style — two bugs, one in the port, one in the tty)
+
+Report: on the public demo (the Next.js shell port of the harness at the
+preview root), `node -v` and `npm -v` printed NOTHING, and
+`npx create-expo-app@latest` died silently right after answering its
+y/N prompt. Screenshot showed mangled spacing ("y" far left of
+"Ok to proceed? (y)", package name indented mid-screen).
+
+### Root cause 1 — the demo page swallowed Enter while a process ran (functional)
+The Next.js port (src/app/page.tsx in the demo shell) checked
+`ch === '\r'` BEFORE the `busy` guard in its shell loop — the harness
+app.js checks `busy` FIRST. With the order inverted, Enter during a
+foreground process never reached `rt.writeStdin('\r')`: the page wrote
+its own \r\n, saw an empty line buffer, and re-armed the SHELL prompt
+while the guest still owned the terminal. So npx's readline never got
+its newline (hung on the y/N prompt forever), and every later
+"command" the user typed was fed to the still-waiting npx readline,
+which ECHOED it — looking exactly like a shell prompt executing and
+producing no output. Nothing ever executed after that first y+Enter.
+Reproduced bit-for-bit in a fresh Chromium (same buffer lines as the
+user's screenshot). Fix: restore the harness order (busy first) and
+document why the order is load-bearing.
+
+### Root cause 2 — tty stdio had no output line discipline (visual)
+Guest programs print bare `\n`; a real kernel TTY translates NL→CR-NL
+on output (termios OPOST/ONLCR); the runtime passed tty chunks through
+untouched, and hosts run xterm with convertEol:false (they write \r\n
+for their own echo/prompt — the harness comment always assumed the
+runtime delivered CRLF). Result: a staircase — every guest line began
+at the column the previous one ended ("Need to install the following
+packages:" is 38 chars → package name rendered at col 39; npm's
+prompt+ESC[20G put "y" at col 20 and "Ok to proceed? (y)" at col 60 —
+the user's mangled screenshot line, exactly). Fix: `ttyOut()` in
+runtime.ts — NL→CR-NL (lookbehind, so existing CR-NL pairs are not
+inflated) applied ONLY on the tty 'stdio' event path; piped/
+programmatic stdio (spawnProgram output streams) stays byte-exact.
+COMPATIBILITY §2 documents the contract.
+
+### Housekeeping
+Committed the session-18→19 harness restyle that was left uncommitted
+(Amplify design tokens: Geist Mono/Outfit @font-faces, header + tabs +
+preview pane layout, Snazzy palette, local fonts + server route).
+
+### Verification (fresh Chromium, rebuilt artifacts deployed to the demo)
+- Demo page: `node -v` → v26.13.0 flush left; `npm -v` → 12.2.1 flush
+  left; prompts at col 0 (staircase gone). `npx create-expo-app@latest`
+  + y + Enter: installs for real, asks the app name interactively,
+  scaffolds `demoproject` (template extracted + full npm install done,
+  files listed back through `node -e`). The user's exact flow works.
+- Regression gates on :7800: m1-driver 14/14 phase A + phase B (0
+  fails, temporary-env contract intact, reinstall works); wc-facade
+  27/27 (pipe path byte-exact — no ONLCR leakage); npx-generators
+  14/14. stdio-matrix diagnostic healthy (its `timeout:true` labels are
+  the driver's own double-resolve artifact, not a failure).
+- Visual: harness page renders header/tabs/preview correctly; no
+  staircase, no clipped text, fonts fine.
+
+### Lessons
+1. A "faithful port" is still new code: ONE reordered guard broke every
+   interactive command. Port diffs of subtle control flow need the same
+   review as new logic — assert the ordering contract in a comment.
+2. Green drivers ≠ correct terminal: every previous suite passed while
+   the staircase existed, because drivers assert marker TEXT (stdio
+   logs, DOM), never LAYOUT. Rendered-buffer checks (cursor column of
+   the next prompt after a one-line output) are the cheapest guard —
+   added to this session's manual verification.
+3. "Works on my machine" timing: the demo-page bug was 100%
+   deterministic but only visible through the interactive flow the
+   user ran — the drivers never typed Enter into a busy prompt. E2E
+   must include the interactive y/N flows (npx prompts), not just
+   fire-and-collect commands.

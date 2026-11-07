@@ -1,47 +1,176 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="utf-8" />
-  <title>OpenContainer — E2E harness</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OpenContainer — browser dev runtime</title>
   <link rel="stylesheet" href="/xterm.css" />
   <style>
-    html, body { margin: 0; height: 100%; background: #1e1e21; color: #d4d4d4;
-                 font-family: ui-monospace, Menlo, monospace; }
-    #bar { padding: 6px 10px; background: #17171a; border-bottom: 1px solid #2d2d33;
-           font-size: 12px; color: #9aa0aa; }
-    #bar b { color: #0d9fff; }
-    #bar .pane { display: flex; height: calc(100% - 32px); }
-    #term { padding: 8px 10px; width: 46%; overflow: hidden; }
+    /* ---- Amplify design tokens (ported from Amplytic-Labs/Amplify, MIT) ---- */
+    @font-face {
+      font-family: 'Geist Mono'; src: url('/fonts/GeistMono-Regular.ttf') format('truetype');
+      font-weight: 400; font-style: normal;
+    }
+    @font-face {
+      font-family: 'Geist Mono'; src: url('/fonts/GeistMono-Bold.ttf') format('truetype');
+      font-weight: 700; font-style: normal;
+    }
+    @font-face {
+      font-family: 'Outfit'; src: url('/fonts/Outfit-Regular.ttf') format('truetype');
+      font-weight: 400; font-style: normal;
+    }
+    @font-face {
+      font-family: 'Outfit'; src: url('/fonts/Outfit-Medium.ttf') format('truetype');
+      font-weight: 500; font-style: normal;
+    }
+    @font-face {
+      font-family: 'Outfit'; src: url('/fonts/Outfit-SemiBold.ttf') format('truetype');
+      font-weight: 600; font-style: normal;
+    }
+
+    :root {
+      --background: oklch(0.145 0 0);
+      --foreground: oklch(0.985 0 0);
+      --card: oklch(0.2301 0.0025 247.93);
+      --muted: oklch(0.269 0 0);
+      --muted-foreground: oklch(0.708 0 0);
+      --border: oklch(0.269 0 0);
+      --primary: #0d9fff;
+      --primary-foreground: oklch(0.985 0 0);
+      --success: oklch(0.627 0.196 145.03);
+      --destructive: oklch(0.637 0.237 25.331);
+      --radius: 0.625rem;
+      --header-height: 48px;
+      --term-bg: #1e1e21;
+      --term-fg: #eff0eb;
+      --scrollbar-thumb: rgba(100, 100, 100, 0.3);
+      --scrollbar-thumb-hover: rgba(10, 10, 10, 0.8);
+    }
+
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; background: var(--background); color: var(--foreground);
+                 font-family: 'Outfit', system-ui, sans-serif; overflow: hidden; }
+
+    /* ---- header ---- */
+    #bar { height: var(--header-height); display: flex; align-items: center; gap: 12px;
+           padding: 0 16px; background: oklch(0.1906 0.0026 247.96);
+           border-bottom: 1px solid var(--border); }
+    #bar .logo { width: 26px; height: 26px; border-radius: 7px; background: var(--primary);
+                 display: grid; place-items: center; flex: none;
+                 box-shadow: 0 0 18px oklch(0.708 0.135 247.93 / 0.45); }
+    #bar .logo svg { width: 15px; height: 15px; }
+    #bar .brand { display: flex; flex-direction: column; line-height: 1.15; }
+    #bar .brand b { font-weight: 600; font-size: 14px; letter-spacing: 0.01em; }
+    #bar .brand span { font-size: 10.5px; color: var(--muted-foreground); }
+    #bar .spacer { flex: 1; }
+    #status { font-size: 11.5px; font-weight: 500; color: var(--muted-foreground);
+              padding: 4px 12px; border-radius: 999px; background: var(--muted);
+              border: 1px solid var(--border); white-space: nowrap; }
+    #status.ok { color: var(--success); border-color: oklch(0.627 0.196 145.03 / 0.35); }
+    #status.bad { color: var(--destructive); border-color: oklch(0.637 0.237 25.331 / 0.35); }
+    #bar a.repo { font-size: 11.5px; color: var(--muted-foreground); text-decoration: none;
+                  padding: 4px 12px; border-radius: 999px; border: 1px solid var(--border); }
+    #bar a.repo:hover { color: var(--foreground); border-color: var(--muted-foreground); }
+
+    /* ---- panes ---- */
+    .pane { display: flex; height: calc(100% - var(--header-height)); }
+
+    /* terminal panel */
+    #term-pane { width: 46%; display: flex; flex-direction: column; min-width: 380px;
+                 background: var(--term-bg); }
+    .tabs { display: flex; align-items: center; gap: 4px; min-height: 34px; padding: 4px 8px;
+            background: var(--card); border-bottom: 1px solid var(--border); flex: none; }
+    .tabs .tab { display: flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 500;
+                 color: var(--foreground); background: var(--muted);
+                 border: 1px solid transparent; border-radius: 6px; padding: 4px 12px; }
+    .tabs .tab svg { width: 13px; height: 13px; color: var(--primary); }
+    .tabs .hint { margin-left: auto; font-size: 10.5px; color: var(--muted-foreground);
+                  padding-right: 6px; }
+    .tabs .hint kbd { font-family: 'Geist Mono', monospace; font-size: 10px;
+                      background: var(--muted); border: 1px solid var(--border);
+                      border-radius: 4px; padding: 1px 5px; }
+    #term { flex: 1; min-height: 0; padding: 1rem; overflow: hidden; }
+
+    /* preview panel */
     #preview { width: 54%; display: flex; flex-direction: column;
-               border-left: 1px solid #2d2d33; background: #fff; }
-    #preview .toolbar { display: flex; gap: 8px; align-items: center;
-                        padding: 5px 10px; background: #17171a; border-bottom: 1px solid #2d2d33;
-                        color: #9aa0aa; font-size: 11px; flex: none; }
-    #preview .toolbar a { color: #0d9fff; text-decoration: none; }
+               border-left: 1px solid var(--border); background: #fff; min-width: 0; }
+    #preview .toolbar { display: flex; gap: 10px; align-items: center;
+                        padding: 0 16px; height: 34px; background: var(--card);
+                        border-bottom: 1px solid var(--border);
+                        color: var(--muted-foreground); font-size: 11.5px; flex: none; }
     #preview .toolbar .dot { width: 7px; height: 7px; border-radius: 50%;
-                             background: #484f58; flex: none; }
-    #preview .toolbar .dot.live { background: #3fb950; }
+                             background: #6e7681; flex: none; }
+    #preview .toolbar .dot.live { background: var(--success);
+                                  box-shadow: 0 0 8px oklch(0.627 0.196 145.03 / 0.8); }
+    #preview .toolbar #preview-label { font-family: 'Geist Mono', monospace; font-size: 11px;
+                                       white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #preview .toolbar a { color: var(--primary); text-decoration: none; font-weight: 500; }
+    #preview .toolbar a:hover { text-decoration: underline; }
     #preview iframe { flex: 1; width: 100%; border: 0; background: #fff; }
-    #preview .empty { flex: 1; display: flex; align-items: center; justify-content: center;
-                      color: #6e7681; font-size: 12px; }
-    #status { float: right; }
-    .ok { color: #3fb950; } .bad { color: #f85149; }
+    #preview .empty { flex: 1; display: flex; flex-direction: column; gap: 12px;
+                      align-items: center; justify-content: center;
+                      color: var(--muted-foreground); font-size: 12.5px;
+                      background: oklch(0.175 0 0); }
+    #preview .empty svg { width: 34px; height: 34px; color: var(--muted); }
+    #preview .empty code { font-family: 'Geist Mono', monospace; font-size: 11.5px;
+                           background: var(--card); color: var(--primary);
+                           border: 1px solid var(--border); border-radius: 6px; padding: 3px 9px; }
+
+    /* ---- xterm / scrollbars (Amplify modern-scrollbar tokens) ---- */
+    .xterm .xterm-viewport { background-color: var(--term-bg) !important; }
+    ::-webkit-scrollbar { width: 10px; height: 10px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 999px;
+                                border: 2px solid var(--term-bg); }
+    ::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); }
+
+    @media (max-width: 900px) {
+      .pane { flex-direction: column; }
+      #term-pane { width: 100%; min-width: 0; height: 55%; }
+      #preview { width: 100%; height: 45%; border-left: 0; border-top: 1px solid var(--border); }
+    }
   </style>
 </head>
 <body>
   <div id="bar">
-    <b>OpenContainer</b> browser E2E harness
+    <div class="logo" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>
+      </svg>
+    </div>
+    <div class="brand">
+      <b>OpenContainer</b>
+      <span>real Node.js runtime in your browser — nothing to host</span>
+    </div>
+    <div class="spacer"></div>
+    <a class="repo" href="https://github.com/imtia33/opencontainer" target="_blank" rel="noreferrer">GitHub ↗</a>
     <span id="status">booting…</span>
   </div>
   <div class="pane">
-    <div id="term"></div>
+    <div id="term-pane">
+      <div class="tabs">
+        <span class="tab">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>
+          </svg>
+          oc — shell
+        </span>
+        <span class="hint">try <kbd>npm init -y</kbd> · <kbd>npm install lodash</kbd> · <kbd>npx create-vite</kbd></span>
+      </div>
+      <div id="term"></div>
+    </div>
     <div id="preview">
       <div class="toolbar">
         <span class="dot" id="preview-dot"></span>
         <span id="preview-label">preview — waiting for a dev server…</span>
-        <a id="preview-link" target="_blank">open ↗</a>
+        <a id="preview-link" target="_blank" style="margin-left:auto">open ↗</a>
       </div>
-      <div class="empty" id="preview-empty">run <code>npm run dev</code> — the server appears here automatically</div>
+      <div class="empty" id="preview-empty">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>
+        </svg>
+        <div>run <code>npm run dev</code> — the server appears here automatically</div>
+      </div>
       <iframe id="preview-frame" style="display:none"></iframe>
     </div>
   </div>
