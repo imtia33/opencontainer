@@ -1,5 +1,6 @@
 import type { Binding, NativesContext } from './index';
 import { UV_EOF, kArrayBufferOffset, kReadBytesOrError, getStreamBaseState, encodeChunk, encodeWritevList } from './stream-state';
+import { ensureStdinBridge, type StdinBridge } from './stdin-bridge';
 
 /**
  * internalBinding('pipe_wrap') — REAL virtual pipes.
@@ -22,6 +23,16 @@ import { UV_EOF, kArrayBufferOffset, kReadBytesOrError, getStreamBaseState, enco
  * same one lib/internal/stream_base_commons.js drives): write* return 0,
  * readStart sets `reading`, data arrives as state[kReadBytesOrError]=n +
  * handle.onread(arrayBuffer).
+ *
+ * ---- raw fd-0 reads ---------------------------------------------------
+ * node materializes process.stdin LAZILY (a property getter), so for guests
+ * that never touch the stream (esbuild-wasm's `node bin/esbuild --service`
+ * reads stdin through raw fs.read(0, …) — Go's wasm_exec glue), the fd-0
+ * Pipe handle may never exist. The stdin side therefore has its OWN eager
+ * state, created at BINDING time when this process was booted with piped
+ * stdin: ONE buffer (stdinBuf) shared by (a) parked raw fs.read(0) readers,
+ * (b) the stdin Socket's stream path once process.stdin is materialized,
+ * and (c) host deliveries — read(2)/stream race semantics, like one OS pipe.
  */
 
 export interface StdioMode {
@@ -39,10 +50,23 @@ export function makePipeWrapBinding(ctx: NativesContext): Binding {
   const registry = new Map<number, any>();
   /** EOFs that arrived before a handle registered (never lost). */
   const eofSeen = new Set<number>();
+  /** Data that arrived before a handle registered (a real pipe buffers). */
+  const earlyData = new Map<number, Uint8Array[]>();
 
   const PIPE_SOCKET = 1;
   const PIPE_SERVER = 0;
   const PIPE_IPC = 2;
+
+  // ---- eager stdin state (piped fd 0) --------------------------------------
+  const stdinMode: StdioMode | undefined = (ctx as any).stdio?.[0];
+  const stdinPipeId: number | null =
+    stdinMode && stdinMode.type === 'pipe' && stdinMode.pipeId !== undefined
+      ? stdinMode.pipeId : null;
+  /** The SHARED fd-0 bridge (created by fs — the first binding to touch
+   *  stdin — adopted here): one buffer for parked raw fs.read(0) readers,
+   *  the stdin Socket's stream path, and host deliveries. */
+  const stdinBridge: StdinBridge | null =
+    stdinPipeId !== null ? ensureStdinBridge(ctx, 'pipe') : null;
 
   class Pipe {
     onread: ((arrayBuffer: ArrayBuffer) => void) | null = null;
@@ -51,6 +75,9 @@ export function makePipeWrapBinding(ctx: NativesContext): Binding {
     /** Assigned by Process.spawn (parent side) or open() (child side). */
     pipeId: number | null = null;
     pending: Uint8Array[] = [];
+    /** uv_unref semantics: an unref'd pipe still delivers data but no longer
+     *  holds the loop open (esbuild unrefs its service child's stdio). */
+    unrefed = false;
 
     constructor(public pipeType: number = PIPE_SOCKET) {
       if (pipeType === PIPE_IPC) {
@@ -69,9 +96,21 @@ export function makePipeWrapBinding(ctx: NativesContext): Binding {
       if (mode && mode.type === 'pipe' && mode.pipeId !== undefined) {
         this.pipeId = mode.pipeId;
         registry.set(this.pipeId, this);
+        const early = earlyData.get(this.pipeId);
+        if (early) {
+          earlyData.delete(this.pipeId);
+          for (const chunk of early) deliver(this, chunk);
+        }
         if (eofSeen.has(this.pipeId)) {
           eofSeen.delete(this.pipeId);
           deliverEof(this);
+        }
+        // fd 0: the stdin Socket materialized — its stream path and raw
+        // fs.read(0) readers share ONE buffer (the bridge) from here on:
+        // the handle's pending array BECOMES the bridge buffer.
+        if (fd === 0 && this.pipeId === stdinPipeId && stdinBridge) {
+          stdinBridge.adoptBuffer(this.pending);
+          if (stdinBridge.eof) deliverEof(this);
         }
       }
       return 0;
@@ -131,13 +170,17 @@ export function makePipeWrapBinding(ctx: NativesContext): Binding {
         if (registry.get(this.pipeId) === this) registry.delete(this.pipeId);
         hooks.onPipeClose?.(this.pipeId, 'close');
       }
+      // Closing the stdin Socket closes fd 0: raw readers get EBADF.
+      if (this.fd === 0 && this.pipeId === stdinPipeId) {
+        stdinBridge?.markClosed();
+      }
       // node's HandleWrap.close(cb) invokes cb when the close completes —
       // net.js's closeSocketHandle emits the Socket 'close' event from it
       // (child_process counts those to fire the ChildProcess 'close').
       if (typeof cb === 'function') queueMicrotask(() => cb());
     }
-    ref() {}
-    unref() {}
+    ref() { this.unrefed = false; }
+    unref() { this.unrefed = true; }
     getsockname() { return { address: '127.0.0.1', port: 0, family: 2 }; }
     getpeername() { return { address: '127.0.0.1', port: 0, family: 2 }; }
     setBlocking(_b: boolean): number { return 0; }
@@ -184,6 +227,20 @@ export function makePipeWrapBinding(ctx: NativesContext): Binding {
     try { handle.onread(new ArrayBuffer(0)); } catch { /* ignore */ }
   }
 
+  /** Stdin bytes from the host: parked raw readers + the shared buffer
+   *  (via the bridge), then an immediate stream flush when active. */
+  function deliverStdin(bytes: Uint8Array): void {
+    if (!stdinBridge) return;
+    stdinBridge.deliver(bytes);
+    const handle = stdinPipeId !== null ? registry.get(stdinPipeId) : undefined;
+    if (handle && handle.reading === true && typeof handle.onread === 'function') {
+      while (stdinBridge.buffer.length > 0 && handle.reading === true &&
+             typeof handle.onread === 'function') {
+        deliver(handle, stdinBridge.buffer.shift()!);
+      }
+    }
+  }
+
   return {
     Pipe,
     PipeConnectWrap: class {},
@@ -202,6 +259,11 @@ export function makePipeWrapBinding(ctx: NativesContext): Binding {
      *  these, so the registry needs an explicit hook). */
     __registerHandle(pipeId: number, handle: any): void {
       registry.set(Number(pipeId), handle);
+      const early = earlyData.get(Number(pipeId));
+      if (early) {
+        earlyData.delete(Number(pipeId));
+        for (const chunk of early) deliver(handle, chunk);
+      }
       if (eofSeen.has(Number(pipeId))) {
         eofSeen.delete(Number(pipeId));
         deliverEof(handle);
@@ -210,24 +272,42 @@ export function makePipeWrapBinding(ctx: NativesContext): Binding {
     /** Host: bytes arrived for this pipeId (child stdout → parent, or
      *  parent's stdin write → child fd0 — each end's worker gets its own). */
     deliverPipeData(pipeId: number, bytes: Uint8Array): void {
+      if (pipeId === stdinPipeId) {
+        deliverStdin(bytes);
+        return;
+      }
       const handle = registry.get(pipeId);
-      if (!handle) return; // not yet open — dropped (host retried on open? no: rare)
+      if (!handle) {
+        // Arrived before open()/register — buffer (a real pipe never drops).
+        const list = earlyData.get(Number(pipeId)) ?? [];
+        list.push(bytes);
+        earlyData.set(Number(pipeId), list);
+        return;
+      }
       deliver(handle, bytes);
     },
     /** Host: the other end closed → EOF (persisted until a handle opens). */
     deliverPipeEof(pipeId: number): void {
+      if (pipeId === stdinPipeId) {
+        stdinBridge?.markEof();
+        const handle = registry.get(stdinPipeId);
+        if (handle) deliverEof(handle);
+        else eofSeen.add(Number(pipeId));
+        return;
+      }
       const handle = registry.get(pipeId);
       if (handle) deliverEof(handle);
       else eofSeen.add(Number(pipeId));
     },
-    /** Loop-drain truth: a pipe keeps the process alive only while its
-     *  READ side is active (uv semantics: a stream is refed when reading or
-     *  with pending writes — our writes complete synchronously). */
+    /** Loop-drain truth: a pipe keeps the process alive while its READ side
+     *  is active (uv semantics: refed when reading) — a stream readStart OR a
+     *  parked raw fs.read(0, …) both count. */
     activePipeCount(): number {
       let n = 0;
       for (const h of registry.values()) {
-        if (h && h.reading === true) n++;
+        if (h && h.reading === true && !h.unrefed) n++;
       }
+      if (stdinBridge && stdinBridge.rawReaders.length > 0) n++;
       return n;
     },
     /** Diagnostics. */

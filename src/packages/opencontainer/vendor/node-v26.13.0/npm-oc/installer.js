@@ -354,5 +354,5 @@ function initYes(cwd) {
 
 module.exports = {
   install, ls, initYes, resolveTree, fetchPackument, pickVersion,
-  verifyIntegrity, extractTar: tar.extractTar, _gunzip: gunzip,
+  verifyIntegrity, extractTar: tar.extractTar, _gunzip: gunzip, extractPackage,
 };

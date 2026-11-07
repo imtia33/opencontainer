@@ -1,3 +1,5 @@
+import { netBodyOpen, netBodyClose } from './net-pending';
+
 /**
  * OpenContainer — fetch-backed node `http`/`https` CLIENT for the guest kernel.
  *
@@ -120,9 +122,19 @@ export interface FetchHttpClientOptions {
 /** CORS-safelisted request headers (fetch spec). These are the ONLY ones a
  * browser may send cross-origin without triggering a preflight OPTIONS —
  * which registry.npmjs.org does not answer (404). Content-type needs value
- * restrictions (only form types are simple); if-none-match/if-modified-since
- * were added to the spec's safelist in 2022 (Chromium 104+, Firefox,
- * Safari 16+ — the supported browser floor for etag revalidation).
+ * restrictions (only form types are simple).
+ *
+ * ⚠ if-none-match / if-modified-since were EXPECTED to be safelisted (the
+ * 2022 spec update, "Chromium 104+") — but the shipped Chromium does NOT
+ * safelist them: any conditional validator on a cross-origin fetch
+ * preflights and dies "Failed to fetch" in ~20ms. npm's packument
+ * revalidation ("cache stale") rode exactly that header — every large
+ * packument burned 2-3 ECONNRESET retries (~25s each) before npm's own
+ * fallback dropped the conditionals and refetched unconditionally. So the
+ * validators are treated as NON-safelisted: dropped on cross-origin (full
+ * 200 refetches — correct data, no 304 shortcuts), preserved same-origin.
+ * if-range is dropped for the same reason; `range` itself stays (it IS
+ * spec-safelisted with value restrictions).
  *
  * Everything else (npm-*, referer, user-agent, authorization, cookie, …)
  * is DROPPED on cross-origin requests: the browser would preflight and the
@@ -134,9 +146,6 @@ const CORS_SAFELISTED_REQUEST_HEADERS = new Set([
   'accept',
   'accept-language',
   'content-language',
-  'if-modified-since',
-  'if-none-match',
-  'if-range',
   'range',
 ]);
 
@@ -415,6 +424,11 @@ class FetchIncomingMessage extends TinyEmitter {
   private _destroyed = false;
   private _gate: Promise<void> | null = null;
   private _gateResolve: (() => void) | null = null;
+  /** True while this response's body reader is open — mirrors a live socket
+   *  for the loop census (net-pending): a body being streamed is a handle;
+   *  without this a slow tarball download looks like an empty loop and the
+   *  drain watcher kills the process mid-request. */
+  private _bodyCounted = false;
   /** Wired by the owning request to re-arm its idle timeout on activity. */
   _touch: (() => void) | null = null;
   /** setEncoding() state: streaming decoder (utf-8*) or label for
@@ -456,7 +470,15 @@ class FetchIncomingMessage extends TinyEmitter {
     this.rawHeaders = raw;
 
     // 204/304/HEAD → response.body is null → immediate 'end'.
-    this._reader = response.body ? response.body.getReader() : null;
+    if (response.body) {
+      this._reader = response.body.getReader();
+      // Body consumption = live socket (loop census). Released at
+      // _finish/destroy/pump-error — whichever comes first.
+      netBodyOpen();
+      this._bodyCounted = true;
+    } else {
+      this._reader = null;
+    }
   }
 
   /** node stream.Readable#setEncoding: subsequent 'data' chunks arrive as
@@ -560,6 +582,7 @@ class FetchIncomingMessage extends TinyEmitter {
     if (this._destroyed) return;
     this._destroyed = true;
     const reader = this._reader;
+    this._releaseBodyCount();
     this._reader = null;
     if (reader) {
       try {
@@ -573,6 +596,14 @@ class FetchIncomingMessage extends TinyEmitter {
       this.emit('aborted');
     }
     this.emit('close');
+  }
+
+  /** Drop the body accounting exactly once (reader released/finished). */
+  private _releaseBodyCount(): void {
+    if (this._bodyCounted) {
+      this._bodyCounted = false;
+      netBodyClose();
+    }
   }
 
   private _releaseGate(): void {
@@ -626,6 +657,7 @@ class FetchIncomingMessage extends TinyEmitter {
     } catch (err: any) {
       if (this._destroyed) return;
       this._reader = null;
+      this._releaseBodyCount();
       this.emit('error', mapFetchError(err, this.url || ''));
       this.emit('close');
     } finally {
@@ -636,6 +668,7 @@ class FetchIncomingMessage extends TinyEmitter {
   private _finish(): void {
     if (this.complete) return;
     this._reader = null;
+    this._releaseBodyCount();
     this.complete = true;
     // Deliver anything buffered in non-flowing mode first, then end.
     this._drainQueue();

@@ -2686,10 +2686,21 @@ class Vfs {
   }
   watch(path, onEvent) {
     const norm = this.normalize(path);
-    const dirNode = this.mustDir(norm, "watch");
+    let dirPath = norm;
+    let fileFilter;
+    const node = this.lookup(norm);
+    if (!node) {
+      throw new VfsError("ENOENT", errnoOf("ENOENT"), "watch", norm);
+    }
+    if ((node.mode & S_IFMT) !== S_IFDIR) {
+      fileFilter = this.basename(norm);
+      dirPath = this.dirname(norm);
+    }
+    const dirNode = this.mustDir(dirPath, "watch");
     const watcher = {
       path: norm,
       onEvent,
+      fileFilter,
       close: () => {
         dirNode.watchers.delete(watcher);
         this.watchersByDir.get(dirNode)?.delete(watcher);
@@ -2709,9 +2720,14 @@ class Vfs {
   }
   fireChange(filePath) {
     const dir = this.lookup(this.dirname(filePath), false);
-    if (dir)
-      for (const w of dir.watchers)
-        w.onEvent({ type: "change", filename: this.basename(filePath) });
+    if (!dir)
+      return;
+    const base = this.basename(filePath);
+    for (const w of dir.watchers) {
+      if (w.fileFilter !== undefined && w.fileFilter !== base)
+        continue;
+      w.onEvent({ type: "change", filename: base });
+    }
   }
   mustNode(p, syscall) {
     const node = this.lookup(p);
@@ -3270,7 +3286,8 @@ var manifest_default = {
     "internal/deps/acorn/acorn/dist/acorn": "acorn/acorn/dist/acorn.js",
     "internal/deps/acorn/acorn-walk/dist/walk": "acorn/acorn-walk/dist/walk.js",
     "internal/deps/amaro/dist/index": "amaro/dist/index.js",
-    "internal/deps/minimatch/index": "minimatch/index.js"
+    "internal/deps/minimatch/index": "minimatch/index.js",
+    "internal/deps/undici/undici": "lib/internal/deps/undici/undici.js"
   },
   files: [
     "acorn/acorn-walk/dist/walk.js",
@@ -3394,6 +3411,7 @@ var manifest_default = {
     "lib/internal/debugger/inspect_helpers.js",
     "lib/internal/debugger/inspect_probe.js",
     "lib/internal/debugger/inspect_repl.js",
+    "lib/internal/deps/undici/undici.js",
     "lib/internal/dgram.js",
     "lib/internal/dns/callback_resolver.js",
     "lib/internal/dns/promises.js",
@@ -3731,6 +3749,8 @@ var manifest_default = {
     "npm-oc/package.json",
     "npm-oc/scripts.js",
     "npm-oc/tar.js",
+    "oc-compat/main.js",
+    "oc-compat/package.json",
     "oc-sh/corepack.js",
     "oc-sh/package.json",
     "oc-sh/sh.js",
@@ -4739,11 +4759,141 @@ function makeUvBinding() {
   };
 }
 
+// src/packages/opencontainer/kernel/natives/stdin-bridge.ts
+function ensureStdinBridge(ctx, fd0Type) {
+  const existing = ctx.stdinBridge;
+  if (existing)
+    return existing;
+  const rawReaders = [];
+  let buffer = [];
+  let eof = false;
+  let closed = false;
+  function drain(b, offset, length) {
+    let total = 0;
+    while (total < length && buffer.length > 0) {
+      const head = buffer[0];
+      const n = Math.min(length - total, head.length);
+      b.set(head.subarray(0, n), offset + total);
+      total += n;
+      if (n < head.length)
+        buffer[0] = head.subarray(n);
+      else
+        buffer.shift();
+    }
+    return total;
+  }
+  const bridge = {
+    get buffer() {
+      return buffer;
+    },
+    get rawReaders() {
+      return rawReaders;
+    },
+    get eof() {
+      return eof;
+    },
+    set eof(v) {
+      eof = v;
+    },
+    get closed() {
+      return closed;
+    },
+    set closed(v) {
+      closed = v;
+    },
+    get source() {
+      return {
+        readSync(b, offset, length) {
+          if (closed)
+            throw ebadf();
+          return drain(b, offset, length);
+        },
+        readAsync(b, offset, length, req) {
+          if (closed) {
+            scheduleStdioCompletion(() => req.oncomplete?.(ebadf(), 0, b));
+            return;
+          }
+          const n = drain(b, offset, length);
+          if (n > 0) {
+            scheduleStdioCompletion(() => req.oncomplete?.(null, n, b));
+            return;
+          }
+          if (eof) {
+            scheduleStdioCompletion(() => req.oncomplete?.(null, 0, b));
+            return;
+          }
+          rawReaders.push({ buffer: b, offset, length, req });
+        },
+        abort(err) {
+          for (const r of rawReaders.splice(0)) {
+            scheduleStdioCompletion(() => r.req.oncomplete?.(err, 0, r.buffer));
+          }
+        }
+      };
+    },
+    deliver(bytes) {
+      let rest = bytes;
+      while (rawReaders.length > 0 && rest.length > 0) {
+        const r = rawReaders.shift();
+        const n = Math.min(r.length, rest.length);
+        r.buffer.set(rest.subarray(0, n), r.offset);
+        rest = rest.subarray(n);
+        scheduleStdioCompletion(() => r.req.oncomplete?.(null, n, r.buffer));
+      }
+      if (rest.length > 0)
+        buffer.push(rest);
+    },
+    adoptBuffer(handlePending) {
+      for (const chunk of buffer)
+        handlePending.push(chunk);
+      buffer = handlePending;
+    },
+    markEof() {
+      eof = true;
+      for (const r of rawReaders.splice(0)) {
+        scheduleStdioCompletion(() => r.req.oncomplete?.(null, 0, r.buffer));
+      }
+    },
+    markClosed() {
+      if (closed)
+        return;
+      closed = true;
+      for (const r of rawReaders.splice(0)) {
+        scheduleStdioCompletion(() => r.req.oncomplete?.(ebadf(), 0, r.buffer));
+      }
+    }
+  };
+  ctx.stdinBridge = bridge;
+  return bridge;
+}
+function ebadf() {
+  const err = new Error("EBADF: read, 0");
+  err.code = "EBADF";
+  err.errno = -9;
+  err.syscall = "read";
+  return err;
+}
+
 // src/packages/opencontainer/kernel/natives/fs.ts
 function uvCode(e) {
   if (e instanceof VfsError)
     return -errnoOf(e.code);
   return -22;
+}
+var hostTimerFs = globalThis.setTimeout?.bind(globalThis) ?? ((cb, ms) => setTimeout(cb, ms));
+var pendingFsOps = 0;
+function activeFsCount() {
+  return pendingFsOps;
+}
+function scheduleFs(cb) {
+  pendingFsOps++;
+  hostTimerFs(() => {
+    pendingFsOps--;
+    cb();
+  }, 0);
+}
+function scheduleStdioCompletion(cb) {
+  scheduleFs(cb);
 }
 function uvDirentOfHelper(mode) {
   switch (mode & 61440) {
@@ -4805,17 +4955,17 @@ function makeFsBinding(ctx) {
           result = fn(...opArgs);
         } catch (e) {
           const err = errnoExceptionOf(e, syscall, getPath(opArgs));
-          queueMicrotask(() => req.oncomplete?.(err));
+          scheduleFs(() => req.oncomplete?.(err));
           return;
         }
-        queueMicrotask(() => req.oncomplete?.(null, result));
+        scheduleFs(() => req.oncomplete?.(null, result));
         return;
       }
       const promiseIdx = args.indexOf(kUsePromisesFlag);
       if (promiseIdx >= 0) {
         const opArgs = args.slice(0, promiseIdx).concat(args.slice(promiseIdx + 1));
         return new Promise((resolve, reject) => {
-          queueMicrotask(() => {
+          scheduleFs(() => {
             try {
               resolve(fn(...opArgs));
             } catch (e) {
@@ -4873,6 +5023,25 @@ function makeFsBinding(ctx) {
       throw new VfsError("EBADF", errnoOf("EBADF"), syscall, String(fd));
     return f;
   }
+  const fd0Mode = ctx.stdio?.[0]?.type;
+  const stdinBridge = fd0Mode === "pipe" || fd0Mode === "tty" || fd0Mode === undefined ? ensureStdinBridge(ctx, fd0Mode) : null;
+  if (stdinBridge)
+    ctx.stdinRaw = stdinBridge.source;
+  function stdioRead(fd, buffer, offset, length, position, req) {
+    if (!stdinBridge || fd0Mode === "ignore") {
+      if (req) {
+        scheduleFs(() => req.oncomplete?.(null, 0, buffer));
+        return;
+      }
+      return 0;
+    }
+    if (req) {
+      stdinBridge.source.readAsync(buffer, offset, length, req);
+      return;
+    }
+    return stdinBridge.source.readSync(buffer, offset, length);
+  }
+  const dualRead = dual("read", (a) => fdPath(a[0]), (fd, buffer, offset, length, position) => readFd(fd, buffer, offset, length, position));
   function fdPath(fd) {
     return mustFd(fd, "read").path;
   }
@@ -4888,6 +5057,10 @@ function makeFsBinding(ctx) {
     return n;
   }
   function writeFd(fd, bytes, position) {
+    if (fd === 1 || fd === 2) {
+      ctx.hooks.onStdio(fd, bytes);
+      return bytes.byteLength;
+    }
     const f = mustFd(fd, "write");
     if (position !== -1 && position !== null && position !== undefined) {
       const existing = vfs.readFile(f.path);
@@ -4909,6 +5082,31 @@ function makeFsBinding(ctx) {
       f.pos += bytes.byteLength;
     }
     return bytes.byteLength;
+  }
+  function statFieldsOfCharacterDevice() {
+    const now = Date.now();
+    const sec = Math.floor(now / 1000);
+    const ns = Math.round((now - sec * 1000) * 1e6);
+    return [
+      0,
+      8192,
+      1,
+      0,
+      0,
+      0,
+      4096,
+      0,
+      0,
+      0,
+      sec,
+      ns,
+      sec,
+      ns,
+      sec,
+      ns,
+      sec,
+      ns
+    ];
   }
   function statFields(p, followSymlinks, bigint = false) {
     const s = followSymlinks ? vfs.stat(p) : vfs.lstat(p);
@@ -5017,7 +5215,22 @@ function makeFsBinding(ctx) {
       mustFd(fd, "close");
       fds.delete(fd);
     }),
-    read: dual("read", (a) => fdPath(a[0]), (fd, buffer, offset, length, position) => readFd(fd, buffer, offset, length, position)),
+    read: (...args) => {
+      if (args[0] === 0) {
+        let reqIdx = -1;
+        for (let i = args.length - 1;i >= 0; i--) {
+          if (isReq(args[i])) {
+            reqIdx = i;
+            break;
+          }
+        }
+        const req = reqIdx >= 0 ? args[reqIdx] : undefined;
+        const opArgs = reqIdx >= 0 ? args.slice(0, reqIdx).concat(args.slice(reqIdx + 1)) : args;
+        const buf = opArgs[1];
+        return stdioRead(0, buf, opArgs[2] ?? 0, opArgs[3] ?? (buf && buf.length) ?? 0, opArgs[4], req);
+      }
+      return dualRead(...args);
+    },
     writeBuffer: dual("write", (a) => fdPath(a[0]), (fd, buffer, offset, length, position) => {
       const chunk = buffer.subarray(offset, offset + length);
       return writeFd(fd, chunk, position);
@@ -5034,7 +5247,17 @@ function makeFsBinding(ctx) {
       }
       return written;
     }),
-    readBuffers: dual("read", (a) => fdPath(a[0]), (fd, buffers, position) => {
+    readBuffers: dual("read", (a) => a[0] === 0 ? "stdio" : fdPath(a[0]), (fd, buffers, position) => {
+      if (fd === 0) {
+        let total2 = 0;
+        for (const b of buffers) {
+          const r = stdioRead(0, b, 0, b.byteLength, -1);
+          total2 += r ?? 0;
+          if (r < b.byteLength)
+            break;
+        }
+        return total2;
+      }
       let total = 0;
       const explicit = position !== null && position !== undefined && position !== -1;
       for (const b of buffers) {
@@ -5067,7 +5290,10 @@ function makeFsBinding(ctx) {
         throw e;
       }
     }),
-    fstat: dual("fstat", (a) => fdPath(a[0]), (...all) => {
+    fstat: dual("fstat", (a) => a[0] >= 0 && a[0] <= 2 ? "stdio" : fdPath(a[0]), (...all) => {
+      if (all[0] === 0 || all[0] === 1 || all[0] === 2) {
+        return statFieldsOfCharacterDevice();
+      }
       const [fd, bigint, x, y] = all;
       const throwIfNoEntry = typeof x === "boolean" ? x : y;
       try {
@@ -5305,7 +5531,7 @@ function makeFsBinding(ctx) {
         this._mode = _mode;
       }
       run() {
-        queueMicrotask(() => {
+        scheduleFs(() => {
           const special = (kind, path) => {
             const marker = new Error("oc-cp-special");
             marker.__ocSpecial = [kind, path];
@@ -5431,7 +5657,7 @@ function makeFsBinding(ctx) {
           const raw = vfs.readFile(p);
           const B = globalThis.Buffer;
           const data = B ? B.from(raw.buffer, raw.byteOffset, raw.byteLength) : raw;
-          queueMicrotask(() => this.ondone?.(null, data, -1, data.length, undefined));
+          scheduleFs(() => this.ondone?.(null, data, -1, data.length, undefined));
           return;
         } catch (e) {
           if (e instanceof VfsError) {
@@ -5466,7 +5692,7 @@ function makeFsBinding(ctx) {
         const p = String(path ?? this.path);
         try {
           vfs.writeFile(p, this.data);
-          queueMicrotask(() => this.ondone?.(null));
+          scheduleFs(() => this.ondone?.(null));
           return;
         } catch (e) {
           if (e instanceof VfsError) {
@@ -5508,14 +5734,14 @@ function makeFsBinding(ctx) {
       };
       if (reqOrPromise === kUsePromisesFlag) {
         return new Promise((resolve, reject) => {
-          queueMicrotask(() => {
+          scheduleFs(() => {
             try {
               const fd = openIt();
               resolve({
                 fd,
                 close() {
                   return new Promise((res, rej) => {
-                    queueMicrotask(() => {
+                    scheduleFs(() => {
                       try {
                         fds.delete(fd);
                         res();
@@ -5535,9 +5761,9 @@ function makeFsBinding(ctx) {
       if (isReq(reqOrPromise)) {
         try {
           const fd = openIt();
-          queueMicrotask(() => reqOrPromise.oncomplete?.(null, fd));
+          scheduleFs(() => reqOrPromise.oncomplete?.(null, fd));
         } catch (e) {
-          queueMicrotask(() => reqOrPromise.oncomplete?.(uvCode(e)));
+          scheduleFs(() => reqOrPromise.oncomplete?.(uvCode(e)));
         }
         return;
       }
@@ -7213,6 +7439,8 @@ var nextThreadId = 1;
 function makeWorkerBinding() {
   const g = globalThis;
   const workers = new Map;
+  if (!(g.__ocWorkerViews instanceof Map))
+    g.__ocWorkerViews = new Map;
 
   class WorkerImpl {
     messagePort;
@@ -7229,6 +7457,11 @@ function makeWorkerBinding() {
       }
       this.threadId = nextThreadId++;
       this.threadName = name ?? `WorkerThread-${this.threadId}`;
+      try {
+        if (globalThis.process?.env?.OC_TRACE_WORKERS) {
+          console.error(`[worker] new Worker ${String(_url).slice(0, 100)}`);
+        }
+      } catch {}
       const [mainSide, threadSide] = EmuPort.pair();
       this.messagePort = mainSide;
       this.threadSide = threadSide;
@@ -7248,6 +7481,8 @@ function makeWorkerBinding() {
       const filename = String(msg.filename ?? "");
       const workerData = msg.workerData;
       const publicPort = msg.publicPort ?? null;
+      const trace = globalThis.__ocEvalLog;
+      trace?.(`[worker] loadScript ${filename} (publicPort=${!!publicPort})`);
       this.bootScript(filename, workerData, publicPort);
     }
     async bootScript(filename, workerData, publicPort) {
@@ -7270,6 +7505,7 @@ function makeWorkerBinding() {
         threadId: this.threadId,
         threadName: this.threadName,
         resourceLimits: null,
+        Worker: WorkerImpl,
         MessagePort: EmuPort,
         MessageChannel: EmuMessageChannel,
         BroadcastChannel: globalThis.BroadcastChannel ?? class BroadcastChannel {
@@ -7297,14 +7533,53 @@ function makeWorkerBinding() {
         }
       };
       view.default = view;
+      g.__ocWorkerViews.set(this.threadId, view);
       const restore = swapBuiltin("worker_threads", view);
+      const swapped = globalThis.__ocWorkerThreadsSwapped === true;
       g.__ocWorkerDispatch = this;
       try {
         const requireFile = g.__ocRequireFile;
         if (typeof requireFile !== "function") {
           throw new Error("OpenContainer: kernel file-require hook not wired (worker boot)");
         }
-        requireFile(filename);
+        let esm = filename.endsWith(".mjs") || filename.endsWith(".mts");
+        if (!esm) {
+          try {
+            const pathMod = g.__ocRealmRequire?.("path");
+            const fsMod = g.__ocRealmRequire?.("fs");
+            let dir = pathMod?.dirname?.(filename) ?? "";
+            for (let i = 0;i < 6 && dir && dir !== "/"; i++) {
+              try {
+                const pkg = JSON.parse(fsMod.readFileSync(pathMod.join(dir, "package.json"), "utf8"));
+                if (pkg && pkg.type === "module") {
+                  esm = true;
+                  break;
+                }
+              } catch {}
+              const parent = pathMod.dirname(dir);
+              if (parent === dir)
+                break;
+              dir = parent;
+            }
+          } catch {}
+        }
+        const dynImport = g.__ocDynImport;
+        const dynImportW = g.__ocDynImportW;
+        if (esm && typeof dynImportW === "function") {
+          const pathMod = g.__ocRealmRequire?.("path");
+          const parentDir = pathMod?.dirname?.(filename) ?? ".";
+          const trace = globalThis.__ocEvalLog;
+          trace?.(`[worker] dynImportW start ${filename} (view published, tid=${this.threadId})`);
+          dynImportW(this.threadId, parentDir, filename).then(() => trace?.(`[worker] dynImportW settled OK ${filename}`), (e) => trace?.(`[worker] dynImportW REJECTED ${filename}: ${e?.message ?? e}`));
+        } else if (esm && typeof dynImport === "function") {
+          const pathMod = g.__ocRealmRequire?.("path");
+          const parentDir = pathMod?.dirname?.(filename) ?? ".";
+          const trace = globalThis.__ocEvalLog;
+          trace?.(`[worker] dynImport start ${filename} (fallback, swapped=${swapped})`);
+          dynImport(parentDir, filename).then(() => trace?.(`[worker] dynImport settled OK ${filename}`), (e) => trace?.(`[worker] dynImport REJECTED ${filename}: ${e?.message ?? e}`));
+        } else {
+          requireFile(filename);
+        }
         this.threadSide.postMessage({ type: "upAndRunning" });
       } catch (err) {
         g.__ocWorkerError = err;
@@ -7323,6 +7598,9 @@ function makeWorkerBinding() {
         return;
       this.exited = true;
       workers.delete(this.threadId);
+      try {
+        g.__ocWorkerViews?.delete(this.threadId);
+      } catch {}
       try {
         this.threadSide.close();
       } catch {}
@@ -7344,10 +7622,12 @@ function makeWorkerBinding() {
       bm.exports = exportsObj;
       bm.loaded = true;
       bm.loading = false;
+      g.__ocWorkerThreadsSwapped = id === "worker_threads" ? true : g.__ocWorkerThreadsSwapped;
       return () => {
         bm.exports = saved.exports;
         bm.loaded = saved.loaded;
         bm.loading = saved.loading;
+        g.__ocWorkerThreadsSwapped = false;
       };
     } catch {
       return () => {};
@@ -9229,6 +9509,11 @@ function encodeWritevList(chunks, allBuffers) {
 
 // src/packages/opencontainer/kernel/natives/tty_wrap.ts
 function makeTtyBinding(ctx) {
+  const stdinMode = ctx.stdio?.[0];
+  const stdinBridge = !stdinMode || stdinMode.type === "tty" ? ensureStdinBridge(ctx, stdinMode?.type) : null;
+  let stdinHandle = null;
+  let eofDelivered = false;
+
   class TtyHandle {
     fd;
     onread = null;
@@ -9236,10 +9521,10 @@ function makeTtyBinding(ctx) {
     rawMode = false;
     constructor(fd, _ctx) {
       this.fd = fd;
-      const handle = this;
       if (fd === 0)
-        stdinHandle = handle;
+        stdinHandle = this;
     }
+    unrefed = false;
     get owner() {
       return this[OWNER];
     }
@@ -9280,11 +9565,17 @@ function makeTtyBinding(ctx) {
       return 0;
     }
     close() {
-      if (stdinHandle === this)
+      if (stdinHandle === this) {
         stdinHandle = null;
+        stdinBridge?.markClosed();
+      }
     }
-    ref() {}
-    unref() {}
+    ref() {
+      this.unrefed = false;
+    }
+    unref() {
+      this.unrefed = true;
+    }
     setRawMode(mode) {
       this.rawMode = mode !== 0;
       return 0;
@@ -9314,9 +9605,6 @@ function makeTtyBinding(ctx) {
     }
   }
   const OWNER = Symbol("nodejs.stream.owner");
-  let stdinHandle = null;
-  const pendingChunks = [];
-  let eofDelivered = false;
   let proc = null;
   function raiseSigint() {
     ctx.hooks.onStdio(1, `^C
@@ -9332,34 +9620,38 @@ function makeTtyBinding(ctx) {
     }
   }
   function deliverChunk(bytes) {
-    const handle = stdinHandle;
-    if (!handle || typeof handle.onread !== "function" || !handle.reading) {
-      pendingChunks.push(bytes);
+    if (!stdinBridge)
       return;
-    }
-    const state = getStreamBaseState();
-    const ab = new ArrayBuffer(bytes.byteLength);
-    new Uint8Array(ab).set(bytes);
-    state[kReadBytesOrError] = bytes.byteLength;
-    state[kArrayBufferOffset] = 0;
-    try {
-      handle.onread(ab);
-    } catch (e) {
-      globalThis.__ocDebugHook?.(`[stdin onread error] ${e?.stack ?? String(e)}`);
-    }
+    stdinBridge.deliver(bytes);
+    flushToStream();
   }
-  function flushPending() {
-    while (pendingChunks.length > 0) {
-      const handle = stdinHandle;
-      if (!handle || !handle.reading || typeof handle.onread !== "function")
+  function flushToStream() {
+    if (!stdinBridge)
+      return;
+    const handle = stdinHandle;
+    if (!handle || typeof handle.onread !== "function" || !handle.reading)
+      return;
+    while (stdinBridge.buffer.length > 0) {
+      if (!handle.reading || typeof handle.onread !== "function")
         return;
-      deliverChunk(pendingChunks.shift());
+      const chunk = stdinBridge.buffer.shift();
+      const state = getStreamBaseState();
+      const ab = new ArrayBuffer(chunk.byteLength);
+      new Uint8Array(ab).set(chunk);
+      state[kReadBytesOrError] = chunk.byteLength;
+      state[kArrayBufferOffset] = 0;
+      try {
+        handle.onread(ab);
+      } catch (e) {
+        globalThis.__ocDebugHook?.(`[stdin onread error] ${e?.stack ?? String(e)}`);
+        return;
+      }
     }
   }
   const origReadStart = TtyHandle.prototype.readStart;
   TtyHandle.prototype.readStart = function() {
     origReadStart.call(this);
-    flushPending();
+    flushToStream();
   };
   function feedStdin(data) {
     if (eofDelivered)
@@ -9386,6 +9678,7 @@ function makeTtyBinding(ctx) {
     if (eofDelivered)
       return;
     eofDelivered = true;
+    stdinBridge?.markEof();
     const handle = stdinHandle;
     if (!handle || typeof handle.onread !== "function")
       return;
@@ -9397,7 +9690,10 @@ function makeTtyBinding(ctx) {
   }
   function resetStdin() {
     eofDelivered = false;
-    pendingChunks.length = 0;
+    if (stdinBridge) {
+      stdinBridge.buffer.length = 0;
+      stdinBridge.eof = false;
+    }
   }
   return {
     TTY: TtyHandle,
@@ -9421,7 +9717,9 @@ function makeTtyBinding(ctx) {
       proc = p;
     },
     stdinReading() {
-      return stdinHandle?.reading === true;
+      if (stdinHandle?.reading === true && !stdinHandle.unrefed)
+        return true;
+      return stdinBridge ? stdinBridge.rawReaders.length > 0 : false;
     }
   };
 }
@@ -9483,20 +9781,33 @@ function makeStreamWrapBinding() {
 }
 
 // src/packages/opencontainer/kernel/natives/encoding.ts
+var NativeTextEncoder = globalThis.TextEncoder ?? class TextEncoder2 {
+  encode() {
+    throw new Error("no TextEncoder");
+  }
+};
+var NativeTextDecoder = globalThis.TextDecoder ?? class TextDecoder2 {
+  decode() {
+    throw new Error("no TextDecoder");
+  }
+};
+var nativeEncoder = new NativeTextEncoder;
+var nativeDecoder = new NativeTextDecoder;
 function makeEncodingBinding() {
   const decoderCache = new Map;
   function getDecoder(enc) {
     let d = decoderCache.get(enc);
     if (!d) {
       try {
-        d = new TextDecoder(enc);
+        d = new NativeTextDecoder(enc);
       } catch {
-        d = new TextDecoder("utf-8");
+        d = new NativeTextDecoder("utf-8");
       }
       decoderCache.set(enc, d);
     }
     return d;
   }
+  const encodeIntoResults = [0, 0];
   return {
     TextDecoder: class BindingTextDecoder {
       decode(buf, opts) {
@@ -9507,7 +9818,21 @@ function makeEncodingBinding() {
     encodings: ["utf8", "utf16le", "latin1", "ascii", "base64", "hex"],
     getDecoder: (enc) => getDecoder(enc),
     encodingNames: ["utf8", "utf-8", "latin1", "binary", "base64", "hex", "ucs2", "utf16le"],
-    internalEndOfStream: Symbol("nodejs.stringdecoder.eos")
+    internalEndOfStream: Symbol("nodejs.stringdecoder.eos"),
+    encodeUtf8String: (s) => nativeEncoder.encode(s),
+    decodeUTF8: (input, ignoreBom, _fatal) => {
+      try {
+        return nativeDecoder.decode(input, ignoreBom ? { ignoreBOM: true } : undefined);
+      } catch {
+        return nativeDecoder.decode(input);
+      }
+    },
+    encodeInto: (src, dest) => {
+      const r = nativeEncoder.encodeInto(src, dest);
+      encodeIntoResults[0] = r.read;
+      encodeIntoResults[1] = r.written;
+    },
+    encodeIntoResults
   };
 }
 
@@ -10261,7 +10586,6 @@ function makeMiscBindings() {
     },
     dtls: {},
     ffi: {},
-    wasi: {},
     webstorage: {
       localStorage: undefined,
       sessionStorage: undefined
@@ -10682,6 +11006,7 @@ function makeProcessWrapBinding(ctx) {
     onexit = null;
     pid = 0;
     myPid = null;
+    unrefed = false;
     constructor() {
       liveProcesses.add(this);
     }
@@ -10760,7 +11085,7 @@ function makeProcessWrapBinding(ctx) {
       const pid = pidCounter++;
       this.pid = pid;
       this.myPid = pid;
-      children.set(pid, { file: resolved, alive: true });
+      children.set(pid, { file: resolved, alive: true, unrefed: this.unrefed });
       const req = {
         pid,
         file: script,
@@ -10791,8 +11116,17 @@ function makeProcessWrapBinding(ctx) {
         children.delete(this.myPid);
       }
     }
-    ref() {}
-    unref() {}
+    ref() {
+      this.unrefed = false;
+    }
+    unref() {
+      this.unrefed = true;
+      if (this.myPid !== null) {
+        const c = children.get(this.myPid);
+        if (c)
+          c.unrefed = true;
+      }
+    }
   }
   function signalName(n) {
     const names = { 2: "SIGINT", 9: "SIGKILL", 15: "SIGTERM" };
@@ -10822,7 +11156,7 @@ function makeProcessWrapBinding(ctx) {
     activeChildCount() {
       let n = 0;
       for (const c of children.values())
-        if (c.alive)
+        if (c.alive && !c.unrefed)
           n++;
       return n;
     },
@@ -10841,9 +11175,13 @@ function makePipeWrapBinding(ctx) {
   const hooks = ctx.hooks;
   const registry3 = new Map;
   const eofSeen = new Set;
+  const earlyData = new Map;
   const PIPE_SOCKET = 1;
   const PIPE_SERVER = 0;
   const PIPE_IPC = 2;
+  const stdinMode = ctx.stdio?.[0];
+  const stdinPipeId = stdinMode && stdinMode.type === "pipe" && stdinMode.pipeId !== undefined ? stdinMode.pipeId : null;
+  const stdinBridge = stdinPipeId !== null ? ensureStdinBridge(ctx, "pipe") : null;
 
   class Pipe {
     pipeType;
@@ -10852,6 +11190,7 @@ function makePipeWrapBinding(ctx) {
     fd = -1;
     pipeId = null;
     pending = [];
+    unrefed = false;
     constructor(pipeType = PIPE_SOCKET) {
       this.pipeType = pipeType;
       if (pipeType === PIPE_IPC) {
@@ -10867,9 +11206,20 @@ function makePipeWrapBinding(ctx) {
       if (mode && mode.type === "pipe" && mode.pipeId !== undefined) {
         this.pipeId = mode.pipeId;
         registry3.set(this.pipeId, this);
+        const early = earlyData.get(this.pipeId);
+        if (early) {
+          earlyData.delete(this.pipeId);
+          for (const chunk of early)
+            deliver(this, chunk);
+        }
         if (eofSeen.has(this.pipeId)) {
           eofSeen.delete(this.pipeId);
           deliverEof(this);
+        }
+        if (fd2 === 0 && this.pipeId === stdinPipeId && stdinBridge) {
+          stdinBridge.adoptBuffer(this.pending);
+          if (stdinBridge.eof)
+            deliverEof(this);
         }
       }
       return 0;
@@ -10928,11 +11278,18 @@ function makePipeWrapBinding(ctx) {
           registry3.delete(this.pipeId);
         hooks.onPipeClose?.(this.pipeId, "close");
       }
+      if (this.fd === 0 && this.pipeId === stdinPipeId) {
+        stdinBridge?.markClosed();
+      }
       if (typeof cb === "function")
         queueMicrotask(() => cb());
     }
-    ref() {}
-    unref() {}
+    ref() {
+      this.unrefed = false;
+    }
+    unref() {
+      this.unrefed = true;
+    }
     getsockname() {
       return { address: "127.0.0.1", port: 0, family: 2 };
     }
@@ -10984,6 +11341,17 @@ function makePipeWrapBinding(ctx) {
       handle.onread(new ArrayBuffer(0));
     } catch {}
   }
+  function deliverStdin(bytes) {
+    if (!stdinBridge)
+      return;
+    stdinBridge.deliver(bytes);
+    const handle = stdinPipeId !== null ? registry3.get(stdinPipeId) : undefined;
+    if (handle && handle.reading === true && typeof handle.onread === "function") {
+      while (stdinBridge.buffer.length > 0 && handle.reading === true && typeof handle.onread === "function") {
+        deliver(handle, stdinBridge.buffer.shift());
+      }
+    }
+  }
   return {
     Pipe,
     PipeConnectWrap: class {
@@ -10998,18 +11366,41 @@ function makePipeWrapBinding(ctx) {
     kOwnedByPipe: Symbol("nodejs.pipe.owned"),
     __registerHandle(pipeId, handle) {
       registry3.set(Number(pipeId), handle);
+      const early = earlyData.get(Number(pipeId));
+      if (early) {
+        earlyData.delete(Number(pipeId));
+        for (const chunk of early)
+          deliver(handle, chunk);
+      }
       if (eofSeen.has(Number(pipeId))) {
         eofSeen.delete(Number(pipeId));
         deliverEof(handle);
       }
     },
     deliverPipeData(pipeId, bytes) {
-      const handle = registry3.get(pipeId);
-      if (!handle)
+      if (pipeId === stdinPipeId) {
+        deliverStdin(bytes);
         return;
+      }
+      const handle = registry3.get(pipeId);
+      if (!handle) {
+        const list = earlyData.get(Number(pipeId)) ?? [];
+        list.push(bytes);
+        earlyData.set(Number(pipeId), list);
+        return;
+      }
       deliver(handle, bytes);
     },
     deliverPipeEof(pipeId) {
+      if (pipeId === stdinPipeId) {
+        stdinBridge?.markEof();
+        const handle2 = registry3.get(stdinPipeId);
+        if (handle2)
+          deliverEof(handle2);
+        else
+          eofSeen.add(Number(pipeId));
+        return;
+      }
       const handle = registry3.get(pipeId);
       if (handle)
         deliverEof(handle);
@@ -11019,9 +11410,11 @@ function makePipeWrapBinding(ctx) {
     activePipeCount() {
       let n = 0;
       for (const h of registry3.values()) {
-        if (h && h.reading === true)
+        if (h && h.reading === true && !h.unrefed)
           n++;
       }
+      if (stdinBridge && stdinBridge.rawReaders.length > 0)
+        n++;
       return n;
     },
     __pipeIds() {
@@ -11242,6 +11635,7 @@ function makeTcpWrapBinding(ctx) {
         out.address = info.address;
         out.port = info.port;
         out.family = info.family;
+        return 0;
       }
       return info;
     }
@@ -11251,6 +11645,7 @@ function makeTcpWrapBinding(ctx) {
         out.address = info.address;
         out.port = info.port;
         out.family = info.family;
+        return 0;
       }
       return info;
     }
@@ -12152,6 +12547,664 @@ function makeStreamPipeBinding() {
   };
 }
 
+// src/packages/opencontainer/kernel/natives/wasi.ts
+var ESUCCESS = 0;
+var EBADF = 8;
+var EEXIST = 20;
+var EINVAL = 28;
+var EIO = 29;
+var EISDIR = 31;
+var ENOENT = 44;
+var ENOMEM = 45;
+var ENOSYS = 52;
+var ENOTDIR = 54;
+var ENOTEMPTY = 55;
+var ENOTSUP = 58;
+var EPERM = 63;
+var FILETYPE_UNKNOWN = 0;
+var FILETYPE_DIR = 3;
+var FILETYPE_REGULAR = 4;
+var FILETYPE_SYMBOLIC_LINK = 7;
+var OFLAG_CREAT = 1 << 0;
+var OFLAG_DIRECTORY = 1 << 1;
+var OFLAG_EXCL = 1 << 2;
+var OFLAG_TRUNC = 1 << 3;
+var RIGHT_FD_READ = 1 << 1;
+var RIGHT_FD_WRITE = 1 << 6;
+var WHENCE_SET = 0;
+var WHENCE_CUR = 1;
+var WHENCE_END = 2;
+function makeWasiBinding(ctx) {
+  const trace = (name, ...rest) => {
+    try {
+      const env = globalThis.process?.env ?? {};
+      if (!env.OC_WASI_TRACE)
+        return;
+      ctx.hooks.onStdio(2, `[wasi] ${name} ${rest.map((x2) => {
+        const s = String(x2);
+        return s.length > 40 ? s.slice(0, 40) + "…" : s;
+      }).join(" ")}
+`);
+    } catch {}
+  };
+  const traceOn = () => {
+    try {
+      return !!globalThis.process?.env?.OC_WASI_TRACE;
+    } catch {
+      return false;
+    }
+  };
+  const wasiProcExit = (code) => {
+    ctx.hooks.onExit(code);
+    throw new Error(`WASI proc_exit(${code})`);
+  };
+
+  class WASIImpl {
+    fds = new Map;
+    nextFd = 3;
+    memory = null;
+    args;
+    env;
+    constructor(args, env, preopens, _stdio) {
+      this.args = args ?? [];
+      this.env = env ?? [];
+      this.fds.set(0, { kind: "stdio", path: "" });
+      this.fds.set(1, { kind: "stdio", path: "" });
+      this.fds.set(2, { kind: "stdio", path: "" });
+      for (let i2 = 0;i2 + 1 < preopens.length; i2 += 2) {
+        const guest = preopens[i2];
+        const host = preopens[i2 + 1];
+        const fd2 = this.nextFd++;
+        this.fds.set(fd2, { kind: "preopen", path: host, preopenName: guest });
+      }
+      const syscalls = [
+        "args_get",
+        "args_sizes_get",
+        "clock_time_get",
+        "environ_get",
+        "environ_sizes_get",
+        "fd_close",
+        "fd_fdstat_get",
+        "fd_filestat_get",
+        "fd_prestat_get",
+        "fd_prestat_dir_name",
+        "fd_read",
+        "fd_readdir",
+        "fd_seek",
+        "fd_write",
+        "path_create_directory",
+        "path_filestat_get",
+        "path_open",
+        "path_readlink",
+        "path_remove_directory",
+        "path_unlink_file",
+        "poll_oneoff",
+        "proc_exit",
+        "random_get",
+        "sched_yield"
+      ];
+      for (const name of syscalls) {
+        const fn = this[name].bind(this);
+        Object.defineProperty(this, name, {
+          value: (...args2) => {
+            if (traceOn())
+              trace(name, ...args2.slice(0, 4));
+            return fn(...args2);
+          },
+          enumerable: true,
+          writable: true,
+          configurable: true
+        });
+      }
+      for (const name of ["fds", "nextFd", "memory", "args", "env"]) {
+        const v = this[name];
+        Object.defineProperty(this, name, {
+          value: v,
+          writable: true,
+          enumerable: false,
+          configurable: true
+        });
+      }
+      Object.defineProperty(this, "_setMemory", {
+        value: (memory) => {
+          this.memory = memory;
+        },
+        enumerable: false,
+        writable: true,
+        configurable: true
+      });
+    }
+    mem() {
+      const buf = this.memory.buffer;
+      return { u8: new Uint8Array(buf), dv: new DataView(buf) };
+    }
+    str(ptr, len) {
+      const { u8: u82 } = this.mem();
+      return new TextDecoder().decode(u82.subarray(ptr, ptr + len));
+    }
+    writeBytes(ptr, bytes) {
+      const { u8: u82 } = this.mem();
+      u82.set(bytes, ptr);
+    }
+    writeU64(ptr, value) {
+      const { dv } = this.mem();
+      dv.setUint32(ptr, value >>> 0, true);
+      dv.setUint32(ptr + 4, Math.floor(value / 4294967296), true);
+    }
+    args_get(argvPtr, argvBufPtr) {
+      const { dv } = this.mem();
+      let bufAt = argvBufPtr;
+      this.args.forEach((a, i2) => {
+        const bytes = new TextEncoder().encode(a);
+        dv.setUint32(argvPtr + i2 * 4, bufAt, true);
+        this.writeBytes(bufAt, bytes);
+        bufAt += bytes.length + 1;
+      });
+      return ESUCCESS;
+    }
+    args_sizes_get(argcPtr, bufLenPtr) {
+      const { dv } = this.mem();
+      const total = this.args.reduce((n, a) => n + a.length + 1, 0);
+      dv.setUint32(argcPtr, this.args.length, true);
+      dv.setUint32(bufLenPtr, total, true);
+      return ESUCCESS;
+    }
+    environ_get(envPtr, envBufPtr) {
+      const { dv } = this.mem();
+      let bufAt = envBufPtr;
+      this.env.forEach((e, i2) => {
+        const bytes = new TextEncoder().encode(e);
+        dv.setUint32(envPtr + i2 * 4, bufAt, true);
+        this.writeBytes(bufAt, bytes);
+        bufAt += bytes.length + 1;
+      });
+      return ESUCCESS;
+    }
+    environ_sizes_get(countPtr, bufLenPtr) {
+      const { dv } = this.mem();
+      const total = this.env.reduce((n, e) => n + e.length + 1, 0);
+      dv.setUint32(countPtr, this.env.length, true);
+      dv.setUint32(bufLenPtr, total, true);
+      return ESUCCESS;
+    }
+    clock_time_get(_id, _precLo, _precHi, outPtr) {
+      const now = _id === 0 ? Date.now() : Math.round(performance.now());
+      this.writeU64(outPtr, now);
+      return ESUCCESS;
+    }
+    random_get(bufPtr, bufLen) {
+      const { u8: u82 } = this.mem();
+      const view = u82.subarray(bufPtr, bufPtr + bufLen);
+      try {
+        crypto.getRandomValues(view);
+      } catch {
+        for (let i2 = 0;i2 < view.length; i2++)
+          view[i2] = Math.random() * 256 | 0;
+      }
+      return ESUCCESS;
+    }
+    sched_yield() {
+      return ESUCCESS;
+    }
+    fdget(fd2) {
+      return this.fds.get(fd2);
+    }
+    allocFd(entry) {
+      const fd2 = this.nextFd++;
+      this.fds.set(fd2, entry);
+      return fd2;
+    }
+    resolveAt(fd2, path) {
+      const base = this.fds.get(fd2);
+      if (!base)
+        throw new Error("bad fd");
+      if (base.kind === "file")
+        throw new Error("not a directory fd");
+      if (path.startsWith("/"))
+        return normalizeGuest(path);
+      return normalizeGuest((base.path === "" ? "/" : base.path) + "/" + path);
+    }
+    fileTypeOf(path, follow) {
+      try {
+        const st = ctx.vfs.stat(path, follow);
+        const mode = st.mode & 61440;
+        if (mode === 16384)
+          return FILETYPE_DIR;
+        if (mode === 40960)
+          return FILETYPE_SYMBOLIC_LINK;
+        return FILETYPE_REGULAR;
+      } catch {
+        return FILETYPE_UNKNOWN;
+      }
+    }
+    fd_close(fd2) {
+      const entry = this.fds.get(fd2);
+      if (!entry)
+        return EBADF;
+      if (entry.kind === "file" && entry.dirty && entry.data) {
+        try {
+          ctx.vfs.writeFile(entry.path, entry.data);
+        } catch {
+          return EIO;
+        }
+      }
+      if (fd2 > 2)
+        this.fds.delete(fd2);
+      return ESUCCESS;
+    }
+    fd_fdstat_get(fd2, bufPtr) {
+      const entry = this.fds.get(fd2);
+      if (!entry)
+        return EBADF;
+      const { dv } = this.mem();
+      let filetype = FILETYPE_UNKNOWN;
+      let rights = 0;
+      if (entry.kind === "stdio") {
+        filetype = FILETYPE_CHARACTER_DEVICE;
+        rights = 0;
+      } else if (entry.kind === "preopen" || entry.kind === "dir")
+        filetype = FILETYPE_DIR;
+      else {
+        filetype = FILETYPE_REGULAR;
+        rights = (entry.readable ? RIGHT_FD_READ : 0) | (entry.writable ? RIGHT_FD_WRITE : 0);
+      }
+      dv.setUint8(bufPtr, filetype);
+      dv.setUint16(bufPtr + 2, 0, true);
+      dv.setUint32(bufPtr + 4, rights >>> 0, true);
+      dv.setUint32(bufPtr + 8, 0, true);
+      dv.setUint32(bufPtr + 12, rights >>> 0, true);
+      dv.setUint32(bufPtr + 16, 0, true);
+      return ESUCCESS;
+    }
+    fd_filestat_get(fd2, bufPtr) {
+      const entry = this.fds.get(fd2);
+      if (!entry)
+        return EBADF;
+      if (entry.kind === "stdio") {
+        this.writeFilestat(bufPtr, { dev: 0, ino: 0, filetype: FILETYPE_CHARACTER_DEVICE, nlink: 1, size: 0, atime: 0, mtime: 0, ctime: 0 });
+        return ESUCCESS;
+      }
+      try {
+        const st = ctx.vfs.stat(entry.path);
+        return this.writeFilestat(bufPtr, {
+          dev: 1,
+          ino: st.ino ?? 0,
+          filetype: this.fileTypeOf(entry.path, true),
+          nlink: 1,
+          size: st.size,
+          atime: st.atimeMs ?? 0,
+          mtime: st.mtimeMs ?? 0,
+          ctime: st.ctimeMs ?? 0
+        });
+      } catch {
+        return EBADF;
+      }
+    }
+    writeFilestat(bufPtr, s) {
+      const { dv } = this.mem();
+      this.writeU64(bufPtr, s.dev);
+      this.writeU64(bufPtr + 8, s.ino);
+      dv.setUint8(bufPtr + 16, s.filetype);
+      this.writeU64(bufPtr + 24, s.nlink);
+      this.writeU64(bufPtr + 32, s.size);
+      this.writeU64(bufPtr + 40, s.atime);
+      this.writeU64(bufPtr + 48, s.mtime);
+      this.writeU64(bufPtr + 56, s.ctime);
+      return ESUCCESS;
+    }
+    fd_prestat_get(fd2, bufPtr) {
+      const entry = this.fds.get(fd2);
+      if (!entry)
+        return EBADF;
+      if (entry.kind !== "preopen")
+        return EBADF;
+      const nameLen = new TextEncoder().encode(entry.preopenName ?? "").length;
+      const { dv } = this.mem();
+      dv.setUint32(bufPtr, 0, true);
+      this.writeU64(bufPtr + 8, nameLen);
+      return ESUCCESS;
+    }
+    fd_prestat_dir_name(fd2, pathPtr, pathLen) {
+      const entry = this.fds.get(fd2);
+      if (!entry || entry.kind !== "preopen")
+        return EBADF;
+      const bytes = new TextEncoder().encode(entry.preopenName ?? "");
+      this.writeBytes(pathPtr, bytes.subarray(0, pathLen));
+      return ESUCCESS;
+    }
+    fd_read(fd2, iovsPtr, iovsLen, nreadPtr) {
+      const entry = this.fds.get(fd2);
+      if (!entry)
+        return EBADF;
+      if (entry.kind !== "file" || !entry.data)
+        return EBADF;
+      const { dv } = this.mem();
+      let total = 0;
+      let pos = entry.pos ?? 0;
+      for (let i2 = 0;i2 < iovsLen; i2++) {
+        const bufPtr = dv.getUint32(iovsPtr + i2 * 8, true);
+        const bufLen = dv.getUint32(iovsPtr + i2 * 8 + 4, true);
+        const avail = Math.max(0, entry.data.length - pos);
+        const n = Math.min(bufLen, avail);
+        if (n > 0) {
+          this.writeBytes(bufPtr, entry.data.subarray(pos, pos + n));
+          pos += n;
+          total += n;
+        }
+        if (n < bufLen)
+          break;
+      }
+      entry.pos = pos;
+      dv.setUint32(nreadPtr, total, true);
+      return ESUCCESS;
+    }
+    fd_readdir(fd2, bufPtr, bufLen, cookie, bufusedPtr) {
+      const entry = this.fds.get(fd2);
+      if (!entry)
+        return EBADF;
+      if (entry.kind !== "preopen" && entry.kind !== "dir")
+        return ENOTDIR;
+      let names;
+      try {
+        names = ctx.vfs.readdir(entry.path);
+      } catch {
+        return ENOENT;
+      }
+      const { dv } = this.mem();
+      let at = bufPtr;
+      let used = 0;
+      let nextCookie = Math.max(1, cookie);
+      let i2 = nextCookie - 1;
+      for (;i2 < names.length; i2++) {
+        const nameBytes = new TextEncoder().encode(names[i2]);
+        const entrySize = 24 + nameBytes.length;
+        if (used + entrySize > bufLen)
+          break;
+        const dNext = i2 + 2;
+        const type = this.fileTypeOf(joinGuest(entry.path, names[i2]), true);
+        this.writeU64(at, dNext);
+        this.writeU64(at + 8, 0);
+        dv.setUint32(at + 16, nameBytes.length, true);
+        dv.setUint8(at + 20, type);
+        this.writeBytes(at + 24, nameBytes);
+        at += entrySize;
+        used += entrySize;
+        nextCookie = dNext;
+      }
+      dv.setUint32(bufusedPtr, used, true);
+      return ESUCCESS;
+    }
+    fd_seek(fd2, offsetLo, offsetHi, whence, newOffsetPtr) {
+      const entry = this.fds.get(fd2);
+      if (!entry || entry.kind !== "file")
+        return EBADF;
+      const offset = offsetLo + offsetHi * 4294967296;
+      const base = whence === WHENCE_SET ? 0 : whence === WHENCE_CUR ? entry.pos ?? 0 : entry.data?.length ?? 0;
+      if (whence !== WHENCE_SET && whence !== WHENCE_CUR && whence !== WHENCE_END)
+        return EINVAL;
+      const next = base + offset;
+      if (next < 0)
+        return EINVAL;
+      entry.pos = next;
+      this.writeU64(newOffsetPtr, next);
+      return ESUCCESS;
+    }
+    fd_write(fd2, iovsPtr, iovsLen, nwrittenPtr) {
+      const entry = this.fds.get(fd2);
+      if (!entry)
+        return EBADF;
+      const { dv, u8: u82 } = this.mem();
+      let total = 0;
+      const parts = [];
+      for (let i2 = 0;i2 < iovsLen; i2++) {
+        const bufPtr = dv.getUint32(iovsPtr + i2 * 8, true);
+        const bufLen = dv.getUint32(iovsPtr + i2 * 8 + 4, true);
+        parts.push(u82.slice(bufPtr, bufPtr + bufLen));
+        total += bufLen;
+      }
+      if (entry.kind === "stdio") {
+        if (fd2 === 0)
+          return EBADF;
+        const merged = concat2(parts);
+        ctx.hooks.onStdio(fd2 === 2 ? 2 : 1, merged);
+      } else if (entry.kind === "file" && entry.writable) {
+        const merged = concat2(parts);
+        const pos = entry.pos ?? 0;
+        const end = pos + merged.length;
+        if (entry.data && end <= entry.data.length) {
+          entry.data.set(merged, pos);
+        } else {
+          const grown = new Uint8Array(end);
+          grown.set(entry.data ?? new Uint8Array(0), 0);
+          grown.set(merged, pos);
+          entry.data = grown;
+        }
+        entry.pos = end;
+        entry.dirty = true;
+      } else {
+        return EBADF;
+      }
+      dv.setUint32(nwrittenPtr, total, true);
+      return ESUCCESS;
+    }
+    path_create_directory(fd2, pathPtr, pathLen) {
+      const path = this.resolveAtChecked(fd2, pathPtr, pathLen);
+      if (path === null)
+        return EBADF;
+      try {
+        ctx.vfs.mkdir(path, false);
+        return ESUCCESS;
+      } catch (e) {
+        return errnoOfVfs(e);
+      }
+    }
+    path_filestat_get(fd2, flags, pathPtr, pathLen, bufPtr) {
+      const path = this.resolveAtChecked(fd2, pathPtr, pathLen);
+      if (path === null)
+        return EBADF;
+      const follow = (flags & 2) === 0;
+      try {
+        const st = ctx.vfs.stat(path, follow);
+        return this.writeFilestat(bufPtr, {
+          dev: 1,
+          ino: st.ino ?? 0,
+          filetype: this.fileTypeOf(path, follow),
+          nlink: 1,
+          size: st.size,
+          atime: st.atimeMs ?? 0,
+          mtime: st.mtimeMs ?? 0,
+          ctime: st.ctimeMs ?? 0
+        });
+      } catch (e) {
+        return errnoOfVfs(e);
+      }
+    }
+    path_open(fd2, _dirflags, pathPtr, pathLen, oflags, rightsBaseLo, _rightsBaseHi, _rightsInhLo, _rightsInhHi, fdOutPtr) {
+      const path = this.resolveAtChecked(fd2, pathPtr, pathLen);
+      if (path === null)
+        return EBADF;
+      const wantDir = (oflags & OFLAG_DIRECTORY) !== 0;
+      const create = (oflags & OFLAG_CREAT) !== 0;
+      const excl = (oflags & OFLAG_EXCL) !== 0;
+      const trunc = (oflags & OFLAG_TRUNC) !== 0;
+      const readable = (rightsBaseLo & RIGHT_FD_READ) !== 0;
+      const writable = (rightsBaseLo & RIGHT_FD_WRITE) !== 0;
+      let exists = true;
+      let isDir = false;
+      try {
+        const st = ctx.vfs.stat(path);
+        isDir = (st.mode & 61440) === 16384;
+      } catch {
+        exists = false;
+      }
+      if (excl && exists && create)
+        return EEXIST;
+      if (wantDir) {
+        if (!exists)
+          return ENOENT;
+        if (!isDir)
+          return ENOTDIR;
+        const newFd2 = this.allocFd({ kind: "dir", path });
+        const { dv: dv2 } = this.mem();
+        dv2.setUint32(fdOutPtr, newFd2, true);
+        return ESUCCESS;
+      }
+      if (isDir)
+        return EISDIR;
+      if (!exists) {
+        if (!create || !writable)
+          return ENOENT;
+        try {
+          ctx.vfs.writeFile(path, new Uint8Array(0));
+        } catch (e) {
+          return errnoOfVfs(e);
+        }
+      } else if (trunc && writable) {
+        try {
+          ctx.vfs.writeFile(path, new Uint8Array(0));
+        } catch (e) {
+          return errnoOfVfs(e);
+        }
+      }
+      let data;
+      try {
+        data = ctx.vfs.readFile(path);
+      } catch (e) {
+        return errnoOfVfs(e);
+      }
+      const newFd = this.allocFd({
+        kind: "file",
+        path,
+        data,
+        pos: 0,
+        readable,
+        writable,
+        dirty: false
+      });
+      const { dv } = this.mem();
+      dv.setUint32(fdOutPtr, newFd, true);
+      return ESUCCESS;
+    }
+    path_readlink(fd2, pathPtr, pathLen, bufPtr, bufLen, bufUsedPtr) {
+      const path = this.resolveAtChecked(fd2, pathPtr, pathLen);
+      if (path === null)
+        return EBADF;
+      try {
+        const target = ctx.vfs.readlink(path);
+        const bytes = new TextEncoder().encode(target);
+        const n = Math.min(bytes.length, bufLen);
+        this.writeBytes(bufPtr, bytes.subarray(0, n));
+        const { dv } = this.mem();
+        dv.setUint32(bufUsedPtr, n, true);
+        return ESUCCESS;
+      } catch (e) {
+        return errnoOfVfs(e);
+      }
+    }
+    path_remove_directory(fd2, pathPtr, pathLen) {
+      const path = this.resolveAtChecked(fd2, pathPtr, pathLen);
+      if (path === null)
+        return EBADF;
+      try {
+        ctx.vfs.rm(path, { recursive: false });
+        return ESUCCESS;
+      } catch (e) {
+        return errnoOfVfs(e);
+      }
+    }
+    path_unlink_file(fd2, pathPtr, pathLen) {
+      const path = this.resolveAtChecked(fd2, pathPtr, pathLen);
+      if (path === null)
+        return EBADF;
+      try {
+        ctx.vfs.rm(path, { recursive: false });
+        return ESUCCESS;
+      } catch (e) {
+        return errnoOfVfs(e);
+      }
+    }
+    resolveAtChecked(fd2, pathPtr, pathLen) {
+      const base = this.fds.get(fd2);
+      if (!base)
+        return null;
+      const rel = this.str(pathPtr, pathLen);
+      try {
+        return this.resolveAt(fd2, rel);
+      } catch {
+        return null;
+      }
+    }
+    poll_oneoff(inPtr, outPtr, nsubs, neventsPtr) {
+      const { dv } = this.mem();
+      let events = 0;
+      for (let i2 = 0;i2 < nsubs; i2++) {
+        const sub = inPtr + i2 * 24;
+        const userdataLo = dv.getUint32(sub, true);
+        const userdataHi = dv.getUint32(sub + 4, true);
+        const type = dv.getUint8(sub + 8);
+        const ev = outPtr + i2 * 32;
+        this.writeU64(ev, userdataLo + userdataHi * 4294967296);
+        dv.setUint16(ev + 8, type === 0 ? 0 : ENOSYS, true);
+        dv.setUint8(ev + 10, type);
+        events++;
+      }
+      dv.setUint32(neventsPtr, events, true);
+      return ESUCCESS;
+    }
+    proc_exit(code) {
+      wasiProcExit(code);
+      return 0;
+    }
+  }
+  return { WASI: WASIImpl };
+}
+var FILETYPE_CHARACTER_DEVICE = 2;
+function normalizeGuest(p) {
+  const parts = [];
+  for (const seg of p.split("/")) {
+    if (seg === "" || seg === ".")
+      continue;
+    if (seg === "..")
+      parts.pop();
+    else
+      parts.push(seg);
+  }
+  return "/" + parts.join("/");
+}
+function joinGuest(base, name) {
+  return normalizeGuest((base === "/" ? "" : base) + "/" + name);
+}
+function concat2(parts) {
+  const total = parts.reduce((n, p) => n + p.length, 0);
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const p of parts) {
+    out.set(p, at);
+    at += p.length;
+  }
+  return out;
+}
+function errnoOfVfs(e) {
+  const code = String(e?.code ?? e?.message ?? "");
+  if (code.includes("ENOENT"))
+    return ENOENT;
+  if (code.includes("EEXIST"))
+    return EEXIST;
+  if (code.includes("EISDIR"))
+    return EISDIR;
+  if (code.includes("ENOTDIR"))
+    return ENOTDIR;
+  if (code.includes("ENOTEMPTY"))
+    return ENOTEMPTY;
+  if (code.includes("EPERM") || code.includes("EACCES"))
+    return EPERM;
+  if (code.includes("ENOMEM"))
+    return ENOMEM;
+  if (code.includes("ENOTSUP"))
+    return ENOTSUP;
+  return EIO;
+}
+
 // src/packages/opencontainer/kernel/natives/index.ts
 class Natives {
   ctx;
@@ -12200,6 +13253,7 @@ class Natives {
     reg("string_decoder", () => makeStringDecoderBinding());
     reg("types", () => makeTypesBinding());
     reg("cjs_lexer", () => makeCjsLexerBinding());
+    reg("wasi", () => makeWasiBinding(ctx));
     for (const [name, binding] of Object.entries(makeMiscBindings())) {
       if (binding !== undefined)
         this.bindings.set(name, binding);
@@ -12697,9 +13751,11 @@ function makeEsmGraphImporter(deps) {
   const resolver = new Resolver(deps);
   const { acorn, serving, vfs } = deps;
   const builtinShimPath = (id) => `/__oc_builtin/${id}.mjs`;
+  const workerBuiltinShimPath = (id, threadId) => `/__oc_builtin_wt${threadId}/${id}.mjs`;
   const cjsShimPath = (p) => `/__oc_cjs${p}.mjs`;
   const jsonShimPath = (p) => `/__oc_json${p}.mjs`;
   const dynShimPath = (p) => `/__oc_dynshim${p}.mjs`;
+  const isWorkerThreadsId = (id) => id === "worker_threads" || id === "node:worker_threads";
   const processNonce = Math.random().toString(36).slice(2, 12);
   const published = new Set;
   const urlByPath = new Map;
@@ -12741,13 +13797,13 @@ function makeEsmGraphImporter(deps) {
     }
     return out;
   }
-  async function rewriteModule(mod) {
+  async function rewriteModule(mod, wtid = null) {
     const src = mod.source;
     const edits = [];
     let metaUsed = false;
     for (const s of collectStaticSpecifiers(mod.ast)) {
       const r = resolver.resolve(s.value, mod.path);
-      const url = await urlFor(r);
+      const url = await urlFor(r, wtid);
       if (r.kind === "json" && s.isStaticDecl) {
         edits.push({ start: s.node.start, end: s.declNode.end, text: JSON.stringify(url) });
       } else {
@@ -12760,10 +13816,11 @@ function makeEsmGraphImporter(deps) {
       if (node.type === "ImportExpression") {
         const arg = node.source ?? node.argument;
         const argText = arg ? src.slice(arg.start, arg.end) : "";
+        const call = wtid !== null ? `globalThis.__ocDynImportW(${wtid}, ${JSON.stringify(dirnameOf(mod.path))}, ${argText})` : `globalThis.__ocDynImport(${JSON.stringify(dirnameOf(mod.path))}, ${argText})`;
         edits.push({
           start: node.start,
           end: node.end,
-          text: `globalThis.__ocDynImport(${JSON.stringify(dirnameOf(mod.path))}, ${argText})`
+          text: call
         });
       } else if (node.type === "MetaProperty" && node.meta?.name === "import" && node.property?.name === "meta") {
         metaUsed = true;
@@ -12793,6 +13850,10 @@ function makeEsmGraphImporter(deps) {
       out = `const __ocImportMeta = globalThis.__ocMetaFor(${JSON.stringify(mod.path)});
 ` + out;
     }
+    out = `;(globalThis).__ocEvalLog&&__ocEvalLog(${JSON.stringify(mod.path)});
+` + out;
+    out += `
+;(globalThis).__ocEvalDone&&__ocEvalDone(${JSON.stringify(mod.path)});`;
     return out;
   }
   function exportKeysOf(load) {
@@ -12813,6 +13874,31 @@ function makeEsmGraphImporter(deps) {
       }
     } catch {}
     let text = `const __m = globalThis.__ocEsmBuiltin(${JSON.stringify(id)});
+export default __m;
+`;
+    for (const k of keys)
+      text += `export const ${k} = __m[${JSON.stringify(k)}];
+`;
+    return text;
+  }
+  function workerBuiltinShimText(id, threadId) {
+    let keys = [];
+    try {
+      const views = globalThis.__ocWorkerViews;
+      const view = views?.get?.(threadId);
+      if (view && (typeof view === "object" || typeof view === "function")) {
+        keys = Object.keys(view).filter(isSafeIdent);
+      }
+    } catch {}
+    if (keys.length === 0) {
+      try {
+        const m = deps.requireBuiltin(id);
+        if (m !== null && m !== undefined && (typeof m === "object" || typeof m === "function")) {
+          keys = Object.keys(m).filter(isSafeIdent);
+        }
+      } catch {}
+    }
+    let text = `const __m = globalThis.__ocEsmWorkerBuiltin(${JSON.stringify(threadId)}, ${JSON.stringify(id)});
 export default __m;
 `;
     for (const k of keys)
@@ -12886,7 +13972,7 @@ export default __j;
 `;
     return text;
   }
-  async function buildGraph(entryPath) {
+  async function buildGraph(entryPath, wtid = null) {
     if (published.has(entryPath))
       return urlOf(entryPath);
     const modules = new Map;
@@ -12932,7 +14018,7 @@ export default __j;
       if (published.has(path))
         continue;
       const mod = modules.get(path);
-      const text = await rewriteModule(mod);
+      const text = await rewriteModule(mod, wtid);
       const urls = await serving.serve(processNonce, new Map([[path, text]]));
       const url = urls.get(path);
       if (!url)
@@ -12942,9 +14028,13 @@ export default __j;
     }
     return urlOf(entryPath);
   }
-  async function urlFor(r) {
-    if (r.kind === "builtin")
+  async function urlFor(r, wtid = null) {
+    if (r.kind === "builtin") {
+      if (wtid !== null && isWorkerThreadsId(r.id)) {
+        return ensureShim(workerBuiltinShimPath(r.id, wtid), workerBuiltinShimText(r.id, wtid));
+      }
       return ensureShim(builtinShimPath(r.id), builtinShimText(r.id));
+    }
     if (r.kind === "cjs")
       return ensureShim(cjsShimPath(r.path), cjsShimText(r.path));
     if (r.kind === "json")
@@ -13004,6 +14094,28 @@ export default __j;
       disarmImport();
     }
   }
+  async function dynamicImportWorker(threadId, parentDir, spec) {
+    armImport();
+    try {
+      const r = resolver.resolveFromDir(spec, parentDir);
+      if (r.kind === "builtin") {
+        if (isWorkerThreadsId(r.id)) {
+          return await import(await ensureShim(workerBuiltinShimPath(r.id, threadId), workerBuiltinShimText(r.id, threadId)));
+        }
+        return await import(await ensureShim(builtinShimPath(r.id), builtinShimText(r.id)));
+      }
+      if (r.kind === "cjs") {
+        return await import(await ensureShim(cjsShimPath(r.path), cjsShimText(r.path)));
+      }
+      if (r.kind === "json") {
+        return await import(await ensureShim(jsonShimPath(r.path), jsonShimText(r.path)));
+      }
+      const url = await buildGraph(r.path, threadId);
+      return await import(url);
+    } finally {
+      disarmImport();
+    }
+  }
   async function ensureShim(shimPath, text) {
     if (published.has(shimPath))
       return urlOf(shimPath);
@@ -13015,13 +14127,21 @@ export default __j;
     published.add(shimPath);
     return url;
   }
-  return { importEntry, dynamicImport };
+  return { importEntry, dynamicImport, dynamicImportWorker };
 }
 
 // src/packages/opencontainer/kernel/net-pending.ts
 var pending = 0;
+var pendingBodies = 0;
 function netPendingCount() {
-  return pending;
+  return pending + pendingBodies;
+}
+function netBodyOpen() {
+  pendingBodies++;
+}
+function netBodyClose() {
+  if (pendingBodies > 0)
+    pendingBodies--;
 }
 function wrapFetchForNetPending(fetchImpl) {
   const wrapped = (input, init) => {
@@ -13054,9 +14174,6 @@ var CORS_SAFELISTED_REQUEST_HEADERS = new Set([
   "accept",
   "accept-language",
   "content-language",
-  "if-modified-since",
-  "if-none-match",
-  "if-range",
   "range"
 ]);
 function isCorsSafelistedRequestHeader(name, value) {
@@ -13292,6 +14409,7 @@ class FetchIncomingMessage extends TinyEmitter {
   _destroyed = false;
   _gate = null;
   _gateResolve = null;
+  _bodyCounted = false;
   _touch = null;
   _streamDecoder = null;
   _encodingLabel = null;
@@ -13319,7 +14437,13 @@ class FetchIncomingMessage extends TinyEmitter {
     }
     this.headers = headers;
     this.rawHeaders = raw;
-    this._reader = response.body ? response.body.getReader() : null;
+    if (response.body) {
+      this._reader = response.body.getReader();
+      netBodyOpen();
+      this._bodyCounted = true;
+    } else {
+      this._reader = null;
+    }
   }
   setEncoding(enc) {
     const label = String(enc ?? "utf8").toLowerCase();
@@ -13413,6 +14537,7 @@ class FetchIncomingMessage extends TinyEmitter {
       return;
     this._destroyed = true;
     const reader = this._reader;
+    this._releaseBodyCount();
     this._reader = null;
     if (reader) {
       try {
@@ -13425,6 +14550,12 @@ class FetchIncomingMessage extends TinyEmitter {
       this.emit("aborted");
     }
     this.emit("close");
+  }
+  _releaseBodyCount() {
+    if (this._bodyCounted) {
+      this._bodyCounted = false;
+      netBodyClose();
+    }
   }
   _releaseGate() {
     if (this._gateResolve) {
@@ -13487,6 +14618,7 @@ class FetchIncomingMessage extends TinyEmitter {
       if (this._destroyed)
         return;
       this._reader = null;
+      this._releaseBodyCount();
       this.emit("error", mapFetchError(err2, this.url || ""));
       this.emit("close");
     } finally {
@@ -13497,6 +14629,7 @@ class FetchIncomingMessage extends TinyEmitter {
     if (this.complete)
       return;
     this._reader = null;
+    this._releaseBodyCount();
     this.complete = true;
     this._drainQueue();
     this.emit("end");
@@ -14389,6 +15522,7 @@ async function bootKernel(opts) {
     mountPkg("pnpm-oc");
     mountPkg("semver");
     mountPkg("oc-sh");
+    mountPkg("oc-compat");
     const binShim = (path, requirePath) => {
       vfs.mkdir(path.slice(0, path.lastIndexOf("/")), true);
       const trace = "if(process.env.OC_TRACE_EXIT){process.stderr.write('OC-ARGV '+JSON.stringify(process.argv)+'\\n');const oe=process.exit;process.exit=function(c){process.stderr.write('OC-EXIT '+c+'\\n'+new Error().stack+'\\n');return oe.call(process,c);};}";
@@ -14397,6 +15531,61 @@ async function bootKernel(opts) {
 ${trace}
 try { require(${JSON.stringify(requirePath)}); } catch (e) { process.stderr.write('OC-SHIM-ERROR ' + path + ': ' + (e && e.stack || e) + '\\n'); process.exit(42); }
 `);
+    };
+    const compatShim = (paths) => {
+      for (const p of paths) {
+        const isPnpm = p.includes("pnpm");
+        const entry = isPnpm ? "/usr/lib/node_modules/pnpm/bin/pnpm.cjs" : "/usr/lib/node_modules/npm/lib/cli.js";
+        vfs.mkdir(p.slice(0, p.lastIndexOf("/")), true);
+        vfs.writeFile(p, `#!/usr/bin/env node
+'use strict';
+` + `const __ocRealExit = process.exit.bind(process);
+` + `let __ocCompatStarted = false;
+` + `let __ocCompatSettled = null; // resolves when the running pass is done
+` + `const __ocRunCompat = (done) => {
+` + `  if (__ocCompatStarted) {
+` + `    // A pass is (or was) in flight: npm's own exit path arrives here
+` + `    // AFTER our completion-promise chain already started the pass —
+` + `    // queue this exit behind it instead of killing the fetches.
+` + `    return (__ocCompatSettled ?? Promise.resolve()).then(() => done());
+` + `  }
+` + `  __ocCompatStarted = true;
+` + `  const cmd = process.argv[2];
+` + `  if (['install','i','add','ci','update','up'].indexOf(cmd) === -1) return done();
+` + `  if (process.env && String(process.env.OC_COMPAT_WASM) === '0') return done();
+` + `  __ocCompatSettled = new Promise((res) => { __ocCompatSettledResolve = res; });
+` + `  try {
+` + `    require('/usr/lib/node_modules/oc-compat/main.js').postInstall(process.cwd(), (err) => {
+` + `      if (err) process.stderr.write('[opencontainer] compat pass failed: ' + (err && err.message || err) + '\\n');
+` + `      __ocCompatSettledResolve();
+` + `      done();
+` + `    });
+` + `  } catch (e) {
+` + `    process.stderr.write('[opencontainer] compat pass failed: ' + (e && e.message || e) + '\\n');
+` + `    __ocCompatSettledResolve();
+` + `    done();
+` + `  }
+` + `};
+` + `let __ocCompatSettledResolve = () => {};
+` + `const __ocTrace = (tag) => { try { process.stderr.write('OC-TRACE ' + tag + ' argv=' + JSON.stringify(process.argv) + ' exitCode=' + JSON.stringify(process.exitCode) + ' at ' + new Error().stack.split('\\n').slice(2,6).join(' <- ') + '\\n'); } catch (_) {} };
+` + `process.exit = function (code) { if (process.env && process.env.OC_TRACE_EXIT === '1') __ocTrace('exit(' + code + ')'); __ocRunCompat(() => __ocRealExit(code)); };
+` + `let __ocResult;
+` + `try { __ocResult = require(${JSON.stringify(entry)})(process); }
+` + `catch (e) { process.stderr.write('OC-SHIM-ERROR ${p}: ' + (e && e.stack || e) + '\\n'); process.exit(42); }
+` + `if (__ocResult && typeof __ocResult.then === 'function') {
+` + `  // The CLI settled. Run the compat pass (install-class commands
+` + `  // only), then EXIT — always. The previous guard (only exit when
+` + `  // exitCode was truthy) left success-path exits to loop drain,
+` + `  // and any surviving handle (a stray timer, an unclosed socket)
+` + `  // hung the process forever: 'npm install' completed, printed its
+` + `  // summary, and never returned the prompt.
+` + `  __ocResult.catch((e) => { try { process.stderr.write('OC-CLI-REJECT ' + (e && e.stack || e) + '\\n'); } catch (_) {} }).then(() => __ocRunCompat(() => {
+` + `    if (process.env && process.env.OC_TRACE_EXIT === '1') __ocTrace('chain-exit');
+` + `    __ocRealExit(Number(process.exitCode) || 0);
+` + `  }));
+` + `}
+`);
+      }
     };
     vfs.mkdir("/usr/local/bin", true);
     vfs.mkdir("/usr/bin", true);
@@ -14411,6 +15600,7 @@ try { require(${JSON.stringify(requirePath)}); } catch (e) { process.stderr.writ
     binShim("/usr/local/bin/pnpm", "/usr/lib/node_modules/pnpm/bin/pnpm.cjs");
     binShim("/usr/local/bin/pnpx", "/usr/lib/node_modules/pnpm/bin/pnpx.cjs");
     binShim("/usr/local/bin/pnpm-oc", "/usr/lib/node_modules/pnpm-oc/cli.js");
+    compatShim(["/usr/local/bin/npm", "/usr/bin/npm", "/usr/local/bin/pnpm"]);
     binShim("/usr/local/bin/corepack", "/usr/lib/node_modules/oc-sh/corepack.js");
     binShim("/usr/bin/sh", "/usr/lib/node_modules/oc-sh/sh.js");
     binShim("/bin/sh", "/usr/lib/node_modules/oc-sh/sh.js");
@@ -14694,7 +15884,16 @@ try { require(${JSON.stringify(requirePath)}); } catch (e) { process.stderr.writ
     });
     globalThis.__ocEsmGraphImport = (entryUrl, entryPath) => importer.importEntry(entryPath.startsWith("/") ? entryPath : entryUrl);
     globalThis.__ocDynImport = (parentDir, spec) => importer.dynamicImport(parentDir, spec);
+    globalThis.__ocDynImportW = (threadId, parentDir, spec) => importer.dynamicImportWorker(threadId, parentDir, spec);
     globalThis.__ocEsmBuiltin = (id) => require2(id);
+    globalThis.__ocEsmWorkerBuiltin = (threadId, id) => {
+      const views = globalThis.__ocWorkerViews;
+      const view = views?.get(threadId);
+      if (view !== undefined && (id === "worker_threads" || id === "node:worker_threads")) {
+        return view;
+      }
+      return require2(id);
+    };
     globalThis.__ocEsmCjs = (p) => requireCjsFile(p);
     globalThis.__ocEsmJson = (p) => {
       const bytes = nativesCtx.vfs.readFile(p);
@@ -14858,6 +16057,7 @@ Node.js ${NODE_VERSION}
     const pipeB = natives.get("pipe_wrap");
     const tcpB = natives.get("tcp_wrap");
     const procB = natives.get("process_wrap");
+    const fsB = natives.get("fs");
     const pendingTimers = timersB.getActiveTimerCount?.() ?? 0;
     const pendingImmediates = timersB.getActiveImmediateCount?.() ?? 0;
     const stdinReading = ttyB.stdinReading?.() ?? false;
@@ -14866,14 +16066,15 @@ Node.js ${NODE_VERSION}
     const liveChildren = procB.activeChildCount?.() ?? 0;
     const pendingNet = netPendingCount();
     const pendingZlib = zlibPendingCount();
-    return pendingTimers === 0 && pendingImmediates === 0 && !stdinReading && openPipes === 0 && openTcp === 0 && liveChildren === 0 && pendingNet === 0 && pendingZlib === 0;
+    const pendingFs = activeFsCount();
+    return pendingTimers === 0 && pendingImmediates === 0 && !stdinReading && openPipes === 0 && openTcp === 0 && liveChildren === 0 && pendingNet === 0 && pendingZlib === 0 && pendingFs === 0;
   }
   function hasLiveHandles() {
     const pipeB = natives.get("pipe_wrap");
     const tcpB = natives.get("tcp_wrap");
     const procB = natives.get("process_wrap");
     const ttyB = natives.get("tty_wrap");
-    return (pipeB.activePipeCount?.() ?? 0) > 0 || (tcpB.activeTcpCount?.() ?? 0) > 0 || (procB.activeChildCount?.() ?? 0) > 0 || (ttyB.stdinReading?.() ?? false) || netPendingCount() > 0 || zlibPendingCount() > 0;
+    return (pipeB.activePipeCount?.() ?? 0) > 0 || (tcpB.activeTcpCount?.() ?? 0) > 0 || (procB.activeChildCount?.() ?? 0) > 0 || (ttyB.stdinReading?.() ?? false) || netPendingCount() > 0 || zlibPendingCount() > 0 || activeFsCount() > 0;
   }
   function raiseSignal(sig) {
     try {
@@ -14894,6 +16095,7 @@ Node.js ${NODE_VERSION}
     if (drainWatcher !== null)
       return;
     let emptyTicks = 0;
+    let busyTicks = 0;
     drainWatcher = hostSetInterval(() => {
       drainTicks();
       if (process._exiting) {
@@ -14902,9 +16104,13 @@ Node.js ${NODE_VERSION}
       }
       if (kernelLoopEmpty()) {
         emptyTicks++;
-        if (emptyTicks >= 2) {
+        if (emptyTicks >= 15 && !(process.env && String(process.env.OC_NO_DRAIN_EXIT) === "1")) {
           stopLoopDrainWatcher();
           try {
+            if (process.env && String(process.env.OC_TRACE_DRAIN) === "1") {
+              opts.hooks.onStdio(2, `[oc-drain] watcher exiting process code=${process.exitCode ?? 0}
+`);
+            }
             process.exit(process.exitCode ?? 0);
           } catch (e) {
             globalThis.__ocDebugHook?.("[loop-drain exit error] " + String(e));
@@ -14912,6 +16118,19 @@ Node.js ${NODE_VERSION}
         }
       } else {
         emptyTicks = 0;
+        if (busyTicks++ % 50 === 49) {
+          if (process.env && String(process.env.OC_TRACE_DRAIN) === "1") {
+            try {
+              const tB = natives.get("timers");
+              const yB = natives.get("tty_wrap");
+              const pB = natives.get("pipe_wrap");
+              const cB = natives.get("tcp_wrap");
+              const xB = natives.get("process_wrap");
+              opts.hooks.onStdio(2, `[oc-drain] loop busy for ${Math.round(busyTicks / 10)}s: timers=${tB.getActiveTimerCount?.() ?? 0} immediates=${tB.getActiveImmediateCount?.() ?? 0} stdinReading=${yB.stdinReading?.() ?? false} pipes=${pB.activePipeCount?.() ?? 0} tcp=${cB.activeTcpCount?.() ?? 0} children=${xB.activeChildCount?.() ?? 0} net=${netPendingCount()} zlib=${zlibPendingCount()} fs=${activeFsCount()}
+`);
+            } catch {}
+          }
+        }
       }
     }, 100);
   }
@@ -14982,8 +16201,54 @@ globalThis.__ocHostGunzip = async (gz) => {
   }
   return gunzipSync(gz);
 };
+var nativePostMessage = typeof self.postMessage === "function" ? self.postMessage.bind(self) : (msg) => {
+  throw new Error(`OpenContainer: worker RPC broken — cannot post ${msg?.type}`);
+};
+try {
+  let proto = globalThis;
+  let d;
+  while (proto !== null && d === undefined) {
+    proto = Object.getPrototypeOf(proto);
+    if (proto === null)
+      break;
+    d = Object.getOwnPropertyDescriptor(proto, "self");
+  }
+  if (d && d.get && !d.set) {
+    Object.defineProperty(globalThis, "self", {
+      value: globalThis,
+      writable: true,
+      configurable: true,
+      enumerable: true
+    });
+  }
+} catch {}
+try {
+  const origWait = Atomics.wait;
+  Atomics.wait = function(ta, index, value, timeout) {
+    try {
+      let shared = "non-shared";
+      try {
+        if (ta.buffer instanceof SharedArrayBuffer && SharedArrayBuffer !== ArrayBuffer)
+          shared = "SHARED";
+      } catch {}
+      post({
+        type: "stdio",
+        fd: 2,
+        chunk: `[oc-atomics] wait(${shared}, i=${index}, v=${value}, t=${timeout === undefined ? "∞" : timeout})
+`
+      });
+    } catch {}
+    return origWait.call(Atomics, ta, index, value, timeout);
+  };
+} catch {}
+globalThis.__ocWorkerMsgDebug = (s) => {
+  try {
+    post({ type: "stdio", fd: 2, chunk: `[oc-port] ${s}
+` });
+  } catch {}
+};
 function post(msg) {
-  self.postMessage(msg);
+  nativePostMessage(msg);
 }
 var CACHE_NAME = "opencontainer-runtime-v2";
 function cacheKeyUrl(file) {
@@ -15062,6 +16327,7 @@ function parseBlob(buf) {
 }
 var sourceEntries = new Map;
 var decodedSources = new Map;
+var coreEntryCount = 0;
 function attachBlob(buf) {
   const { entries, bodyStart, bytes } = parseBlob(buf);
   for (const e of entries) {
@@ -15083,6 +16349,10 @@ function makeLazyStore() {
         if (rel.startsWith("amaro/") && !amaroReady) {
           throw new Error("OpenContainer: TypeScript support is still loading — retry in a moment");
         }
+        try {
+          const keys = [...sourceEntries.keys()];
+          globalThis.__ocEvalLog?.(`store miss '${rel}': entries=${sourceEntries.size}, coreEntries=${coreEntryCount}, hasPrefixLib=${keys.filter((k) => k.startsWith("lib/")).length}, sample=${keys.slice(0, 3).join("|")}, undiciKeyPresent=${keys.includes("lib/internal/deps/undici/undici.js")}`);
+        } catch {}
         throw new Error(`OpenContainer: source not preloaded: ${path}`);
       }
       const text = storeDecoder.decode(entry.view);
@@ -15208,10 +16478,13 @@ function applyHostFsOp(op) {
 async function opfsRoot() {
   try {
     const root = await navigator.storage?.getDirectory?.();
-    if (!root)
+    if (!root) {
+      diag("opfs: getDirectory() resolved falsy");
       return null;
+    }
     return await root.getDirectoryHandle(OPFS_ROOT_DIR, { create: true });
-  } catch {
+  } catch (e) {
+    diag(`opfs: opfsRoot threw: ${e && e.name}: ${e && e.message} (navigator=${typeof globalThis.navigator}, getDirectory=${typeof globalThis.navigator?.storage?.getDirectory})`);
     return null;
   }
 }
@@ -15221,12 +16494,35 @@ function opfsKey(path) {
 function isEphemeralPath(p) {
   return p.includes("/node_modules/");
 }
+function diag(message) {
+  try {
+    post({ type: "stdio", fd: 2, chunk: `[oc-diag] ${message}
+` });
+    post({ type: "error", message: `[oc-diag] ${message}` });
+  } catch {}
+}
+globalThis.__ocEvalLog = (p) => {
+  try {
+    post({ type: "stdio", fd: 2, chunk: `[oc-eval] ${p}
+` });
+  } catch {}
+};
+globalThis.__ocEvalDone = (p) => {
+  try {
+    post({ type: "stdio", fd: 2, chunk: `[oc-eval✓] ${p}
+` });
+  } catch {}
+};
 async function saveTreeToOpfs() {
-  if (!kernel)
+  if (!kernel) {
+    diag("opfs: no kernel");
     return;
+  }
   const root = await opfsRoot();
-  if (!root)
+  if (!root) {
+    diag("opfs: opfsRoot() returned null — getDirectory/getDirectoryHandle threw or unavailable");
     return;
+  }
   const tree = kernel.vfs.exportTree("/home");
   const eDirs = tree.dirs.filter((p) => !isEphemeralPath(p));
   const eFiles = tree.files.filter(([p]) => !isEphemeralPath(p));
@@ -15412,6 +16708,26 @@ async function boot(msg) {
     }
   }
   wireVfsDeltas();
+  if (msg.env && String(msg.env.OC_TRACE_IMMEDIATE) === "1") {
+    try {
+      const g = globalThis;
+      const orig = g.setImmediate;
+      let n = 0;
+      g.setImmediate = function(cb, ...a) {
+        const id = ++n;
+        post({ type: "stdio", fd: 2, chunk: `[oc-imm] #${id} scheduled
+` });
+        return orig(function(...args) {
+          post({ type: "stdio", fd: 2, chunk: `[oc-imm] #${id} start
+` });
+          const r = cb.apply(this, args);
+          post({ type: "stdio", fd: 2, chunk: `[oc-imm] #${id} done
+` });
+          return r;
+        }, ...a);
+      };
+    } catch {}
+  }
   globalThis.__oc = globalThis.__oc ?? {};
   globalThis.__oc.kernel = kernel;
   self.addEventListener("unhandledrejection", (ev) => {
@@ -15497,7 +16813,7 @@ function startRepl() {
   kernel.require("internal/main/repl");
 }
 var booted = false;
-self.onmessage = async (ev) => {
+async function handleRpcMessage(ev) {
   const msg = ev.data;
   if (booting && msg.type !== "boot") {
     earlyMessages.push(msg);
@@ -15516,7 +16832,7 @@ self.onmessage = async (ev) => {
             const queued = earlyMessages;
             earlyMessages = [];
             for (const m of queued) {
-              self.onmessage({ data: m });
+              await handleRpcMessage({ data: m });
             }
           }
         }
@@ -15627,6 +16943,7 @@ self.onmessage = async (ev) => {
         break;
       }
       case "tcp-data": {
+        globalThis.__ocDebugHook?.(`[worker] tcp-data connId=${msg.connId} ${msg.bytes?.length ?? 0}B kernel=${!!kernel}`);
         if (!kernel)
           break;
         const tcpB = kernel.natives.get("tcp_wrap");
@@ -15878,4 +17195,7 @@ self.onmessage = async (ev) => {
   } finally {
     drainTicks();
   }
-};
+}
+self.addEventListener("message", (ev) => {
+  handleRpcMessage(ev);
+});

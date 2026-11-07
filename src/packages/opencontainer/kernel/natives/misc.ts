@@ -309,7 +309,6 @@ export function makeMiscBindings(): Record<string, Binding> {
     },
     dtls: {},
     ffi: {},
-    wasi: {},
     webstorage: {
       localStorage: undefined,
       sessionStorage: undefined,

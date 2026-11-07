@@ -60,6 +60,30 @@ export interface KernelHooks {
 
 export type Binding = Record<string, any>;
 
+/** A parked raw fs.read(fd 0) in callback mode (node's FSReqCallback shape). */
+export interface StdinRawReader {
+  buffer: Uint8Array;
+  offset: number;
+  length: number;
+  req: {
+    oncomplete: ((err: number | Error | null, ...args: any[]) => void) | null;
+    context?: any;
+  };
+}
+
+/** Raw fd-0 read source: registered by pipe_wrap/tty_wrap once this process's
+ *  stdin handle exists, so raw fs.read/readSync(0, …) — Go's wasm_exec glue
+ *  (esbuild-wasm's --service), read(2)-style consumers — and node's own stdin
+ *  stream draw from ONE kernel pipe buffer instead of two. */
+export interface StdinRawSource {
+  /** Sync: drain buffered bytes into buffer (0 = none/EOF). */
+  readSync(buffer: Uint8Array, offset: number, length: number): number;
+  /** Async: park the read; the source completes req.oncomplete(err, n, buffer). */
+  readAsync(buffer: Uint8Array, offset: number, length: number, req: StdinRawReader['req']): void;
+  /** The handle went away (close/destroy): parked readers get err. */
+  abort(err: Error): void;
+}
+
 export interface NativesContext {
   vfs: Vfs;
   hooks: KernelHooks;
@@ -70,6 +94,9 @@ export interface NativesContext {
   options: Map<string, any>;
   /** This process's stdio modes (tty | pipe | ignore) per fd. */
   stdio?: Array<{ type: 'tty' | 'pipe' | 'ignore'; pipeId?: number }>;
+  /** Set by pipe_wrap/tty_wrap when the fd-0 handle exists; fs.read(0, …)
+   *  delegates here (ONE shared stdin buffer for streams and raw fd reads). */
+  stdinRaw?: StdinRawSource | null;
 }
 
 import { makeErrorsBinding } from './errors';
@@ -111,6 +138,7 @@ import { makeTcpWrapBinding } from './tcp_wrap';
 import { makeHttpParserBinding } from './http_parser';
 import { makeHttp2Binding } from './http2';
 import { makeStreamPipeBinding } from './stream_pipe';
+import { makeWasiBinding } from './wasi';
 
 export class Natives {
   private bindings = new Map<string, Binding>();
@@ -159,6 +187,7 @@ export class Natives {
     reg('string_decoder', () => makeStringDecoderBinding());
     reg('types', () => makeTypesBinding());
     reg('cjs_lexer', () => makeCjsLexerBinding());
+    reg('wasi', () => makeWasiBinding(ctx));
     for (const [name, binding] of Object.entries(makeMiscBindings())) {
       if (binding !== undefined) this.bindings.set(name, binding);
     }

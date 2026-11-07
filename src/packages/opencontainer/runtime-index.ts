@@ -3,11 +3,11 @@
 export const RUNTIME_INDEX = {
   "nodeVersion": "v26.13.0",
   "core": {
-    "file": "node-v26.13.0-core-d3f3d922.ocrt",
-    "sha256": "d3f3d922",
-    "rawBytes": 6817465,
-    "gzBytes": 1555204,
-    "modules": 511
+    "file": "node-v26.13.0-core-829f0f03.ocrt",
+    "sha256": "829f0f03",
+    "rawBytes": 6842078,
+    "gzBytes": 1562262,
+    "modules": 514
   },
   "amaro": {
     "file": "node-v26.13.0-amaro-d518032c.ocrt",

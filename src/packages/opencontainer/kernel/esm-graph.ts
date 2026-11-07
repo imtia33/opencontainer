@@ -78,6 +78,9 @@ export interface EsmGraphImporter {
   importEntry(entryPath: string): Promise<void>;
   /** Dynamic import() from guest ESM code (computed specifiers). */
   dynamicImport(parentPath: string, spec: string): Promise<any>;
+  /** Dynamic import() from an IN-PROCESS WORKER's module graph: binds
+   *  `worker_threads` to that worker's view (parentPort/workerData). */
+  dynamicImportWorker(threadId: number, parentPath: string, spec: string): Promise<any>;
 }
 
 // ---------------------------------------------------------------------------
@@ -475,9 +478,20 @@ export function makeEsmGraphImporter(deps: EsmGraphDeps): EsmGraphImporter {
   const { acorn, serving, vfs } = deps;
 
   const builtinShimPath = (id: string) => `/__oc_builtin/${id}.mjs`;
+  const workerBuiltinShimPath = (id: string, threadId: number) => `/__oc_builtin_wt${threadId}/${id}.mjs`;
   const cjsShimPath = (p: string) => `/__oc_cjs${p}.mjs`;
   const jsonShimPath = (p: string) => `/__oc_json${p}.mjs`;
   const dynShimPath = (p: string) => `/__oc_dynshim${p}.mjs`;
+
+  /** worker_threads inside an in-process worker's module graph resolves to
+   *  a PER-WORKER shim URL: the worker view (parentPort/workerData/threadId,
+   *  isMainThread:false) is per-thread state, while a shared shim would
+   *  snapshot ONE view for every importer in the process (module records are
+   *  URL-keyed). Distinct URL → distinct record → each worker's ESM import
+   *  of `node:worker_threads` binds ITS view (natives/worker.ts registers it
+   *  via globalThis.__ocWorkerViews before the graph builds). */
+  const isWorkerThreadsId = (id: string): boolean =>
+    id === 'worker_threads' || id === 'node:worker_threads';
 
   /** ONE URL per path per process (node's module map is process-wide): a
    *  module reached from two graphs resolves to ONE URL — one V8 module
@@ -538,15 +552,17 @@ export function makeEsmGraphImporter(deps: EsmGraphDeps): EsmGraphImporter {
   /** Rewrite one ESM module: minimal, range-based text edits. EVERY static
    *  specifier (relative included) is rewritten to an explicit transport URL —
    *  blob: URLs cannot resolve relative specifiers, so nothing may be left
-   *  to V8's URL-space mirroring. */
-  async function rewriteModule(mod: PendingModule): Promise<string> {
+   *  to V8's URL-space mirroring. `wtid` (when set) marks modules of an
+   *  in-process WORKER's graph: worker_threads binds the per-worker view and
+   *  dynamic imports keep the worker context. */
+  async function rewriteModule(mod: PendingModule, wtid: number | null = null): Promise<string> {
     const src = mod.source;
     const edits: Array<{ start: number; end: number; text: string }> = [];
     let metaUsed = false;
 
     for (const s of collectStaticSpecifiers(mod.ast)) {
       const r = resolver.resolve(s.value, mod.path);
-      const url = await urlFor(r);
+      const url = await urlFor(r, wtid);
       if (r.kind === 'json' && s.isStaticDecl) {
         // The JSON shim is a JS module — the `with { type: 'json' }`
         // attribute must go (replacing through the declaration end drops it).
@@ -577,9 +593,15 @@ export function makeEsmGraphImporter(deps: EsmGraphDeps): EsmGraphImporter {
       if (node.type === 'ImportExpression') {
         const arg = node.source ?? node.argument;
         const argText = arg ? src.slice(arg.start, arg.end) : '';
+        // In a worker's graph, dynamic imports stay IN the worker context —
+        // a worker module's import() must resolve worker_threads to the
+        // worker view, same as its static imports.
+        const call = wtid !== null
+          ? `globalThis.__ocDynImportW(${wtid}, ${JSON.stringify(dirnameOf(mod.path))}, ${argText})`
+          : `globalThis.__ocDynImport(${JSON.stringify(dirnameOf(mod.path))}, ${argText})`;
         edits.push({
           start: node.start, end: node.end,
-          text: `globalThis.__ocDynImport(${JSON.stringify(dirnameOf(mod.path))}, ${argText})`,
+          text: call,
         });
       } else if (node.type === 'MetaProperty' && node.meta?.name === 'import' && node.property?.name === 'meta') {
         metaUsed = true;
@@ -607,6 +629,12 @@ export function makeEsmGraphImporter(deps: EsmGraphDeps): EsmGraphImporter {
     if (metaUsed) {
       out = `const __ocImportMeta = globalThis.__ocMetaFor(${JSON.stringify(mod.path)});\n` + out;
     }
+    // TEMPORARY audit: evaluation order of guest modules — the last line
+    // before a stall names the module whose top-level code pends forever.
+    out = `;(globalThis).__ocEvalLog&&__ocEvalLog(${JSON.stringify(mod.path)});\n` + out;
+    // TEMPORARY audit pair: evaluation COMPLETION (start-without-done = the
+    // module whose top-level code or TLA never settles).
+    out += `\n;(globalThis).__ocEvalDone&&__ocEvalDone(${JSON.stringify(mod.path)});`;
     return out;
   }
 
@@ -635,6 +663,31 @@ export function makeEsmGraphImporter(deps: EsmGraphDeps): EsmGraphImporter {
       }
     } catch { /* the error surfaces at shim evaluation, not graph build */ }
     let text = `const __m = globalThis.__ocEsmBuiltin(${JSON.stringify(id)});\nexport default __m;\n`;
+    for (const k of keys) text += `export const ${k} = __m[${JSON.stringify(k)}];\n`;
+    return text;
+  }
+
+  /** Per-worker variant of the builtin shim: resolves through
+   *  globalThis.__ocEsmWorkerBuiltin(threadId, id) so worker_threads binds
+   *  the importing WORKER's view. Key set mirrors the main module's. */
+  function workerBuiltinShimText(id: string, threadId: number): string {
+    let keys: string[] = [];
+    try {
+      const views: any = (globalThis as any).__ocWorkerViews;
+      const view = views?.get?.(threadId);
+      if (view && (typeof view === 'object' || typeof view === 'function')) {
+        keys = Object.keys(view).filter(isSafeIdent);
+      }
+    } catch { /* fall back to the builtin's own keys below */ }
+    if (keys.length === 0) {
+      try {
+        const m = deps.requireBuiltin(id);
+        if (m !== null && m !== undefined && (typeof m === 'object' || typeof m === 'function')) {
+          keys = Object.keys(m).filter(isSafeIdent);
+        }
+      } catch { /* surfaces at shim evaluation */ }
+    }
+    let text = `const __m = globalThis.__ocEsmWorkerBuiltin(${JSON.stringify(threadId)}, ${JSON.stringify(id)});\nexport default __m;\n`;
     for (const k of keys) text += `export const ${k} = __m[${JSON.stringify(k)}];\n`;
     return text;
   }
@@ -702,11 +755,15 @@ export function makeEsmGraphImporter(deps: EsmGraphDeps): EsmGraphImporter {
 
   // ---- graph build ---------------------------------------------------------
 
-  async function buildGraph(entryPath: string): Promise<string> {
+  async function buildGraph(entryPath: string, wtid: number | null = null): Promise<string> {
     // Already-served module → its URL (node's module-map semantics: one
     // evaluation per resolved path per process).
     if (published.has(entryPath)) return urlOf(entryPath);
-
+    // A worker's graph must NOT reuse a main-graph module URL for its entry:
+    // the entry's own imports may bind the worker view. Worker graphs mint
+    // from scratch only when the entry is not yet published; shared deps
+    // (already-published paths) keep their URLs — node's per-thread module
+    // map caches only SOURCE, and our shims are the sole per-view surface.
     const modules = new Map<string, PendingModule>();
 
     // phase 1 — resolve + parse walk (skipping already-published paths: their
@@ -762,7 +819,7 @@ export function makeEsmGraphImporter(deps: EsmGraphDeps): EsmGraphImporter {
     for (const path of order) {
       if (published.has(path)) continue;
       const mod = modules.get(path)!;
-      const text = await rewriteModule(mod);
+      const text = await rewriteModule(mod, wtid);
       const urls = await serving.serve(processNonce, new Map([[path, text]]));
       const url = urls.get(path);
       if (!url) throw new Error(`OpenContainer: ESM transport returned no URL for ${path}`);
@@ -778,8 +835,15 @@ export function makeEsmGraphImporter(deps: EsmGraphDeps): EsmGraphImporter {
    *  - esm NOT yet minted → cycle back-edge / forward reference → a
    *    dynamic-import shim (snapshot re-exports of the real module — the
    *    documented divergence for cyclic ESM graphs). */
-  async function urlFor(r: { kind: string; path?: string; id?: string }): Promise<string> {
-    if (r.kind === 'builtin') return ensureShim(builtinShimPath(r.id!), builtinShimText(r.id!));
+  async function urlFor(r: { kind: string; path?: string; id?: string }, wtid: number | null = null): Promise<string> {
+    if (r.kind === 'builtin') {
+      // A worker's graph binds worker_threads to THAT worker's view via a
+      // per-worker shim URL (see workerBuiltinShimPath).
+      if (wtid !== null && isWorkerThreadsId(r.id!)) {
+        return ensureShim(workerBuiltinShimPath(r.id!, wtid), workerBuiltinShimText(r.id!, wtid));
+      }
+      return ensureShim(builtinShimPath(r.id!), builtinShimText(r.id!));
+    }
     if (r.kind === 'cjs') return ensureShim(cjsShimPath(r.path!), cjsShimText(r.path!));
     if (r.kind === 'json') return ensureShim(jsonShimPath(r.path!), jsonShimText(r.path!));
     if (urlByPath.has(r.path!)) return urlByPath.get(r.path!)!;
@@ -857,6 +921,35 @@ export function makeEsmGraphImporter(deps: EsmGraphDeps): EsmGraphImporter {
     }
   }
 
+  /** Dynamic import FROM AN IN-PROCESS WORKER'S MODULE (see
+   *  natives/worker.ts): identical resolution to dynamicImport, but the
+   *  resulting graph binds `worker_threads` to the importing worker's view
+   *  (per-worker shim URLs) so parentPort/workerData/threadId are the
+   *  worker's own — not the main thread's. */
+  async function dynamicImportWorker(threadId: number, parentDir: string, spec: string): Promise<any> {
+    armImport();
+    try {
+      const r = resolver.resolveFromDir(spec, parentDir);
+      if (r.kind === 'builtin') {
+        if (isWorkerThreadsId(r.id!)) {
+          return await import(/* @vite-ignore */ await ensureShim(
+            workerBuiltinShimPath(r.id!, threadId), workerBuiltinShimText(r.id!, threadId)));
+        }
+        return await import(/* @vite-ignore */ await ensureShim(builtinShimPath(r.id!), builtinShimText(r.id!)));
+      }
+      if (r.kind === 'cjs') {
+        return await import(/* @vite-ignore */ await ensureShim(cjsShimPath(r.path!), cjsShimText(r.path!)));
+      }
+      if (r.kind === 'json') {
+        return await import(/* @vite-ignore */ await ensureShim(jsonShimPath(r.path!), jsonShimText(r.path!)));
+      }
+      const url = await buildGraph(r.path!, threadId);
+      return await import(/* @vite-ignore */ url);
+    } finally {
+      disarmImport();
+    }
+  }
+
   /** Mint a single shim module (no static deps — always mintable) and
    *  return its URL. */
   async function ensureShim(shimPath: string, text: string): Promise<string> {
@@ -869,7 +962,7 @@ export function makeEsmGraphImporter(deps: EsmGraphDeps): EsmGraphImporter {
     return url;
   }
 
-  return { importEntry, dynamicImport };
+  return { importEntry, dynamicImport, dynamicImportWorker };
 }
 
 // Re-export helpers used by the wiring layer.

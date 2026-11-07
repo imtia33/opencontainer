@@ -13,13 +13,33 @@
  * requests) increments a global counter while in flight; the loop-drain
  * watcher (boot.ts kernelLoopEmpty) and hasLiveHandles() treat
  * `netPendingCount() > 0` as a live handle, exactly like a uv req.
+ *
+ * P2 (2026-11-06, found by the Vite-workflow E2E): the wrapper's counter
+ * releases when the fetch PROMISE settles — i.e. at response HEADERS. The
+ * BODY is then streamed through ReadableStreamDefaultReader.read() promises
+ * that the census cannot see — a slow tarball download (the multi-second
+ * part of any npm install) looked like an empty loop and the drain watcher
+ * killed npm mid-reify with "Exit handler never called!". A body being read
+ * is now counted too: the http client marks the reader open at getReader()
+ * and closed at end/destroy (net-pending body accounting).
  */
 
 let pending = 0;
+let pendingBodies = 0;
 
 /** Number of guest network ops currently in flight (loop-handle census). */
 export function netPendingCount(): number {
-  return pending;
+  return pending + pendingBodies;
+}
+
+/** Mark a response body as being consumed (open reader → live socket). */
+export function netBodyOpen(): void {
+  pendingBodies++;
+}
+
+/** Mark a response body as fully consumed or aborted (reader released). */
+export function netBodyClose(): void {
+  if (pendingBodies > 0) pendingBodies--;
 }
 
 /**

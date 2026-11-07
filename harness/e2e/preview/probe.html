@@ -1,0 +1,11 @@
+<!doctype html><body>probe</body>
+<script>
+try {
+  window.parent.postMessage({ type: 'PROBE_ALIVE', hasSW: 'serviceWorker' in navigator, controller: !!navigator.serviceWorker?.controller }, '*');
+  navigator.serviceWorker?.register('/pkg/sw.js')
+    .then(r => window.parent.postMessage({ type: 'PROBE_REG_OK', scope: r.scope, state: r.installing?.state ?? r.active?.state ?? 'none' }, '*'))
+    .catch(e => window.parent.postMessage({ type: 'PROBE_REG_FAIL', error: String(e), name: e?.name, hasSWApi: 'serviceWorker' in navigator }, '*'));
+} catch (e) {
+  window.parent.postMessage({ type: 'PROBE_THROW', error: String(e) }, '*');
+}
+</script>

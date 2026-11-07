@@ -33,6 +33,12 @@ export function makeWorkerBinding(): Binding {
   /** Active in-process workers by threadId (terminate/exit bookkeeping). */
   const workers = new Map<number, WorkerImpl>();
 
+  /** Per-worker `worker_threads` views (threadId → view), published for the
+   *  ESM graph's per-worker builtin shim (__ocEsmWorkerBuiltin) and the
+   *  worker-graph dynamic importer (__ocDynImportW). Registered before the
+   *  worker's module graph builds, removed when the worker finishes. */
+  if (!(g.__ocWorkerViews instanceof Map)) g.__ocWorkerViews = new Map();
+
   class WorkerImpl {
     /** Main-side control port — the vendored Worker wires kOnMessage here. */
     messagePort: EmuPort;
@@ -59,6 +65,11 @@ export function makeWorkerBinding(): Binding {
       }
       this.threadId = nextThreadId++;
       this.threadName = name ?? `WorkerThread-${this.threadId}`;
+      try {
+        if ((globalThis as any).process?.env?.OC_TRACE_WORKERS) {
+          console.error(`[worker] new Worker ${String(_url).slice(0, 100)}`);
+        }
+      } catch { /* diagnostic only */ }
       const [mainSide, threadSide] = EmuPort.pair();
       this.messagePort = mainSide;
       this.threadSide = threadSide;
@@ -88,6 +99,8 @@ export function makeWorkerBinding(): Binding {
       const filename = String(msg.filename ?? '');
       const workerData = (msg as any).workerData;
       const publicPort = (msg as any).publicPort ?? null; // EmuPort (worker side)
+      const trace = (globalThis as any).__ocEvalLog; // reuse the stderr diag channel
+      trace?.(`[worker] loadScript ${filename} (publicPort=${!!publicPort})`);
       void this.bootScript(filename, workerData, publicPort);
     }
 
@@ -112,6 +125,10 @@ export function makeWorkerBinding(): Binding {
         threadId: this.threadId,
         threadName: this.threadName,
         resourceLimits: null,
+        // Nested worker spawn from INSIDE a worker (rolldown's wasi-worker.mjs
+        // imports { Worker } and re-exports it for emnapi's nested pools) —
+        // the same in-process WorkerImpl, worker_threads' node semantics.
+        Worker: WorkerImpl,
         MessagePort: EmuPort,
         MessageChannel: EmuMessageChannel,
         BroadcastChannel: (globalThis as any).BroadcastChannel ?? class BroadcastChannel {},
@@ -125,7 +142,13 @@ export function makeWorkerBinding(): Binding {
         setEnvironmentData(this: any, k: any, v: any) { if (v === undefined) this.environmentData.delete(k); else this.environmentData.set(k, v); },
       };
       (view as any).default = view;
+      // Publish the view BEFORE the script loads: the ESM graph's per-worker
+      // builtin shim (esm-graph.ts workerBuiltinShimText → __ocEsmWorkerBuiltin)
+      // and worker-graph dynamic imports resolve it by threadId. (The CJS
+      // swap below still covers synchronously-required CJS worker scripts.)
+      g.__ocWorkerViews.set(this.threadId, view);
       const restore = swapBuiltin('worker_threads', view);
+      const swapped = (globalThis as any).__ocWorkerThreadsSwapped === true;
       // Worker-script dispatch window: process.exit() inside the script's
       // top level or its parentPort handlers means "worker exits", never
       // "the whole process exits" (ownsProcessState semantics).
@@ -135,7 +158,57 @@ export function makeWorkerBinding(): Binding {
         if (typeof requireFile !== 'function') {
           throw new Error('OpenContainer: kernel file-require hook not wired (worker boot)');
         }
-        requireFile(filename);
+        // ESM worker scripts (.mjs or a "type":"module" package) load through
+        // the ESM graph — napi-rs wasi bindings (e.g. @rolldown/binding-wasm32-wasi's
+        // wasi-worker.mjs) are ESM; loading them as CJS died with a syntax error
+        // and the whole wasm thread pool exited 1 before it ever ran.
+        let esm = filename.endsWith('.mjs') || filename.endsWith('.mts');
+        if (!esm) {
+          try {
+            const pathMod = g.__ocRealmRequire?.('path');
+            const fsMod = g.__ocRealmRequire?.('fs');
+            let dir = pathMod?.dirname?.(filename) ?? '';
+            for (let i = 0; i < 6 && dir && dir !== '/'; i++) {
+              try {
+                const pkg = JSON.parse(fsMod.readFileSync(pathMod.join(dir, 'package.json'), 'utf8'));
+                if (pkg && pkg.type === 'module') { esm = true; break; }
+              } catch { /* keep walking up */ }
+              const parent = pathMod.dirname(dir);
+              if (parent === dir) break;
+              dir = parent;
+            }
+          } catch { /* best-effort type sniff */ }
+        }
+        const dynImport = g.__ocDynImport;
+        const dynImportW = g.__ocDynImportW;
+        if (esm && typeof dynImportW === 'function') {
+          const pathMod = g.__ocRealmRequire?.('path');
+          const parentDir = pathMod?.dirname?.(filename) ?? '.';
+          // Fire-and-forget like vite's bin: the worker's evaluation errors
+          // surface through the 'error'/'exit' events (the pool handles them).
+          // Worker-graph import: worker_threads inside this graph binds THIS
+          // worker's view (per-worker shim URL) — a plain dynImport would
+          // evaluate the graph AFTER the CJS swap is restored, binding the
+          // MAIN view (parentPort=null, workerData=undefined) and leaving the
+          // worker deaf (found via rolldown's wasi-worker.mjs pool).
+          const trace = (globalThis as any).__ocEvalLog;
+          trace?.(`[worker] dynImportW start ${filename} (view published, tid=${this.threadId})`);
+          dynImportW(this.threadId, parentDir, filename).then(
+            () => trace?.(`[worker] dynImportW settled OK ${filename}`),
+            (e: any) => trace?.(`[worker] dynImportW REJECTED ${filename}: ${e?.message ?? e}`),
+          );
+        } else if (esm && typeof dynImport === 'function') {
+          const pathMod = g.__ocRealmRequire?.('path');
+          const parentDir = pathMod?.dirname?.(filename) ?? '.';
+          const trace = (globalThis as any).__ocEvalLog;
+          trace?.(`[worker] dynImport start ${filename} (fallback, swapped=${swapped})`);
+          dynImport(parentDir, filename).then(
+            () => trace?.(`[worker] dynImport settled OK ${filename}`),
+            (e: any) => trace?.(`[worker] dynImport REJECTED ${filename}: ${e?.message ?? e}`),
+          );
+        } else {
+          requireFile(filename);
+        }
         this.threadSide.postMessage({ type: 'upAndRunning' });
       } catch (err: any) {
         // Boot failures surface as a non-zero worker exit — the pool's
@@ -159,6 +232,7 @@ export function makeWorkerBinding(): Binding {
       if (this.exited) return;
       this.exited = true;
       workers.delete(this.threadId);
+      try { (g as any).__ocWorkerViews?.delete(this.threadId); } catch { /* already gone */ }
       try { this.threadSide.close(); } catch { /* already closed */ }
       try { this.messagePort.close(); } catch { /* already closed */ }
       try { this.onexit?.(code, null, null); } catch { /* listener crash — nothing more we can do */ }
@@ -175,10 +249,12 @@ export function makeWorkerBinding(): Binding {
       bm.exports = exportsObj;
       bm.loaded = true;
       bm.loading = false;
+      (g as any).__ocWorkerThreadsSwapped = id === 'worker_threads' ? true : (g as any).__ocWorkerThreadsSwapped;
       return () => {
         bm.exports = saved.exports;
         bm.loaded = saved.loaded;
         bm.loading = saved.loading;
+        (g as any).__ocWorkerThreadsSwapped = false;
       };
     } catch {
       return () => {};

@@ -16,10 +16,18 @@ import { $ } from 'bun';
 
 const entries: Array<[string, string]> = [
   ['src/packages/opencontainer/index.ts', 'dist/opencontainer.mjs'],
+  // The vite plugin runs in NODE (not the browser) — its own entry.
+  ['src/packages/opencontainer/vite-plugin.ts', 'dist-plugins/vite.mjs'],
 ];
 
 for (const [entry, outfile] of entries) {
-  await $`bun build ${entry} --target=browser --format=esm --minify --outfile=${outfile}`;
+  const external = outfile.includes('vite') ? '--external' : '';
+  if (external) {
+    // Node-only entry: keep node: imports real (no bundling of builtins).
+    await $`bun build ${entry} --target=node --format=esm --outfile=${outfile}`;
+  } else {
+    await $`bun build ${entry} --target=browser --format=esm --minify --outfile=${outfile}`;
+  }
 }
 
 // Declarations via the app repo's TypeScript (tsconfig.dist.json pins

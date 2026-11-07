@@ -1,0 +1,95 @@
+<!doctype html>
+<!-- Experiment orchestrator (consumer origin 127.0.0.1:8090).
+     Runs E1/E2 via the cross-origin bridge iframe (8091) and E3/E4 with the
+     root-scope consumer SW. Parks everything in window.__ocResult.
+     Harness rules: log by APPENDING text nodes (body.textContent += wipes
+     iframes); keep iframe refs in variables (never re-query by index). -->
+<body style="font-family: monospace; white-space: pre-wrap">running…<pre id="log"></pre></body>
+<script>
+window.__ocResult = null;
+const out = {};
+const log = (s) => { document.getElementById('log').appendChild(document.createTextNode(s + '\n')); };
+
+function makeIframe(src, sandbox) {
+  const f = document.createElement('iframe');
+  f.src = src;
+  if (sandbox) f.setAttribute('sandbox', sandbox);
+  f.style.width = '300px'; f.style.height = '100px';
+  document.body.appendChild(f);
+  return f;
+}
+
+const waitFor = (check, timeout = 15000) => new Promise((resolve, reject) => {
+  const t0 = Date.now();
+  const iv = setInterval(() => {
+    let v; try { v = check(); } catch (e) { v = null; }
+    if (v) { clearInterval(iv); resolve(v); }
+    else if (Date.now() - t0 > timeout) { clearInterval(iv); reject(new Error('timeout')); }
+  }, 50);
+});
+
+const listenOnce = (type, timeout = 12000) => new Promise((resolve) => {
+  const onMsg = (ev) => {
+    if (ev.data && ev.data.type === type) { window.removeEventListener('message', onMsg); resolve(ev.data); }
+  };
+  window.addEventListener('message', onMsg);
+  setTimeout(() => { window.removeEventListener('message', onMsg); resolve({ error: 'timeout' }); }, timeout);
+});
+
+void (async () => {
+  // ---- E1/E2: cross-origin bridge iframe --------------------------------
+  const e12 = await Promise.race([
+    (async () => {
+      const hostMsg = listenOnce('HOST_RESULTS', 8000);
+      const prevMsg = listenOnce('E1_PREVIEW', 12000);
+      makeIframe('http://127.0.0.1:8091/host.html');
+      const results = await hostMsg;
+      const preview = await prevMsg;
+      return { results, preview };
+    })(),
+    new Promise((r) => setTimeout(() => r({ results: { error: 'timeout' }, preview: null }), 14000)),
+  ]);
+  out.e1 = e12.results?.e1;
+  out.e2 = e12.results?.e2;
+  out.e1_preview = e12.preview ?? null;
+  log('E1: ' + JSON.stringify(out.e1));
+  log('E2: ' + JSON.stringify(out.e2));
+  log('E1 preview: ' + JSON.stringify(out.e1_preview));
+
+  // ---- E3/E4: root-scope consumer SW, per-client port binding ------------
+  for (const r of await navigator.serviceWorker.getRegistrations()) await r.unregister();
+  const reg = await navigator.serviceWorker.register('/sw.js', { scope: '/' });
+  await waitFor(() => reg.active || navigator.serviceWorker.controller, 10000).catch(() => {});
+  await new Promise((r) => setTimeout(r, 300)); // claim() to propagate
+
+  const e3Promise = listenOnce('E3_PAGE', 12000);
+  const e3Frame = makeIframe('/p/5173/');
+  out.e3 = await e3Promise;
+
+  const reloadPromise = listenOnce('E3_PAGE', 12000);
+  e3Frame.src = '/deep/link?x=1'; // parent-initiated full navigation, NO /p/ prefix
+  out.e3_reload = await reloadPromise;
+
+  const e4Promise = listenOnce('E3_PAGE', 12000);
+  makeIframe('/p/4173/', 'allow-scripts allow-forms allow-popups allow-modals allow-storage-access-by-user-activation allow-same-origin');
+  out.e4 = await e4Promise;
+
+  const parse = (v) => { try { return v ? JSON.parse(v) : null; } catch { return null; } };
+  out.summary = {
+    e1_crossOriginSwRegistration: out.e1?.ok === true,
+    e1_active: out.e1?.active === true,
+    e2_wideScopeRejected: out.e2?.ok === false,
+    e2_error: out.e2?.error ?? null,
+    e1_cdnPreviewServed: out.e1_preview?.port === 5173,
+    e3_navigatePrefix: parse(out.e3?.route)?.port === 5173,
+    e3_absoluteAssetRouted: parse(out.e3?.route)?.port === 5173 && parse(out.e3?.route)?.src === 'client',
+    e3_fetchRouted: parse(out.e3?.data)?.port === 5173,
+    e3_pushStateFetchRouted: parse(out.e3?.afterPush)?.port === 5173,
+    e3_parentInitiatedDeepLink: parse(out.e3_reload?.route)?.port === 5173,
+    e3_reloadSrc: parse(out.e3_reload?.route)?.src ?? null,
+    e4_sandboxedIframeRouted: parse(out.e4?.route)?.port === 4173,
+  };
+  window.__ocResult = out;
+  log(JSON.stringify(out.summary, null, 1));
+})();
+</script>

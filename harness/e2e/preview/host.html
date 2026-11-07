@@ -1,0 +1,49 @@
+<!doctype html>
+<!-- CDN-stand-in bridge page: runs on the "CDN" origin (127.0.0.1:8091).
+     E1: registers /pkg/sw.js (default scope /pkg/) from a CROSS-ORIGIN iframe.
+     E2: tries /pkg/sw.js with scope '/' — must fail (no Service-Worker-Allowed).
+     Then loads /pkg/p/5173/ in a child iframe and relays the result up.
+     NOTE: never await navigator.serviceWorker.ready here — this page sits
+     OUTSIDE the /pkg/ scope, so ready never resolves (harness lesson). -->
+<script>
+const results = {};
+const post = (msg) => window.parent.postMessage(msg, '*');
+
+void (async () => {
+  try {
+    const reg = await navigator.serviceWorker.register('/pkg/sw.js');
+    // bounded wait for activation (no .ready — out-of-scope page)
+    await new Promise((resolve) => {
+      if (reg.active) return resolve();
+      const t = setTimeout(resolve, 3000);
+      reg.addEventListener('updatefound', () => {
+        const w = reg.installing ?? reg.waiting;
+        w?.addEventListener?.('statechange', () => { if (reg.active) { clearTimeout(t); resolve(); } });
+      });
+      const iv = setInterval(() => { if (reg.active) { clearInterval(iv); clearTimeout(t); resolve(); } }, 100);
+    });
+    results.e1 = { ok: true, scope: reg.scope, active: !!reg.active };
+  } catch (err) {
+    results.e1 = { ok: false, error: String(err) };
+  }
+
+  try {
+    await navigator.serviceWorker.register('/pkg/sw.js', { scope: '/' });
+    results.e2 = { ok: true, note: 'scope / ACCEPTED — Service-Worker-Allowed present?' };
+  } catch (err) {
+    results.e2 = { ok: false, error: String(err), expectedFail: true };
+  }
+
+  post({ type: 'HOST_RESULTS', results });
+
+  // load the CDN-scoped preview page and relay its report
+  window.addEventListener('message', (ev) => {
+    if (ev.data && ev.data.type === 'E1_PAGE') {
+      post({ type: 'E1_PREVIEW', page: ev.data });
+    }
+  });
+  const iframe = document.createElement('iframe');
+  iframe.src = '/pkg/p/5173/';
+  document.body.appendChild(iframe);
+})();
+</script>

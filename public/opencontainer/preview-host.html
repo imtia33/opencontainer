@@ -1,0 +1,87 @@
+<!doctype html>
+<!--
+  OpenContainer preview bridge page (Tier 2 — cross-origin SW embedding).
+
+  When the runtime assets come from a DIFFERENT origin (the jsDelivr CDN
+  default), the preview Service Worker must be registered on THAT origin —
+  service workers are same-origin-only for the registering page. This page,
+  served from the same origin as the SW, registers it inside a hidden iframe
+  and then relays SW ⇄ host-page traffic across the origins:
+
+      SW ⇄ (MessagePort) ⇄ this page ⇄ (postMessage) ⇄ embedder page ⇄ runtime
+
+  Verified feasible empirically (harness/e2e/preview/sw-experiments.mjs,
+  experiment E1): a third-party iframe CAN register a SW on its own origin.
+
+  The embedder loads this page as a hidden iframe with ?sw=<sw-path> and
+  talks to it with { type: 'oc-bridge-*' } messages. Nothing here talks to
+  the network beyond registering the SW.
+-->
+<script>
+(function () {
+  var params = new URLSearchParams(location.search);
+  var swPath = params.get('sw') || '/preview-sw.js';
+  var hostOrigin = params.get('origin') || '*';
+  var pending = [];
+  var ready = false;
+  var failReason = null;
+
+  function toHost(msg, transfer) {
+    try { parent.postMessage(msg, hostOrigin, transfer || []); } catch (e) { /* host gone */ }
+  }
+
+  // ---- 1. register the SW on THIS origin -------------------------------
+  navigator.serviceWorker.register(swPath).then(function (reg) {
+    // Bounded activation wait — this page may sit OUTSIDE the SW scope, so
+    // navigator.serviceWorker.ready would hang forever (harness lesson).
+    return new Promise(function (resolve) {
+      if (reg.active) return resolve();
+      var iv = setInterval(function () {
+        if (reg.active) { clearInterval(iv); clearTimeout(t); resolve(); }
+      }, 100);
+      var t = setTimeout(function () { clearInterval(iv); resolve(); }, 4000);
+    });
+  }).then(function () {
+    ready = true;
+    toHost({ type: 'oc-bridge-ready' });
+    // deliver anything the host sent while we were booting
+    for (var i = 0; i < pending.length; i++) deliver(pending[i]);
+    pending.length = 0;
+  }).catch(function (err) {
+    failReason = String(err && err.message || err);
+    toHost({ type: 'oc-bridge-failed', error: failReason });
+  });
+
+  // ---- 2. host ⇄ SW relay ----------------------------------------------
+  // Host messages: { type: 'oc-bridge-attach', sid } + [port]. The port is
+  // the runtime's private pipe; we hand it to the SW (oc-attach).
+  window.addEventListener('message', function (ev) {
+    var m = ev.data;
+    if (!m || typeof m !== 'object') return;
+    if (m.type === 'oc-bridge-attach') {
+      var port = ev.ports[0] || null;
+      if (!port) return;
+      if (!ready) { pending.push({ data: m, port: port }); return; }
+      deliver({ data: m, port: port });
+    }
+  });
+
+  function deliver(entry) {
+    var m = entry.data;
+    var port = entry.port;
+    var sw = navigator.serviceWorker.controller;
+    if (!sw) {
+      toHost({ type: 'oc-bridge-failed', error: 'service worker not controlling the bridge page' });
+      return;
+    }
+    try {
+      sw.postMessage({ type: m.type === 'oc-bridge-attach' ? 'oc-attach' : m.type, sid: m.sid }, [port]);
+    } catch (e) {
+      toHost({ type: 'oc-bridge-failed', error: 'attach failed: ' + String(e && e.message || e) });
+    }
+  }
+
+  // SW → host relays (control messages like ws open-failed) arrive on the
+  // attached ports, not here — the runtime's own port speaks oc-ws-*.
+})();
+</script>

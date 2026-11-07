@@ -97,8 +97,71 @@ interface RpcMsg {
   [k: string]: any;
 }
 
+// The kernel worker's own postMessage is its RPC lifeline to the host.
+// Guest worker_threads scripts legitimately assign onto the worker global
+// (rolldown's wasi-worker.mjs: Object.assign(globalThis, { self, postMessage,
+// require, importScripts })) — node worker globals have none of those as
+// accessors, so the assigns define fresh globals. In a BROWSER worker,
+// `self` is a getter-only accessor (the assign THROWS in strict mode — found
+// via vite 8's rolldown wasm32-wasi binding: every pool worker died with
+// "Cannot set property self of #<WorkerGlobalScope> which has only a
+// getter"), and `postMessage`/`onmessage` are the kernel's own channel.
+// Normalized BEFORE any guest code runs:
+//   - self → own WRITABLE data property (guest assigns work, like node);
+//   - the host postMessage is captured so guest shadowing is harmless;
+//   - RPC dispatch rides addEventListener, which no onmessage assignment
+//     can remove.
+const nativePostMessage: (msg: RpcMsg) => void =
+  typeof (self as any).postMessage === 'function'
+    ? (self as any).postMessage.bind(self)
+    : (msg: RpcMsg) => { throw new Error(`OpenContainer: worker RPC broken — cannot post ${msg?.type}`); };
+try {
+  // `self` on a browser worker is a getter-only accessor sitting on a
+  // PROTOTYPE — DedicatedWorkerGlobalScope.prototype → WorkerGlobalScope
+  // .prototype (verified: NOT an own property, NOT on the direct prototype).
+  // Walk the chain; if the found accessor has no setter, shadow it with an
+  // own WRITABLE data property so guest `Object.assign(globalThis, {self…})`
+  // behaves exactly like node's worker globals (wasi-worker.mjs et al.).
+  let proto: any = globalThis;
+  let d: PropertyDescriptor | undefined;
+  while (proto !== null && d === undefined) {
+    proto = Object.getPrototypeOf(proto);
+    if (proto === null) break;
+    d = Object.getOwnPropertyDescriptor(proto, 'self');
+  }
+  if (d && d.get && !d.set) {
+    Object.defineProperty(globalThis, 'self', {
+      value: globalThis, writable: true, configurable: true, enumerable: true,
+    });
+  }
+} catch { /* exotic environment — keep the native accessor */ }
+
+// TEMP diagnostic (wasi-threads debugging): guest-side Atomics.wait calls,
+// traced through the IMMEDIATE host channel (post) — guest stdio is buffered
+// and is lost when the loop blocks, this trace is not.
+try {
+  const origWait = Atomics.wait;
+  (Atomics as any).wait = function (ta: any, index: any, value: any, timeout: any) {
+    try {
+      let shared = 'non-shared';
+      try { if (ta.buffer instanceof SharedArrayBuffer && SharedArrayBuffer !== ArrayBuffer) shared = 'SHARED'; } catch { /* */ }
+      post({
+        type: 'stdio', fd: 2,
+        chunk: `[oc-atomics] wait(${shared}, i=${index}, v=${value}, t=${timeout === undefined ? '∞' : timeout})\n`,
+      });
+    } catch { /* never break the call */ }
+    return origWait.call(Atomics, ta, index, value, timeout);
+  };
+} catch { /* Atomics frozen — skip tracing */ }
+
+// TEMP diagnostic: EmuPort (in-process worker port) message flow, same
+// immediate channel. Enabled by env OC_TRACE_PORTS=1 on the process.
+(globalThis as any).__ocWorkerMsgDebug = (s: string): void => {
+  try { post({ type: 'stdio', fd: 2, chunk: `[oc-port] ${s}\n` }); } catch { /* noop */ }
+};
+
 function post(msg: RpcMsg) {
-  (self as any).postMessage(msg);
+  nativePostMessage(msg);
 }
 
 // ---------------------------------------------------------------------------
@@ -276,6 +339,11 @@ function makeLazyStore() {
         if (rel.startsWith('amaro/') && !amaroReady) {
           throw new Error('OpenContainer: TypeScript support is still loading — retry in a moment');
         }
+        // TEMPORARY diag: what does this worker's store actually hold?
+        try {
+          const keys = [...sourceEntries.keys()];
+          (globalThis as any).__ocEvalLog?.(`store miss '${rel}': entries=${sourceEntries.size}, coreEntries=${coreEntryCount}, hasPrefixLib=${keys.filter((k) => k.startsWith('lib/')).length}, sample=${keys.slice(0, 3).join('|')}, undiciKeyPresent=${keys.includes('lib/internal/deps/undici/undici.js')}`);
+        } catch { /* noop */ }
         throw new Error(`OpenContainer: source not preloaded: ${path}`);
       }
       const text = storeDecoder.decode(entry.view);
@@ -437,9 +505,10 @@ interface OpfsPaths { dirs: string[]; files: Array<[string, Uint8Array]>; symlin
 async function opfsRoot(): Promise<any | null> {
   try {
     const root = await (navigator as any).storage?.getDirectory?.();
-    if (!root) return null;
+    if (!root) { diag('opfs: getDirectory() resolved falsy'); return null; }
     return await root.getDirectoryHandle(OPFS_ROOT_DIR, { create: true });
-  } catch {
+  } catch (e: any) {
+    diag(`opfs: opfsRoot threw: ${e && e.name}: ${e && e.message} (navigator=${typeof (globalThis as any).navigator}, getDirectory=${typeof (globalThis as any).navigator?.storage?.getDirectory})`);
     return null; // OPFS unavailable (sandboxed context) — in-session only.
   }
 }
@@ -462,10 +531,34 @@ function isEphemeralPath(p: string): boolean {
   return p.includes('/node_modules/');
 }
 
+/** Temporary diagnostics channel for the OPFS save path (keeper → host).
+ *  Rides the stdio message path ({type:'stdio'} has no 'error' case in the
+ *  host switch — plain 'error' posts are dropped silently). */
+function diag(message: string): void {
+  try {
+    post({ type: 'stdio', fd: 2, chunk: `[oc-diag] ${message}\n` });
+    post({ type: 'error', message: `[oc-diag] ${message}` });
+  } catch { /* noop */ }
+}
+
+/** TEMPORARY guest-module evaluation audit (esm-graph prologue → host).
+ *  The last module logged before a stall is the one whose top-level code
+ *  pends forever. */
+(globalThis as any).__ocEvalLog = (p: string): void => {
+  try { post({ type: 'stdio', fd: 2, chunk: `[oc-eval] ${p}\n` }); } catch { /* noop */ }
+};
+
+/** TEMPORARY: module evaluation COMPLETION audit — pairs with __ocEvalLog;
+ *  a logged start without a matching done names the module whose top-level
+ *  code (or top-level await) never settles. */
+(globalThis as any).__ocEvalDone = (p: string): void => {
+  try { post({ type: 'stdio', fd: 2, chunk: `[oc-eval✓] ${p}\n` }); } catch { /* noop */ }
+};
+
 async function saveTreeToOpfs(): Promise<void> {
-  if (!kernel) return;
+  if (!kernel) { diag('opfs: no kernel'); return; }
   const root = await opfsRoot();
-  if (!root) return;
+  if (!root) { diag('opfs: opfsRoot() returned null — getDirectory/getDirectoryHandle threw or unavailable'); return; }
   const tree = kernel.vfs.exportTree('/home');
   // Ephemeral filter BEFORE the manifest is built: node_modules is excluded
   // from dirs/files/symlinks, so the manifest never lists it, and the `live`
@@ -723,6 +816,28 @@ async function boot(msg: {
 
   wireVfsDeltas();
 
+  // TEMP diagnostic (OC_TRACE_IMMEDIATE=1): guest setImmediate calls —
+  // emnapi's async-work engine rides setImmediate; a work item that never
+  // executes (immediate never fires) or one whose callback never returns
+  // (wasm infinite loop) is the two failure shapes this separates.
+  if (msg.env && String((msg.env as any).OC_TRACE_IMMEDIATE) === '1') {
+    try {
+      const g: any = globalThis;
+      const orig = g.setImmediate;
+      let n = 0;
+      g.setImmediate = function (cb: any, ...a: any[]) {
+        const id = ++n;
+        post({ type: 'stdio', fd: 2, chunk: `[oc-imm] #${id} scheduled\n` });
+        return orig(function (this: any, ...args: any[]) {
+          post({ type: 'stdio', fd: 2, chunk: `[oc-imm] #${id} start\n` });
+          const r = cb.apply(this, args);
+          post({ type: 'stdio', fd: 2, chunk: `[oc-imm] #${id} done\n` });
+          return r;
+        }, ...a);
+      };
+    } catch { /* best-effort diagnostic */ }
+  }
+
   (globalThis as any).__oc = (globalThis as any).__oc ?? {};
   (globalThis as any).__oc.kernel = kernel;
 
@@ -829,7 +944,12 @@ function startRepl(): void {
 
 let booted = false;
 
-(self as any).onmessage = async (ev: MessageEvent<RpcMsg>) => {
+// RPC dispatch on addEventListener, NOT the onmessage property: guest
+// worker_threads scripts assign globalThis.onmessage (node semantics — the
+// worker owns the global), and a property assignment would otherwise
+// DETACH the kernel's host channel. An addEventListener handler can only be
+// removed by removeEventListener — guest assigns are harmless shadowing.
+async function handleRpcMessage(ev: MessageEvent<RpcMsg>): Promise<void> {
   const msg = ev.data;
   if (booting && msg.type !== 'boot') {
     earlyMessages.push(msg);
@@ -848,7 +968,7 @@ let booted = false;
             const queued = earlyMessages;
             earlyMessages = [];
             for (const m of queued) {
-              (self as any).onmessage({ data: m } as MessageEvent<RpcMsg>);
+              await handleRpcMessage({ data: m } as MessageEvent<RpcMsg>);
             }
           }
         }
@@ -959,6 +1079,7 @@ let booted = false;
         break;
       }
       case 'tcp-data': {
+        (globalThis as any).__ocDebugHook?.(`[worker] tcp-data connId=${msg.connId} ${msg.bytes?.length ?? 0}B kernel=${!!kernel}`);
         if (!kernel) break;
         const tcpB: any = kernel.natives.get('tcp_wrap');
         tcpB.deliverTcpData(msg.connId ?? -1, msg.bytes ?? new Uint8Array());
@@ -1004,6 +1125,8 @@ let booted = false;
       }
       case 'write-file': {
         if (!kernel) throw new Error('kernel not booted');
+        // content is a string OR raw bytes (runtime.writeFile accepts both;
+        // bytes must never be stringified — see its snapshot-corruption note).
         kernel.vfs.writeFile(msg.path ?? '/home/project/file.js', msg.content ?? '');
         post({ type: 'write-file-done', id: msg.id });
         break;
@@ -1197,4 +1320,8 @@ let booted = false;
   } finally {
     drainTicks();
   }
-};
+}
+
+self.addEventListener('message', (ev: MessageEvent<RpcMsg>) => {
+  void handleRpcMessage(ev);
+});

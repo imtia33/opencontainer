@@ -41,6 +41,10 @@ export type RuntimeEventMap = {
   processStart: (info: { pid: number; repl: boolean; background: boolean }) => void;
   fsChange: (event: { type: 'rename' | 'change'; filename: string | null }) => void;
   previewMessage: (message: unknown) => void;
+  /** Preview infrastructure report (v2): which distribution mode was chosen —
+   *  'root-scope' (full fidelity), 'scoped' (same-origin package path),
+   *  'cdn-bridge' (zero-integration CDN fallback) or 'none'. */
+  previewStatus: (info: { mode: 'root-scope' | 'scoped' | 'cdn-bridge' | 'none'; sid?: string; reason?: string }) => void;
 };
 
 /** Typed error for IDE filesystem RPCs (node-style code + path). */
@@ -120,6 +124,26 @@ function waitForActive(reg: ServiceWorkerRegistration): Promise<void> {
     });
     setTimeout(done, 3000);
   });
+}
+
+/** Per-boot preview session id — routes preview traffic to THIS runtime on
+ *  the shared SW (multi-tab determinism). Shape: 6 chars, letter-first, so
+ *  it can never be confused with a port number in preview URLs. */
+function previewSid(): string {
+  // The SW's URL contract is ^[a-z][a-z0-9]{3,11}$ — the FIRST character
+  // MUST be a letter. A digit-first sid (possible with the mixed alphabet)
+  // silently unroutes every preview fetch ("no route" — found via the
+  // same-origin harness, ~30% of sessions).
+  const letters = 'abcdefghjkmnpqrstuvwxyz';
+  const alphabet = letters + '23456789';
+  let sid = '';
+  const rand = new Uint8Array(6);
+  (globalThis as any).crypto?.getRandomValues?.(rand);
+  for (let i = 0; i < 6; i++) {
+    const src = i === 0 ? letters : alphabet;
+    sid += src[(rand[i] ?? Math.floor(Math.random() * 256)) % src.length];
+  }
+  return sid;
 }
 
 async function resolveWorkerUrl(base: string): Promise<string> {
@@ -268,6 +292,15 @@ export class OpenContainerRuntime {
   private previewRegistered = false;
   private previewRegistration: ServiceWorkerRegistration | null = null;
   private previewScript: string | null = null;
+  /** Preview v2: per-boot session id routing preview traffic to THIS runtime
+   *  (multi-tab safe), the private pipe to the preview SW, the distribution
+   *  mode and the URL base preview pages live under. */
+  private previewSid = '';
+  private previewBridge: MessagePort | null = null;
+  private previewMode: 'root-scope' | 'scoped' | 'cdn-bridge' | 'none' = 'none';
+  private previewBase: string | null = null;
+  /** Hidden Tier-2 bridge iframe (cdn-bridge mode only). */
+  private previewHostFrame: HTMLIFrameElement | null = null;
 
   constructor(events: RuntimeEvents = {}, options: RuntimeOptions = {}) {
     this.events = events;
@@ -550,6 +583,9 @@ export class OpenContainerRuntime {
           this.ports.set(port, { pid: proc.pid });
           this.notifyPortOwnership(port, true);
           this.broadcastPorts();
+          // A fresh listener is the moment preview traffic starts — the SW
+          // may have restarted since boot (its bridge table is ephemeral).
+          this.attachPreviewBridge();
           this.emit('listen', { port, pid: proc.pid });
         }
         break;
@@ -809,6 +845,22 @@ export class OpenContainerRuntime {
     proc.worker.postMessage({ type: 'tcp-connected', reqId: msg.reqId, status: 0 });
   }
 
+  /** (Re)attach our private bridge pipe to the preview SW. Idempotent —
+   *  safe on every SW restart announcement and every listen event. */
+  private attachPreviewBridge(fallbackWorker?: ServiceWorker | null): void {
+    if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return;
+    if (!this.previewSid) return;
+    try {
+      const channel = new MessageChannel();
+      this.previewBridge?.close?.();
+      this.previewBridge = channel.port1;
+      this.previewBridge.onmessage = (ev: MessageEvent) => this.handlePreviewBridgeMessage(ev);
+      const sw = (navigator as any)?.serviceWorker?.controller
+        ?? fallbackWorker ?? this.previewRegistration?.active;
+      sw?.postMessage({ type: 'oc-attach', sid: this.previewSid }, [channel.port2]);
+    } catch { /* SW gone — preview degraded */ }
+  }
+
   /** Preview bridge: SW/page hands us a raw virtual connection to a port.
    *  `initialBytes` is the client's request head+body (the SW builds the full
    *  HTTP/1.1 wire bytes and sends them with the connection request). */
@@ -989,13 +1041,20 @@ export class OpenContainerRuntime {
    *  delta SOURCE (fan-out skips the source). Skipping the write-file RPC
    *  made host-written files vanish from OPFS on the next reload while
    *  guest-written files (real deltas) survived. */
-  async writeFile(path: string, content: string): Promise<void> {
+  async writeFile(path: string, content: string | Uint8Array): Promise<void> {
     const target = this.keeper ?? this.processes.values().next().value!;
+    // Byte content must stay BYTES through BOTH channels: the keeper RPC and
+    // the host snapshot. A Uint8Array coerced into TextEncoder.encode()
+    // becomes "123,10,32,…" (the array's toString) — the keeper got the real
+    // bytes while every process hydrated from the snapshot read garbage
+    // (found via a JSONParseError in npm reading a host-written
+    // package.json).
+    const bytes = typeof content === 'string' ? new TextEncoder().encode(content) : content;
     if (target && !target.exited) {
-      await this.postTo(target, { type: 'write-file', path, content });
+      await this.postTo(target, { type: 'write-file', path, content: bytes });
     }
     this.applyDeltas(target, [
-      { type: 'write', path, data: new TextEncoder().encode(content) },
+      { type: 'write', path, data: bytes },
     ]);
   }
 
@@ -1589,94 +1648,118 @@ export class OpenContainerRuntime {
 
   // ----------------------------------------------------------------- preview
   /**
-   * Register the preview ServiceWorker and wire the preview URL bridge
-   * (`/opencontainer/p/<port>/…` → this runtime's virtual TCP stack).
+   * Stand up the preview infrastructure (v2) and wire the preview bridge.
    *
    * Called automatically by boot() — embedders normally never call this.
-   * The SW file must live on THIS origin (browser spec: service workers
-   * are same-origin only), so with the default CDN assetsBase the runtime
-   * probes the conventional same-origin locations:
-   *   /opencontainer/preview-sw.js   (the documented copy: `cp -r
-   *                                   node_modules/opencontainer/public/opencontainer ./public/`
-   *                                   — only needed for preview support)
-   *   /preview-sw.js                 (flat-copy convention)
-   * A same-origin assetsBase ({ assetsBase: '/opencontainer' }) is probed
-   * first. Returns the registration, or null when no same-origin SW was
-   * found (a console warning explains the copy step; everything except
-   * preview URLs keeps working).
+   *
+   * Distribution ladder (zero-setup by default):
+   *   1. `/preview-sw.js` on this origin — emitted by the `opencontainer/vite`
+   *      plugin or copied once into the app's public dir. Root scope by
+   *      default → FULL fidelity (absolute guest paths, real dev servers,
+   *      client-side routing, HMR).
+   *   2. `<assetsBase>/preview-sw.js` (same-origin assets) and
+   *      `/opencontainer/preview-sw.js` (legacy layout) — root scope when the
+   *      host sends Service-Worker-Allowed, package scope otherwise.
+   *   3. Cross-origin assetsBase (the jsDelivr CDN default) → Tier 2: a
+   *      hidden bridge iframe on the CDN origin registers the SW there
+   *      (verified: a third-party iframe CAN register a SW on its own
+   *      origin) and relays SW ⇄ this page. Scoped-scope fallback: guests
+   *      with absolute paths are remapped by the injected preview shim
+   *      (fetch/XHR/pushState); dev servers that hard-code absolute URLs in
+   *      ways the shim cannot see may still miss assets — the honest cost of
+   *      the no-integration path (browser scope rule, not our choice).
+   *
+   * Preview URLs: `<base>/p/<sid>/<port>/<path>` — the SW binds the client
+   * of that navigation to {sid, port} and then routes every request from it
+   * (any absolute path) to the right runtime + port. The sid makes
+   * multi-tab sessions deterministic.
    */
   async registerPreview(): Promise<ServiceWorkerRegistration | null> {
-    if (this.previewRegistered) return null;
+    if (this.previewRegistered) return this.previewRegistration;
     this.previewRegistered = true;
     if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return null;
 
-    const candidates: string[] = [];
-    if (!/^https?:/.test(this.assetsBase)) {
-      candidates.push(`${this.assetsBase}/preview-sw.js`);
+    this.previewSid = previewSid();
+    const sameOriginAssets = !/^https?:/.test(this.assetsBase);
+
+    // ---- ladder 1+2: same-origin SW script --------------------------------
+    const candidates: Array<{ url: string; rootScope: boolean }> = [
+      { url: '/preview-sw.js', rootScope: true }, // vite plugin / public-dir copy
+    ];
+    if (sameOriginAssets) {
+      candidates.push({ url: `${this.assetsBase}/preview-sw.js`, rootScope: false });
     }
-    candidates.push('/opencontainer/preview-sw.js', '/preview-sw.js');
+    candidates.push({ url: '/opencontainer/preview-sw.js', rootScope: false });
 
     let registration: ServiceWorkerRegistration | null = null;
     let lastError: unknown = null;
-    for (const path of candidates) {
+    for (const cand of candidates) {
       try {
-        // Root scope when the host allows it (Service-Worker-Allowed: /);
-        // the default scope fallback (/opencontainer/) equally covers every
-        // URL this SW serves — preview URLs live under /opencontainer/.
         try {
-          registration = await navigator.serviceWorker.register(path, { scope: '/' });
+          registration = await navigator.serviceWorker.register(
+            cand.url, cand.rootScope ? undefined : { scope: '/' });
         } catch {
-          registration = await navigator.serviceWorker.register(path);
+          registration = await navigator.serviceWorker.register(cand.url);
         }
         break;
       } catch (err) {
         lastError = err;
       }
     }
-    if (!registration) {
-      console.warn(
-        '[opencontainer] preview ServiceWorker not registered ' +
-        (lastError ? `(${(lastError as Error)?.message ?? lastError}) ` : '') +
-        '— preview URLs need the SW on your origin. Copy the runtime assets to your public ' +
-        'folder: cp -r node_modules/opencontainer/public/opencontainer ./public/ — everything ' +
-        'else (terminal, fs, npm) works without it.',
-      );
-      return null;
-    }
-    // Do NOT await navigator.serviceWorker.ready — it only resolves for a
-    // registration whose scope COVERS THIS PAGE, and the default SW scope
-    // (/opencontainer/) does not (the page sits at /). Root-scope hosts
-    // resolve; default-scope hosts hung here forever, leaving the preview
-    // bridge unwired. The registration object itself is all we need; wait
-    // (bounded) for its worker to activate so a fresh install can claim.
-    await waitForActive(registration);
-    this.previewRegistration = registration;
 
-    // Page-level runtime registry: the SW message handler below asks every
-    // runtime on the page until one owns the port (multi-runtime pages,
-    // e.g. a facade runtime booted next to a terminal runtime).
+    if (registration) {
+      // Do NOT await navigator.serviceWorker.ready — it only resolves for a
+      // scope that covers THIS page; a package-path scope never will.
+      await waitForActive(registration);
+      this.previewRegistration = registration;
+      const scopePath = new URL(registration.scope).pathname.replace(/\/+$/, '');
+      this.previewMode = scopePath === '' ? 'root-scope' : 'scoped';
+      this.previewBase =
+        this.previewMode === 'root-scope'
+          ? new URL('p/', (globalThis as any).document?.baseURI ?? (globalThis as any).location?.href).href
+          : new URL(`${scopePath}/p/`, (globalThis as any).location?.href).href;
+
+      // Private pipe to the SW (the "bridge"): attach with our sid.
+      this.attachPreviewBridge(registration.active);
+    } else if (/^https?:/.test(this.assetsBase)) {
+      // ---- ladder 3: cross-origin CDN bridge (Tier 2) ---------------------
+      const bridged = await this.attachCdnBridge();
+      if (bridged) {
+        this.previewMode = 'cdn-bridge';
+        this.previewBase = `${this.assetsBase}/p/`;
+      }
+    }
+
+    // Page-level runtime registry (multi-runtime pages).
     const g = globalThis as any;
     if (!Array.isArray(g.__ocRuntimes)) g.__ocRuntimes = [];
     if (!g.__ocRuntimes.includes(this)) g.__ocRuntimes.push(this);
 
-    // Route the SW's preview fetches into this runtime's virtual TCP.
+    // The SW is terminated/restarted by the browser at will — every
+    // in-memory table (our bridge pipe!) dies with it. It announces each
+    // (re)start ('oc-sw-restarted'); we re-attach. Also re-attach whenever a
+    // guest server starts listening, covering restarts since boot.
+    navigator.serviceWorker.addEventListener('message', (ev: MessageEvent) => {
+      const m: any = ev.data;
+      if (m && m.type === 'oc-sw-restarted') this.attachPreviewBridge();
+    });
+
+    // LEGACY window-level handler: preview SWs ≤ v1 talk oc-preview-fetch on
+    // navigator.serviceWorker (no sid, no bridge pipe). Kept one release for
+    // embedders with a pinned old SW file.
     navigator.serviceWorker.addEventListener('message', (ev: MessageEvent) => {
       const m = ev.data;
       if (!m || typeof m.type !== 'string') return;
       if (m.type === 'oc-who-owns') {
-        // Port-ownership pull (see preview-sw.js): claim only what this
-        // runtime actually owns. The reply goes straight back to the SW;
-        // event.source on the SW side identifies the claiming page.
         if (typeof m.port === 'number' && this.ports.has(m.port)) {
           const sw = (navigator as any)?.serviceWorker?.controller
-            ?? this.previewRegistration?.active
-            ?? null;
-          try { sw?.postMessage({ type: 'oc-claim', port: m.port }); } catch { /* SW gone */ }
+            ?? this.previewRegistration?.active ?? this.previewBridge;
+          try { (sw as any)?.postMessage({ type: 'oc-claim', sid: this.previewSid, port: m.port }); } catch { /* SW gone */ }
         }
         return;
       }
       if (m.type !== 'oc-preview-fetch') return;
-      if ((ev as any).__ocHandled) return; // another runtime on this page took it
+      if ((ev as any).__ocHandled) return;
       const channel = ev.ports[0];
       const registry: OpenContainerRuntime[] = (globalThis as any).__ocRuntimes ?? [this];
       const owner = registry.find((r) => r.connectPreview(m.port, channel, m.bytes));
@@ -1686,8 +1769,8 @@ export class OpenContainerRuntime {
       }
     });
 
-    // Preview iframes forward console errors here (via setPreviewScript's
-    // injected shim) — re-emit as 'preview-message' for embedders.
+    // Preview iframes forward errors here (the injected shim) — re-emit as
+    // 'preview-message' for embedders (upstream forwardPreviewErrors shape).
     window.addEventListener('message', (ev: MessageEvent) => {
       const data: any = ev.data;
       if (data && typeof data.type === 'string' && data.type.startsWith('PREVIEW_')) {
@@ -1695,11 +1778,170 @@ export class OpenContainerRuntime {
       }
     });
 
-    // Deliver a preview script registered before the SW was ready.
-    if (this.previewScript !== null) {
-      this.postPreviewScript(this.previewScript, registration);
+    if (this.previewMode === 'none') {
+      console.warn(
+        '[opencontainer] preview ServiceWorker not registered ' +
+        (lastError ? `(${(lastError as Error)?.message ?? lastError}) ` : '') +
+        '— previews need the SW on your origin. Zero-setup: add the `opencontainer/vite` ' +
+        'plugin (emits /preview-sw.js automatically), or copy once: ' +
+        'cp -r node_modules/opencontainer/public/opencontainer ./public/ — everything ' +
+        'else (terminal, fs, npm) works without it.',
+      );
+      this.emit('previewStatus', { mode: 'none', reason: 'no service worker' } as any);
+    } else {
+      this.emit('previewStatus', { mode: this.previewMode, sid: this.previewSid } as any);
     }
-    return registration;
+
+    // Deliver a preview script registered before the SW was ready.
+    if (this.previewScript !== null && this.previewRegistration) {
+      this.postPreviewScript(this.previewScript, this.previewRegistration);
+    } else if (this.previewScript !== null && this.previewBridge) {
+      try { this.previewBridge.postMessage({ type: 'oc-preview-script', code: this.previewScript }); }
+      catch { /* SW gone */ }
+    }
+    return this.previewRegistration;
+  }
+
+  /** The zero-setup preview URL for a guest port (iframe.src = this works). */
+  previewUrl(port: number): string {
+    if (this.previewBase && this.previewSid) {
+      return `${this.previewBase}${this.previewSid}/${port}/`;
+    }
+    // No SW infrastructure — the documented legacy shape (works only with a
+    // manually copied v1 SW; the previewStatus event already said why).
+    try {
+      return new URL(`/opencontainer/p/${port}/`, (globalThis as any).location?.href ?? 'http://localhost').href;
+    } catch {
+      return `http://localhost:${port}`;
+    }
+  }
+
+  /** Tier 2: hidden iframe on the assets origin registers the SW there and
+   *  relays its pipe to us. Verified: third-party iframes can register SWs
+   *  on their own origin (harness/e2e/preview, experiment E1). */
+  private async attachCdnBridge(): Promise<boolean> {
+    if (typeof document === 'undefined') return false;
+    const iframe = document.createElement('iframe');
+    iframe.style.display = 'none';
+    iframe.setAttribute('aria-hidden', 'true');
+    const hostOrigin = typeof location !== 'undefined' ? location.origin : '*';
+    iframe.src = `${this.assetsBase}/preview-host.html?sw=${encodeURIComponent(`${this.assetsBase}/preview-sw.js`)}&origin=${encodeURIComponent(hostOrigin)}`;
+    this.previewHostFrame = iframe;
+
+    const ready = new Promise<boolean>((resolve) => {
+      const timeout = setTimeout(() => resolve(false), 10000);
+      window.addEventListener('message', function onMsg(ev: MessageEvent) {
+        const d: any = ev.data;
+        if (!d || typeof d !== 'object') return;
+        if (d.type === 'oc-bridge-ready' || d.type === 'oc-bridge-failed') {
+          window.removeEventListener('message', onMsg);
+          clearTimeout(timeout);
+          resolve(d.type === 'oc-bridge-ready');
+        }
+      });
+    });
+    document.body.appendChild(iframe);
+    const ok = await ready;
+    if (!ok) {
+      try { iframe.remove(); } catch { /* noop */ }
+      this.previewHostFrame = null;
+      return false;
+    }
+    // Attach our pipe through the bridge page.
+    const channel = new MessageChannel();
+    this.previewBridge = channel.port1;
+    this.previewBridge.onmessage = (ev: MessageEvent) => this.handlePreviewBridgeMessage(ev);
+    try {
+      iframe.contentWindow?.postMessage(
+        { type: 'oc-bridge-attach', sid: this.previewSid }, '*', [channel.port2]);
+    } catch {
+      return false;
+    }
+    return true;
+  }
+
+  /** Messages from the preview SW on our private pipe (oc-fetch / oc-ws / …). */
+  private handlePreviewBridgeMessage(ev: MessageEvent): void {
+    const m: any = ev.data;
+    if (!m || typeof m !== 'object') return;
+    const bridge = this.previewBridge;
+    switch (m.type) {
+      case 'oc-fetch': {
+        const replyChan = ev.ports[0];
+        const registry: OpenContainerRuntime[] = (globalThis as any).__ocRuntimes ?? [this];
+        const owner = registry.find((r) => r.connectPreview(m.port, replyChan, m.bytes));
+        if (!owner) {
+          try { replyChan.postMessage({ type: 'end' }); } catch { /* closed */ }
+        }
+        return;
+      }
+      case 'oc-ws-open': {
+        const dataChan = ev.ports[0];
+        this.connectPreviewWs(m.port, m.id, m.url, m.bytes, dataChan);
+        return;
+      }
+      case 'oc-who-owns': {
+        if (typeof m.port === 'number' && this.ports.has(m.port)) {
+          try { bridge?.postMessage({ type: 'oc-claim', sid: this.previewSid, port: m.port }); }
+          catch { /* gone */ }
+        }
+        return;
+      }
+      default:
+        return;
+    }
+  }
+
+  /** Preview WebSocket tunnel: the shim's MessagePort is one end of a raw
+   *  byte pipe; the guest server sees a real HTTP upgrade on the wire
+   *  (handshake bytes arrive as initialBytes, frames flow both ways). */
+  private connectPreviewWs(
+    port: number, id: number, url: string,
+    initialBytes: Uint8Array | null, channel: MessagePort,
+  ): boolean {
+    const target = this.ports.get(port);
+    if (!target) {
+      try {
+        channel.postMessage({ type: 'oc-ws-open-failed', id, error: `no server listening on port ${port}` });
+        channel.close();
+      } catch { /* gone */ }
+      return false;
+    }
+    void url;
+    const listener = this.processes.get(target.pid);
+    const serverConnId = this.nextConnId++;
+    // Same adapter shape connectPreview installs, but speaking the shim's
+    // ws message protocol ({oc-ws-data|oc-ws-end} instead of {data|end}).
+    const wsChannel = {
+      postMessage(msg: any) {
+        try {
+          if (msg.type === 'data') channel.postMessage({ type: 'oc-ws-data', bytes: msg.bytes });
+          else if (msg.type === 'end') { channel.postMessage({ type: 'oc-ws-end', id }); channel.close(); }
+        } catch { /* page gone */ }
+      },
+      close() { try { channel.close(); } catch { /* gone */ } },
+    };
+    this.connections.set(serverConnId, {
+      ownerPid: target.pid, peer: null, preview: wsChannel as any,
+    });
+    channel.onmessage = (ev: MessageEvent) => {
+      const msg: any = ev.data;
+      if (!msg || typeof msg !== 'object') return;
+      if (msg.type === 'oc-ws-data') {
+        listener?.worker.postMessage({
+          type: 'tcp-data', connId: serverConnId, bytes: new Uint8Array(msg.bytes),
+        });
+      } else if (msg.type === 'oc-ws-close') {
+        listener?.worker.postMessage({ type: 'tcp-eof', connId: serverConnId });
+        this.connections.delete(serverConnId);
+        try { channel.close(); } catch { /* gone */ }
+      }
+    };
+    listener?.worker.postMessage({
+      type: 'tcp-connect', port, connId: serverConnId, remotePort: 0,
+      bytes: initialBytes && initialBytes.byteLength > 0 ? initialBytes : undefined,
+    });
+    return true;
   }
 
   /**
@@ -1711,9 +1953,15 @@ export class OpenContainerRuntime {
    */
   setPreviewScript(code: string): void {
     this.previewScript = code;
-    // Deliver to the ACTIVE preview SW — navigator.serviceWorker.controller
-    // is null while this page is outside the SW scope (default-scope hosts);
-    // the registration captured by registerPreview is the reliable handle.
+    // v2 path first: the private bridge pipe (works for every mode, incl.
+    // cdn-bridge where this page cannot reach the SW directly at all).
+    if (this.previewBridge) {
+      try { this.previewBridge.postMessage({ type: 'oc-preview-script', code }); return; }
+      catch { /* bridge gone — fall through */ }
+    }
+    // v1 path: navigator.serviceWorker — controller is null while this page
+    // is outside the SW scope (scoped hosts); the registration captured by
+    // registerPreview is the reliable handle.
     const active = navigator?.serviceWorker?.controller
       ?? this.previewRegistration?.active
       ?? null;

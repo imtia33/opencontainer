@@ -36,7 +36,7 @@ const rt = new OpenContainerRuntime({
   // default is the jsDelivr CDN — tested by the standalone IDE test app.)
   onStdio(fd, chunk) {
     window.__ocStdioLog.push(String(chunk));
-    if (window.__ocStdioLog.length > 400) window.__ocStdioLog.shift();
+    if (window.__ocStdioLog.length > 4000) window.__ocStdioLog.shift();
     term.write(chunk);
   },
   onExit() {
@@ -51,11 +51,35 @@ const rt = new OpenContainerRuntime({
   },
   onListen(info) {
     state.ports.push(info.port);
-    term.write(`\r\n\x1b[90m[listening :${info.port} → /opencontainer/p/${info.port}/]\x1b[0m\r\n`);
+    term.write(`\r\n\x1b[90m[listening :${info.port} → ${rt.previewUrl(info.port)}]\x1b[0m\r\n`);
     prompt();
+    // Zero-setup same-tab preview: the server's output appears in this
+    // tab automatically. No tunnel, no copied scripts, no hosted service —
+    // previewUrl(port) is the SW-routed same-origin URL (per-client port
+    // binding, see registerPreview/preview-sw.js).
+    const frame = document.getElementById('preview-frame');
+    const empty = document.getElementById('preview-empty');
+    const dot = document.getElementById('preview-dot');
+    const label = document.getElementById('preview-label');
+    const link = document.getElementById('preview-link');
+    const url = rt.previewUrl(info.port);
+    if (frame) {
+      frame.src = url;
+      frame.style.display = '';
+      if (empty) empty.style.display = 'none';
+      if (dot) dot.classList.add('live');
+      if (label) label.textContent = `preview :${info.port} — ${url}`;
+      if (link) { link.href = url; link.textContent = 'open ↗'; }
+    }
+    window.__ocPreviewUrl = url;
+    window.__ocState.previewUrl = url;
   },
   onUnlisten(info) {
     state.ports = state.ports.filter((p) => p !== info.port);
+    const dot = document.getElementById('preview-dot');
+    const label = document.getElementById('preview-label');
+    if (dot) dot.classList.remove('live');
+    if (label) label.textContent = `preview :${info.port} closed`;
   },
   onError(err) {
     term.write(`\r\n\x1b[31m[error] ${err.message}\x1b[0m\r\n`);

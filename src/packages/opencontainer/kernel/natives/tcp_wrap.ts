@@ -229,12 +229,20 @@ export function makeTcpWrapBinding(ctx: NativesContext): Binding {
         port: this.localPort || 0,
         family: this.localHost?.includes(':') ? 10 : 2,
       };
-      if (out && typeof out === 'object') { out.address = info.address; out.port = info.port; out.family = info.family; }
+      // uv convention: fill `out` and return 0 (a truthy return is an errno —
+      // net.js Server.address() threw ERR_INVALID_ARG_TYPE on the info object).
+      if (out && typeof out === 'object') {
+        out.address = info.address; out.port = info.port; out.family = info.family;
+        return 0;
+      }
       return info;
     }
     getpeername(out?: any): any {
       const info = { address: '127.0.0.1', port: this.remotePort || 0, family: 2 };
-      if (out && typeof out === 'object') { out.address = info.address; out.port = info.port; out.family = info.family; }
+      if (out && typeof out === 'object') {
+        out.address = info.address; out.port = info.port; out.family = info.family;
+        return 0;
+      }
       return info;
     }
     open(_fd: number): number { return 0; }

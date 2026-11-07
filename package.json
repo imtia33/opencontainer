@@ -36,10 +36,15 @@
       "types": "./dist-types/index.d.ts",
       "import": "./dist/opencontainer.mjs"
     },
+    "./vite": {
+      "types": "./dist-types/vite-plugin.d.ts",
+      "import": "./dist-plugins/vite.mjs"
+    },
     "./package.json": "./package.json"
   },
   "files": [
     "dist",
+    "dist-plugins",
     "dist-types",
     "public",
     "README.md",

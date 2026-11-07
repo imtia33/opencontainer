@@ -107,6 +107,10 @@ export function makeProcessWrapBinding(ctx: NativesContext): Binding {
     onexit: ((exitCode: number, signalCode: string | null) => void) | null = null;
     pid: number = 0;
     private myPid: number | null = null;
+    /** uv_unref semantics: an unref'd child no longer holds this process's
+     *  loop open (its exit still fires). esbuild's service host unrefs its
+     *  long-lived child so builds don't hang the parent. */
+    unrefed = false;
 
     constructor() {
       liveProcesses.add(this);
@@ -211,7 +215,7 @@ export function makeProcessWrapBinding(ctx: NativesContext): Binding {
       const pid = pidCounter++;
       this.pid = pid;
       this.myPid = pid;
-      children.set(pid, { file: resolved, alive: true });
+      children.set(pid, { file: resolved, alive: true, unrefed: this.unrefed });
 
       const req: ChildSpawnRequest = {
         pid,
@@ -247,8 +251,16 @@ export function makeProcessWrapBinding(ctx: NativesContext): Binding {
         children.delete(this.myPid);
       }
     }
-    ref() {}
-    unref() {}
+    ref() { this.unrefed = false; }
+    unref() {
+      this.unrefed = true;
+      // Keep the registry entry (exit must still fire) but drop its loop
+      // hold — node's ChildProcess.unref() does exactly this to the handle.
+      if (this.myPid !== null) {
+        const c = children.get(this.myPid);
+        if (c) c.unrefed = true;
+      }
+    }
   }
 
   function signalName(n: number): string {
@@ -283,10 +295,11 @@ export function makeProcessWrapBinding(ctx: NativesContext): Binding {
         }
       }
     },
-    /** Loop-drain truth: live children keep the parent process alive. */
+    /** Loop-drain truth: live children keep the parent process alive —
+     *  EXCEPT unref'd ones (uv semantics). */
     activeChildCount(): number {
       let n = 0;
-      for (const c of children.values()) if (c.alive) n++;
+      for (const c of children.values()) if (c.alive && !c.unrefed) n++;
       return n;
     },
     /** Host: allocate pipe ids in a fresh base for this process. */

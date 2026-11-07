@@ -12,6 +12,7 @@ import { Natives, KernelHooks } from './natives';
 import { ModuleRegistry, loadPrimordials, SourceStore } from './module-registry';
 import { NODE_VERSION, VENDOR_ROOT, resolveModuleFile } from './id-map';
 import { wireBuiltinCompile } from './natives/builtins';
+import { activeFsCount } from './natives/fs';
 import { makeEsmGraphImporter, fileUrlOf, dirnameOf as esmDirname } from './esm-graph';
 import { installNetPendingGlobalFetch, netPendingCount } from './net-pending';
 import { zlibPendingCount } from './natives/zlib';
@@ -241,6 +242,7 @@ export async function bootKernel(opts: BootOptions): Promise<BootedKernel> {
     mountPkg('pnpm-oc');
     mountPkg('semver');
     mountPkg('oc-sh');
+    mountPkg('oc-compat');
 
     // ---- internal executables (the execvp surface of the virtual OS) -----
     // Real files in the VFS so PATH resolution + shebang parsing behave
@@ -258,17 +260,81 @@ export async function bootKernel(opts: BootOptions): Promise<BootedKernel> {
       vfs.writeFile(path,
         `#!/usr/bin/env node\n'use strict';\n${trace}\ntry { require(${JSON.stringify(requirePath)}); } catch (e) { process.stderr.write('OC-SHIM-ERROR ' + path + ': ' + (e && e.stack || e) + '\\n'); process.exit(42); }\n`);
     };
+    // The npm/pnpm compat shim: runs the real CLI, then — after install-class
+    // commands — the oc-compat WASM pass (esbuild/rollup → official WASM
+    // twins; native binaries cannot execute in a browser kernel). npm exits
+    // via process.exitCode + event-loop drain on success (never calling
+    // process.exit), so the pass hooks BOTH the CLI's completion promise
+    // (npm's lib/cli.js exports fn(process) → promise) and process.exit
+    // (pnpm + npm error paths). Marked swap dirs + a notice are left behind;
+    // OC_COMPAT_WASM=0 disables.
+    const compatShim = (paths: string[]) => {
+      for (const p of paths) {
+        const isPnpm = p.includes('pnpm');
+        const entry = isPnpm
+          ? '/usr/lib/node_modules/pnpm/bin/pnpm.cjs'
+          : '/usr/lib/node_modules/npm/lib/cli.js';
+        vfs.mkdir(p.slice(0, p.lastIndexOf('/')), true);
+        vfs.writeFile(p,
+          `#!/usr/bin/env node\n'use strict';\n` +
+          `const __ocRealExit = process.exit.bind(process);\n` +
+          `let __ocCompatStarted = false;\n` +
+          `let __ocCompatSettled = null; // resolves when the running pass is done\n` +
+          `const __ocRunCompat = (done) => {\n` +
+          `  if (__ocCompatStarted) {\n` +
+          `    // A pass is (or was) in flight: npm's own exit path arrives here\n` +
+          `    // AFTER our completion-promise chain already started the pass —\n` +
+          `    // queue this exit behind it instead of killing the fetches.\n` +
+          `    return (__ocCompatSettled ?? Promise.resolve()).then(() => done());\n` +
+          `  }\n` +
+          `  __ocCompatStarted = true;\n` +
+          `  const cmd = process.argv[2];\n` +
+          `  if (['install','i','add','ci','update','up'].indexOf(cmd) === -1) return done();\n` +
+          `  if (process.env && String(process.env.OC_COMPAT_WASM) === '0') return done();\n` +
+          `  __ocCompatSettled = new Promise((res) => { __ocCompatSettledResolve = res; });\n` +
+          `  try {\n` +
+          `    require('/usr/lib/node_modules/oc-compat/main.js').postInstall(process.cwd(), (err) => {\n` +
+          `      if (err) process.stderr.write('[opencontainer] compat pass failed: ' + (err && err.message || err) + '\\n');\n` +
+          `      __ocCompatSettledResolve();\n` +
+          `      done();\n` +
+          `    });\n` +
+          `  } catch (e) {\n` +
+          `    process.stderr.write('[opencontainer] compat pass failed: ' + (e && e.message || e) + '\\n');\n` +
+          `    __ocCompatSettledResolve();\n` +
+          `    done();\n` +
+          `  }\n` +
+          `};\n` +
+          `let __ocCompatSettledResolve = () => {};\n` +
+          `const __ocTrace = (tag) => { try { process.stderr.write('OC-TRACE ' + tag + ' argv=' + JSON.stringify(process.argv) + ' exitCode=' + JSON.stringify(process.exitCode) + ' at ' + new Error().stack.split('\\n').slice(2,6).join(' <- ') + '\\n'); } catch (_) {} };\n` +
+          `process.exit = function (code) { if (process.env && process.env.OC_TRACE_EXIT === '1') __ocTrace('exit(' + code + ')'); __ocRunCompat(() => __ocRealExit(code)); };\n` +
+          `let __ocResult;\n` +
+          `try { __ocResult = require(${JSON.stringify(entry)})(process); }\n` +
+          `catch (e) { process.stderr.write('OC-SHIM-ERROR ${p}: ' + (e && e.stack || e) + '\\n'); process.exit(42); }\n` +
+          `if (__ocResult && typeof __ocResult.then === 'function') {\n` +
+          `  // The CLI settled. Run the compat pass (install-class commands\n` +
+          `  // only), then EXIT — always. The previous guard (only exit when\n` +
+          `  // exitCode was truthy) left success-path exits to loop drain,\n` +
+          `  // and any surviving handle (a stray timer, an unclosed socket)\n` +
+          `  // hung the process forever: 'npm install' completed, printed its\n` +
+          `  // summary, and never returned the prompt.\n` +
+          `  __ocResult.catch((e) => { try { process.stderr.write('OC-CLI-REJECT ' + (e && e.stack || e) + '\\n'); } catch (_) {} }).then(() => __ocRunCompat(() => {\n` +
+          `    if (process.env && process.env.OC_TRACE_EXIT === '1') __ocTrace('chain-exit');\n` +
+          `    __ocRealExit(Number(process.exitCode) || 0);\n` +
+          `  }));\n` +
+          `}\n`);
+      }
+    };
     vfs.mkdir('/usr/local/bin', true);
     vfs.mkdir('/usr/bin', true);
     vfs.mkdir('/bin', true);
     // The node "binary": recognized by path in process_wrap (NODE_BIN).
     vfs.writeFile('/usr/local/bin/node', '#!/usr/bin/env node\n');
-    // P1 "npm is npm" / "pnpm is pnpm": npm/npx and pnpm/pnpx are the REAL
-    // vendored upstream CLIs (/usr/lib/node_modules/{npm,pnpm} — mounted by
-    // the host from their OCRT blobs, see worker-entry; harnesses mount from
-    // disk). npm-oc / pnpm-oc stay available ONLY as explicitly-named
-    // rollback tools — they are no longer the default `npm`/`pnpm` (never an
-    // invisible fallback).
+    // npm/npx and pnpm/pnpx shims additionally run the oc-compat WASM pass
+    // after install-class commands: esbuild/rollup native twins cannot
+    // execute in a browser kernel, so they are swapped for the official WASM
+    // builds (marker + notice printed; OC_COMPAT_WASM=0 disables). The exit
+    // hook defers the real process.exit until the (async, network-bound)
+    // pass finishes, preserving npm's own exit code.
     binShim('/usr/local/bin/npm', '/usr/lib/node_modules/npm/bin/npm-cli.js');
     binShim('/usr/local/bin/npx', '/usr/lib/node_modules/npm/bin/npx-cli.js');
     binShim('/usr/bin/npm', '/usr/lib/node_modules/npm/bin/npm-cli.js');
@@ -277,6 +343,7 @@ export async function bootKernel(opts: BootOptions): Promise<BootedKernel> {
     binShim('/usr/local/bin/pnpm', '/usr/lib/node_modules/pnpm/bin/pnpm.cjs');
     binShim('/usr/local/bin/pnpx', '/usr/lib/node_modules/pnpm/bin/pnpx.cjs');
     binShim('/usr/local/bin/pnpm-oc', '/usr/lib/node_modules/pnpm-oc/cli.js');
+    compatShim(['/usr/local/bin/npm', '/usr/bin/npm', '/usr/local/bin/pnpm']);
     binShim('/usr/local/bin/corepack', '/usr/lib/node_modules/oc-sh/corepack.js');
     binShim('/usr/bin/sh', '/usr/lib/node_modules/oc-sh/sh.js');
     binShim('/bin/sh', '/usr/lib/node_modules/oc-sh/sh.js');
@@ -691,7 +758,24 @@ export async function bootKernel(opts: BootOptions): Promise<BootedKernel> {
     // import() promise the guest's own catch handles, exactly like node.
     (globalThis as any).__ocDynImport = (parentDir: string, spec: string) =>
       importer.dynamicImport(parentDir, spec);
+    // Worker-graph dynamic import (natives/worker.ts): worker_threads in the
+    // importing worker's graph binds THAT worker's view via a per-worker
+    // shim URL (esm-graph dynamicImportWorker). Registered BEFORE any worker
+    // can boot, alongside the main hook.
+    (globalThis as any).__ocDynImportW = (threadId: number, parentDir: string, spec: string) =>
+      importer.dynamicImportWorker(threadId, parentDir, spec);
     (globalThis as any).__ocEsmBuiltin = (id: string) => require(id);
+    // Builtin resolution for a WORKER's module graph: worker_threads comes
+    // from the per-worker view registry (natives/worker.ts publishes each
+    // worker's view there); every other builtin is the shared realm module.
+    (globalThis as any).__ocEsmWorkerBuiltin = (threadId: number, id: string) => {
+      const views: Map<number, any> | undefined = (globalThis as any).__ocWorkerViews;
+      const view = views?.get(threadId);
+      if (view !== undefined && (id === 'worker_threads' || id === 'node:worker_threads')) {
+        return view;
+      }
+      return require(id);
+    };
     (globalThis as any).__ocEsmCjs = (p: string) => requireCjsFile(p);
     (globalThis as any).__ocEsmJson = (p: string) => {
       const bytes = nativesCtx.vfs.readFile(p);
@@ -913,6 +997,7 @@ export async function bootKernel(opts: BootOptions): Promise<BootedKernel> {
     const pipeB: any = natives.get('pipe_wrap');
     const tcpB: any = natives.get('tcp_wrap');
     const procB: any = natives.get('process_wrap');
+    const fsB: any = natives.get('fs');
     const pendingTimers = timersB.getActiveTimerCount?.() ?? 0;
     const pendingImmediates = timersB.getActiveImmediateCount?.() ?? 0;
     const stdinReading = ttyB.stdinReading?.() ?? false;
@@ -924,9 +1009,13 @@ export async function bootKernel(opts: BootOptions): Promise<BootedKernel> {
     const pendingNet = netPendingCount();
     // P1 (zlib): in-flight compression writes are live uv reqs too.
     const pendingZlib = zlibPendingCount();
+    // P2 (fs): an in-flight async fs op is a threadpool uv req in node —
+    // npm's reify phase is a storm of them; uncounted, the drain watcher
+    // killed it mid-reify ("Exit handler never called!").
+    const pendingFs = activeFsCount();
     return pendingTimers === 0 && pendingImmediates === 0 && !stdinReading
       && openPipes === 0 && openTcp === 0 && liveChildren === 0
-      && pendingNet === 0 && pendingZlib === 0;
+      && pendingNet === 0 && pendingZlib === 0 && pendingFs === 0;
   }
 
   /** True while this process owns live OS-like resources (open pipes,
@@ -942,7 +1031,8 @@ export async function bootKernel(opts: BootOptions): Promise<BootedKernel> {
       || ((procB.activeChildCount?.() ?? 0) > 0)
       || (ttyB.stdinReading?.() ?? false)
       || netPendingCount() > 0
-      || zlibPendingCount() > 0;
+      || zlibPendingCount() > 0
+      || activeFsCount() > 0;
   }
 
   /** Deliver a signal to this process, node's JS-visible semantics: a
@@ -969,6 +1059,7 @@ export async function bootKernel(opts: BootOptions): Promise<BootedKernel> {
   function startLoopDrainWatcher(): void {
     if (drainWatcher !== null) return;
     let emptyTicks = 0;
+    let busyTicks = 0;
     drainWatcher = hostSetInterval(() => {
       drainTicks();
       // Idempotence: a second armed wakeup can fire in the same host batch
@@ -977,11 +1068,22 @@ export async function bootKernel(opts: BootOptions): Promise<BootedKernel> {
       if (process._exiting) { stopLoopDrainWatcher(); return; }
       if (kernelLoopEmpty()) {
         emptyTicks++;
-        // Two consecutive empty samples (≈200ms) — brief gaps during
-        // readline setup must not fire a spurious exit.
-        if (emptyTicks >= 2) {
+        // Fifteen consecutive empty samples (≈1.5s). The census counts every
+        // known handle class (timers, immediates, pipes, tcp, children, net
+        // — fetches AND streamed bodies — zlib, stdin, in-flight fs), but its
+        // history has blind spots: each one turned "loop looks empty for
+        // 200ms" into a kill of a LIVE process (npm died mid-reify with
+        // "Exit handler never called!"). Live guest work pauses for <1s
+        // between phases; a finished script has nothing left and waits out
+        // the same 1.5s before its exit — prompt for users, survivable for
+        // stragglers. OC_NO_DRAIN_EXIT=1 disables watcher exits entirely
+        // (diagnostics: prove a CLI completes without it).
+        if (emptyTicks >= 15 && !(process.env && String(process.env.OC_NO_DRAIN_EXIT) === '1')) {
           stopLoopDrainWatcher();
           try {
+            if (process.env && String(process.env.OC_TRACE_DRAIN) === '1') {
+              opts.hooks.onStdio(2, `[oc-drain] watcher exiting process code=${process.exitCode ?? 0}\n`);
+            }
             process.exit(process.exitCode ?? 0);
           } catch (e: any) {
             (globalThis as any).__ocDebugHook?.(
@@ -990,6 +1092,22 @@ export async function bootKernel(opts: BootOptions): Promise<BootedKernel> {
         }
       } else {
         emptyTicks = 0;
+        // OC_TRACE_DRAIN=1: a process whose script finished but whose loop
+        // never drains is the classic "silent hang" — npm did this for
+        // months before anyone noticed. Every ~5s of a continuously busy
+        // loop, name the handle that keeps it alive.
+        if (busyTicks++ % 50 === 49) {
+          if (process.env && String(process.env.OC_TRACE_DRAIN) === '1') {
+            try {
+              const tB: any = natives.get('timers');
+              const yB: any = natives.get('tty_wrap');
+              const pB: any = natives.get('pipe_wrap');
+              const cB: any = natives.get('tcp_wrap');
+              const xB: any = natives.get('process_wrap');
+              opts.hooks.onStdio(2, `[oc-drain] loop busy for ${Math.round(busyTicks / 10)}s: timers=${tB.getActiveTimerCount?.() ?? 0} immediates=${tB.getActiveImmediateCount?.() ?? 0} stdinReading=${yB.stdinReading?.() ?? false} pipes=${pB.activePipeCount?.() ?? 0} tcp=${cB.activeTcpCount?.() ?? 0} children=${xB.activeChildCount?.() ?? 0} net=${netPendingCount()} zlib=${zlibPendingCount()} fs=${activeFsCount()}\n`);
+            } catch { /* diagnostics must never break the watcher */ }
+          }
+        }
       }
     }, 100);
   }

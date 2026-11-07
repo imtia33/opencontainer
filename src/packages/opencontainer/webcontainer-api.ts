@@ -271,12 +271,12 @@ export class WebContainer {
     this.assertNotTornDown();
     const rt = this.runtime;
     const wrap = (fn: (a: any, b: any) => void): RuntimeEventListener => (info: any) => fn(info.port, info);
-    // The loadable preview URL (upstream's is on their origin; ours is the
-    // same-origin ServiceWorker path — iframe.src = url works identically).
-    const previewUrl = (port: number): string => {
-      try { return new URL(`/opencontainer/p/${port}/`, (globalThis as any).location?.href ?? 'http://localhost').href; }
-      catch { return `http://localhost:${port}`; }
-    };
+    // The loadable preview URL — the runtime's zero-setup preview
+    // infrastructure (service-worker-routed, per-client port binding; see
+    // registerPreview). Upstream's URL is on their vendor origin; ours is
+    // on the embedder's (or the CDN fallback) — iframe.src = url works
+    // identically either way.
+    const previewUrl = (port: number): string => rt.previewUrl(port);
     let off: () => void;
     switch (event) {
       case 'server-ready': {

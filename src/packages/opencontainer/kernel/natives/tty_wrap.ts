@@ -1,5 +1,6 @@
 import type { Binding, NativesContext } from './index';
 import { UV_EOF, kArrayBufferOffset, kReadBytesOrError, getStreamBaseState, encodeWritevList } from './stream-state';
+import { ensureStdinBridge } from './stdin-bridge';
 
 /**
  * internalBinding('tty_wrap') — stdio TTY handles over the kernel's stdio
@@ -18,6 +19,19 @@ import { UV_EOF, kArrayBufferOffset, kReadBytesOrError, getStreamBaseState, enco
  */
 
 export function makeTtyBinding(ctx: NativesContext): Binding {
+  // ---- stdin delivery state -------------------------------------------------
+  // The SHARED fd-0 bridge (created by fs — the first binding to touch
+  // stdin — adopted here): one buffer for parked raw fs.read(0) readers,
+  // the tty stdin stream, and terminal deliveries. The old private
+  // pendingChunks/rawReaders state is GONE — raw readers and the stream
+  // converge on the bridge buffer.
+  const stdinMode: { type: string } | undefined = (ctx as any).stdio?.[0];
+  const stdinBridge = !stdinMode || stdinMode.type === 'tty'
+    ? ensureStdinBridge(ctx, stdinMode?.type)
+    : null;
+  let stdinHandle: TtyHandle | null = null;
+  let eofDelivered = false;
+
   class TtyHandle {
     /** Assigned by lib/internal/stream_base_commons.js (onread driver). */
     onread: ((arrayBuffer: ArrayBuffer) => void) | null = null;
@@ -29,10 +43,10 @@ export function makeTtyBinding(ctx: NativesContext): Binding {
 
     constructor(public fd: number, _ctx?: { code?: number }) {
       // node passes a ctx object for init errors — we never fail init.
-      // eslint-disable-next-line @typescript-eslint/no-this-alias
-      const handle: TtyHandle = this;
-      if (fd === 0) stdinHandle = handle;
+      if (fd === 0) stdinHandle = this;
     }
+    /** uv_unref semantics (rare for a tty, honored anyway). */
+    unrefed = false;
     get owner(): any { return (this as any)[OWNER]; }
     writeUtf8String(req: any, data: string | Uint8Array, cb?: (err?: Error | null) => void): number {
       ctx.hooks.onStdio(this.fd as 1 | 2, data);
@@ -68,9 +82,15 @@ export function makeTtyBinding(ctx: NativesContext): Binding {
       queueMicrotask(() => req?.oncomplete?.(0));
       return 0;
     }
-    close() { if (stdinHandle === this) stdinHandle = null; }
-    ref() {}
-    unref() {}
+    close() {
+      if (stdinHandle === this) {
+        stdinHandle = null;
+        // Closing the tty stdin handle closes fd 0: raw readers get EBADF.
+        stdinBridge?.markClosed();
+      }
+    }
+    ref() { this.unrefed = false; }
+    unref() { this.unrefed = true; }
     /** tty.js ReadStream.setRawMode translates true→UV_TTY_MODE_RAW_VT(3),
      * false→UV_TTY_MODE_NORMAL(0). We record the state — the cooked-mode
      * line discipline below depends on it. */
@@ -94,10 +114,6 @@ export function makeTtyBinding(ctx: NativesContext): Binding {
 
   const OWNER = Symbol('nodejs.stream.owner');
 
-  // ---- stdin delivery ------------------------------------------------------
-  let stdinHandle: TtyHandle | null = null;
-  const pendingChunks: Uint8Array[] = [];
-  let eofDelivered = false;
   /** The kernel process object — attached from boot.ts after the EventEmitter
    *  prototype is installed; needed to raise SIGINT on the cooked-mode INTR. */
   let proc: any = null;
@@ -123,37 +139,36 @@ export function makeTtyBinding(ctx: NativesContext): Binding {
   }
 
   /**
-   * Host bridge: raw bytes from the terminal UI → node's stdin stream.
-   * Mirrors uv__stream_read: allocates an ArrayBuffer, sets the shared
-   * streamBaseState, then invokes handle.onread(buf).
+   * Host bridge: raw bytes from the terminal UI → the stdin bridge (parked
+   * raw fs.read(0) readers first), then the stream when it is reading —
+   * the uv__stream_read protocol via handle.onread(buf).
    */
   function deliverChunk(bytes: Uint8Array): void {
-    const handle = stdinHandle;
-    if (!handle || typeof handle.onread !== 'function' || !handle.reading) {
-      pendingChunks.push(bytes);
-      return;
-    }
-    const state = getStreamBaseState();
-    // Copy into a standalone ArrayBuffer the FastBuffer will view.
-    const ab = new ArrayBuffer(bytes.byteLength);
-    new Uint8Array(ab).set(bytes);
-    state[kReadBytesOrError] = bytes.byteLength;
-    state[kArrayBufferOffset] = 0;
-    try {
-      handle.onread(ab);
-    } catch (e: any) {
-      // A throw inside onread must not kill the host loop; node would crash
-      // the process — we log and keep the terminal alive.
-      (globalThis as any).__ocDebugHook?.(`[stdin onread error] ${(e?.stack ?? String(e))}`);
-    }
+    if (!stdinBridge) return;
+    stdinBridge.deliver(bytes);
+    flushToStream();
   }
 
-  /** Flush chunks that arrived before lib called readStart(). */
-  function flushPending(): void {
-    while (pendingChunks.length > 0) {
-      const handle = stdinHandle;
-      if (!handle || !handle.reading || typeof handle.onread !== 'function') return;
-      deliverChunk(pendingChunks.shift()!);
+  /** Drain the bridge buffer into the stdin stream (uv semantics: data
+   *  arriving for a readStart-ed handle goes straight to onread). */
+  function flushToStream(): void {
+    if (!stdinBridge) return;
+    const handle = stdinHandle;
+    if (!handle || typeof handle.onread !== 'function' || !handle.reading) return;
+    while (stdinBridge.buffer.length > 0) {
+      if (!handle.reading || typeof handle.onread !== 'function') return;
+      const chunk = stdinBridge.buffer.shift()!;
+      const state = getStreamBaseState();
+      const ab = new ArrayBuffer(chunk.byteLength);
+      new Uint8Array(ab).set(chunk);
+      state[kReadBytesOrError] = chunk.byteLength;
+      state[kArrayBufferOffset] = 0;
+      try {
+        handle.onread(ab);
+      } catch (e: any) {
+        (globalThis as any).__ocDebugHook?.(`[stdin onread error] ${(e?.stack ?? String(e))}`);
+        return;
+      }
     }
   }
 
@@ -161,7 +176,7 @@ export function makeTtyBinding(ctx: NativesContext): Binding {
   const origReadStart = TtyHandle.prototype.readStart;
   TtyHandle.prototype.readStart = function (this: TtyHandle) {
     origReadStart.call(this);
-    flushPending();
+    flushToStream();
   };
 
   function feedStdin(data: string | Uint8Array): void {
@@ -188,6 +203,7 @@ export function makeTtyBinding(ctx: NativesContext): Binding {
   function sendStdinEof(): void {
     if (eofDelivered) return;
     eofDelivered = true;
+    stdinBridge?.markEof();
     const handle = stdinHandle;
     if (!handle || typeof handle.onread !== 'function') return;
     const state = getStreamBaseState();
@@ -197,7 +213,10 @@ export function makeTtyBinding(ctx: NativesContext): Binding {
 
   function resetStdin(): void {
     eofDelivered = false;
-    pendingChunks.length = 0;
+    if (stdinBridge) {
+      stdinBridge.buffer.length = 0;
+      stdinBridge.eof = false;
+    }
   }
 
   return {
@@ -224,6 +243,9 @@ export function makeTtyBinding(ctx: NativesContext): Binding {
     /** boot.ts wires the process here once its EventEmitter proto is ready. */
     attachProcess(p: any): void { proc = p; },
     /** Loop-drain detection: an open, readStarted stdin keeps node's loop alive. */
-    stdinReading(): boolean { return stdinHandle?.reading === true; },
+    stdinReading(): boolean {
+      if (stdinHandle?.reading === true && !stdinHandle.unrefed) return true;
+      return stdinBridge ? stdinBridge.rawReaders.length > 0 : false;
+    },
   };
 }

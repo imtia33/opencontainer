@@ -10,7 +10,20 @@
     #bar { padding: 6px 10px; background: #17171a; border-bottom: 1px solid #2d2d33;
            font-size: 12px; color: #9aa0aa; }
     #bar b { color: #0d9fff; }
-    #term { padding: 8px 10px; height: calc(100% - 32px); }
+    #bar .pane { display: flex; height: calc(100% - 32px); }
+    #term { padding: 8px 10px; width: 46%; overflow: hidden; }
+    #preview { width: 54%; display: flex; flex-direction: column;
+               border-left: 1px solid #2d2d33; background: #fff; }
+    #preview .toolbar { display: flex; gap: 8px; align-items: center;
+                        padding: 5px 10px; background: #17171a; border-bottom: 1px solid #2d2d33;
+                        color: #9aa0aa; font-size: 11px; flex: none; }
+    #preview .toolbar a { color: #0d9fff; text-decoration: none; }
+    #preview .toolbar .dot { width: 7px; height: 7px; border-radius: 50%;
+                             background: #484f58; flex: none; }
+    #preview .toolbar .dot.live { background: #3fb950; }
+    #preview iframe { flex: 1; width: 100%; border: 0; background: #fff; }
+    #preview .empty { flex: 1; display: flex; align-items: center; justify-content: center;
+                      color: #6e7681; font-size: 12px; }
     #status { float: right; }
     .ok { color: #3fb950; } .bad { color: #f85149; }
   </style>
@@ -20,7 +33,18 @@
     <b>OpenContainer</b> browser E2E harness
     <span id="status">booting…</span>
   </div>
-  <div id="term"></div>
+  <div class="pane">
+    <div id="term"></div>
+    <div id="preview">
+      <div class="toolbar">
+        <span class="dot" id="preview-dot"></span>
+        <span id="preview-label">preview — waiting for a dev server…</span>
+        <a id="preview-link" target="_blank">open ↗</a>
+      </div>
+      <div class="empty" id="preview-empty">run <code>npm run dev</code> — the server appears here automatically</div>
+      <iframe id="preview-frame" style="display:none"></iframe>
+    </div>
+  </div>
   <script src="/xterm.js"></script>
   <script type="module" src="/app.js"></script>
 </body>

@@ -1,5 +1,6 @@
 import type { Binding, NativesContext } from './index';
 import { VfsError, errnoOf } from '../vfs';
+import { ensureStdinBridge } from './stdin-bridge';
 
 /**
  * internalBinding('fs') — the syscall surface over the VFS.
@@ -13,6 +14,45 @@ import { VfsError, errnoOf } from '../vfs';
 function uvCode(e: unknown): number {
   if (e instanceof VfsError) return -errnoOf(e.code);
   return -22; // EINVAL
+}
+
+// ---------------------------------------------------------------------------
+// Pending async-fs accounting (loop census).
+//
+// In node every in-flight async fs op is a threadpool uv req — a LIVE handle
+// that keeps the event loop alive. Our completions used to be queueMicrotask
+// calls: they drain inside one checkpoint, so a busy reify phase (npm's move/
+// stat storm — thousands of awaited fs ops) was INVISIBLE to the drain
+// watcher between host tasks, and the watcher killed npm mid-reify with
+// "Exit handler never called!". Completions now hop one HOST macrotask and
+// are counted while in flight — an async fs op is a live handle, like node.
+//
+// The host timer is captured at module scope, BEFORE bootKernel swaps the
+// guest's globals (scheduling guest completions on the guest's own timer
+// would be circular).
+const hostTimerFs: typeof setTimeout =
+  (globalThis as any).setTimeout?.bind(globalThis)
+  ?? ((cb: any, ms?: number) => setTimeout(cb, ms) as any);
+let pendingFsOps = 0;
+
+/** Pending async fs operations (in-flight threadpool-equivalent reqs). */
+export function activeFsCount(): number {
+  return pendingFsOps;
+}
+
+/** Schedule an async-fs completion on a counted host macrotask. */
+function scheduleFs(cb: () => void): void {
+  pendingFsOps++;
+  hostTimerFs(() => {
+    pendingFsOps--;
+    cb();
+  }, 0);
+}
+
+/** Same counted-macrotask completion for raw stdio reads parked on a
+ *  pipe/tty handle (pipe_wrap/tty_wrap complete fs.read(0, …) reqs there). */
+export function scheduleStdioCompletion(cb: () => void): void {
+  scheduleFs(cb);
 }
 
 /** VFS S_IFMT mode bits → UV_DIRENT_* code (constants.ts values: the same
@@ -102,10 +142,10 @@ export function makeFsBinding(ctx: NativesContext): Binding {
           // numbers reaching userland break error handling (cacache's write
           // stream died on a bare -2).
           const err = errnoExceptionOf(e, syscall, getPath(opArgs));
-          queueMicrotask(() => req.oncomplete?.(err));
+          scheduleFs(() => req.oncomplete?.(err));
           return;
         }
-        queueMicrotask(() => req.oncomplete?.(null, result));
+        scheduleFs(() => req.oncomplete?.(null, result));
         return;
       }
       // S3.1: the kUsePromises sentinel is NOT always the LAST argument —
@@ -120,7 +160,7 @@ export function makeFsBinding(ctx: NativesContext): Binding {
         // with the operation result (or rejects with an ErrnoException).
         const opArgs = args.slice(0, promiseIdx).concat(args.slice(promiseIdx + 1));
         return new Promise((resolve, reject) => {
-          queueMicrotask(() => {
+          scheduleFs(() => {
             try {
               resolve(fn(...opArgs));
             } catch (e) {
@@ -191,11 +231,58 @@ export function makeFsBinding(ctx: NativesContext): Binding {
     return f;
   }
 
+  // ---- stdio fds (0/1/2) ---------------------------------------------------
+  // Raw fs.read/fs.write on the standard fds: in real node, 0/1/2 are OS
+  // pipes/TTYS. Go-compiled wasm services (esbuild-wasm's --service mode!)
+  // read their command protocol straight off fd 0 through the vendored fs
+  // binding — an EBADF there kills the whole service
+  // ("panic: JavaScript error: EBADF: read, 0", found via vite 7's config
+  // loading, which bundles vite.config.js with esbuild).
+  //
+  // fd 0: THE per-process stdin bridge (natives/stdin-bridge.ts) — one buffer
+  // shared with node's stdin stream; pipe_wrap/tty_wrap deliveries feed it,
+  // and the fs binding itself CREATES it here (fs materializes before any
+  // guest I/O in every node process, so the bridge always exists before a
+  // raw read parks — the ordering hole that deadlocked esbuild's service).
+  // fd 1/2: writes route to the same hooks.onStdio channel node's stdout
+  // streams use — pipe modes keep their pipeId routing.
+  const fd0Mode = ((ctx as any).stdio?.[0]?.type) as string | undefined;
+  const stdinBridge =
+    fd0Mode === 'pipe' || fd0Mode === 'tty' || fd0Mode === undefined
+      ? ensureStdinBridge(ctx, fd0Mode)
+      : null;
+  if (stdinBridge) (ctx as any).stdinRaw = stdinBridge.source;
+
+  /** fs.read on fd 0: sync mode drains what is buffered; callback mode
+   *  PARKS until data or EOF (the pipe blocking read node's fd 0 has).
+   *
+   *  'ignore' stdio is /dev/null → immediate EOF. Pipe/tty stdio shares the
+   *  stdin bridge buffer with node's own stdin stream (kernel-pipe
+   *  semantics: whoever reads gets the bytes). This is the path
+   *  esbuild-wasm's Go service uses: wasm_exec's `globalThis.fs =
+   *  require('fs')` calls fs.read(0, buf, off, len, null, cb) for its whole
+   *  stdin protocol — a synchronous throw there panics the Go program. */
+  function stdioRead(fd: number, buffer: Uint8Array, offset: number, length: number, position: number, req?: ReqLike): number | void {
+    void fd; void position; // stdin has no positions
+    if (!stdinBridge || fd0Mode === 'ignore') {
+      if (req) { scheduleFs(() => req.oncomplete?.(null, 0, buffer)); return; }
+      return 0;
+    }
+    if (req) { stdinBridge.source.readAsync(buffer, offset, length, req); return; }
+    return stdinBridge.source.readSync(buffer, offset, length);
+  }
+
+  /** Plain dual-mode read for FILE fds (fd 0 is routed through the stdio
+   *  bridge by the exported `read` wrapper). */
+  const dualRead = dual('read', (a) => fdPath(a[0]), (fd: number, buffer: Uint8Array, offset: number, length: number, position: number) =>
+    readFd(fd, buffer, offset, length, position));
+
   function fdPath(fd: number): string {
     return mustFd(fd, 'read').path;
   }
 
   function readFd(fd: number, buffer: Uint8Array, offset: number, length: number, position: number): number {
+    // fd 1/2 reads: EBADF in node too (writing ends are not readable).
     const f = mustFd(fd, 'read');
     const data = vfs.readFile(f.path);
     const pos = position === -1 || position === null || position === undefined ? f.pos : position;
@@ -207,6 +294,15 @@ export function makeFsBinding(ctx: NativesContext): Binding {
   }
 
   function writeFd(fd: number, bytes: Uint8Array, position: number): number {
+    // fd 1/2 (stdout/stderr): raw fs.write on the standard fds routes to
+    // the kernel's stdio channel (pipe modes keep their pipeId routing —
+    // hooks.onStdio handles that). Go-compiled wasm services write their
+    // whole protocol through fs.write(1, …) — the same path the streams
+    // take (found via esbuild-wasm --service).
+    if (fd === 1 || fd === 2) {
+      (ctx.hooks as any).onStdio(fd, bytes);
+      return bytes.byteLength;
+    }
     const f = mustFd(fd, 'write');
     if (position !== -1 && position !== null && position !== undefined) {
       const existing = vfs.readFile(f.path);
@@ -232,6 +328,20 @@ export function makeFsBinding(ctx: NativesContext): Binding {
       f.pos += bytes.byteLength;
     }
     return bytes.byteLength;
+  }
+
+  /** Stdio fstat shape: a character device (S_IFCHR, 0o020000) — what a
+   *  pipe/TTY fd stats as in real node. Positional-array form like
+   *  statFields (Go's wasm glue fstats stdin to detect its shape). */
+  function statFieldsOfCharacterDevice(): any {
+    const now = Date.now();
+    const sec = Math.floor(now / 1000);
+    const ns = Math.round((now - sec * 1000) * 1e6);
+    return [
+      0, 0o020000, 1, 0, 0,
+      0, 4096, 0, 0, 0,
+      sec, ns, sec, ns, sec, ns, sec, ns,
+    ];
   }
 
   function statFields(p: string, followSymlinks: boolean, bigint = false): any {
@@ -351,8 +461,23 @@ export function makeFsBinding(ctx: NativesContext): Binding {
     }),
 
     // ---- read/write -----------------------------------------------------------
-    read: dual('read', (a) => fdPath(a[0]), (fd: number, buffer: Uint8Array, offset: number, length: number, position: number) =>
-      readFd(fd, buffer, offset, length, position)),
+    read: (...args: any[]) => {
+      // fd 0 (stdin) never enters the file-fd table — route to the stdio
+      // bridge. Callback mode's req may sit anywhere in the tail; find it
+      // the same way dual() does. opArgs (req-stripped) = [fd, buffer,
+      // offset, length, position] — fd is args[0], the BUFFER is opArgs[1].
+      if (args[0] === 0) {
+        let reqIdx = -1;
+        for (let i = args.length - 1; i >= 0; i--) {
+          if (isReq(args[i])) { reqIdx = i; break; }
+        }
+        const req = reqIdx >= 0 ? (args[reqIdx] as ReqLike) : undefined;
+        const opArgs = reqIdx >= 0 ? args.slice(0, reqIdx).concat(args.slice(reqIdx + 1)) : args;
+        const buf: any = opArgs[1];
+        return stdioRead(0, buf, opArgs[2] ?? 0, opArgs[3] ?? (buf && buf.length) ?? 0, opArgs[4], req);
+      }
+      return dualRead(...args);
+    },
     writeBuffer: dual('write', (a) => fdPath(a[0]), (fd: number, buffer: Uint8Array, offset: number, length: number, position: number) => {
       // note: fs.js passes (fd, buffer, offset, length, position) — buffer slice [offset, offset+length)
       const chunk = buffer.subarray(offset, offset + length);
@@ -378,7 +503,17 @@ export function makeFsBinding(ctx: NativesContext): Binding {
       }
       return written;
     }),
-    readBuffers: dual('read', (a) => fdPath(a[0]), (fd: number, buffers: Uint8Array[], position: number | null) => {
+    readBuffers: dual('read', (a) => (a[0] === 0 ? 'stdio' : fdPath(a[0])), (fd: number, buffers: Uint8Array[], position: number | null) => {
+      // fd 0 (raw readv on stdin): same stdio bridge per buffer.
+      if (fd === 0) {
+        let total = 0;
+        for (const b of buffers) {
+          const r = stdioRead(0, b, 0, b.byteLength, -1);
+          total += (r as number) ?? 0;
+          if ((r as number) < b.byteLength) break;
+        }
+        return total;
+      }
       let total = 0;
       const explicit = position !== null && position !== undefined && position !== -1;
       for (const b of buffers) {
@@ -414,7 +549,12 @@ export function makeFsBinding(ctx: NativesContext): Binding {
         throw e;
       }
     }),
-    fstat: dual('fstat', (a) => fdPath(a[0]), (...all: any[]) => {
+    fstat: dual('fstat', (a) => (a[0] >= 0 && a[0] <= 2 ? 'stdio' : fdPath(a[0])), (...all: any[]) => {
+      // stdio fds stat as character devices (a pipe/TTY — what Go's wasm
+      // glue and any fd-detecting code expect).
+      if (all[0] === 0 || all[0] === 1 || all[0] === 2) {
+        return statFieldsOfCharacterDevice();
+      }
       const [fd, bigint, x, y] = all as [number, boolean?, boolean?, boolean?];
       const throwIfNoEntry = typeof x === 'boolean' ? x : y;
       try {
@@ -679,7 +819,7 @@ export function makeFsBinding(ctx: NativesContext): Binding {
         private _mode: number,
       ) {}
       run(): void {
-        queueMicrotask(() => {
+        scheduleFs(() => {
           // Sentinel for special files: node's C++ surfaces them as
           // (kind, path) rather than an error so the JS can reject with
           // ERR_FS_CP_SOCKET / _FIFO_PIPE / _UNKNOWN itself.
@@ -797,7 +937,7 @@ export function makeFsBinding(ctx: NativesContext): Binding {
           const data: Uint8Array = B
             ? B.from(raw.buffer, raw.byteOffset, raw.byteLength)
             : raw;
-          queueMicrotask(() => this.ondone?.(null, data, -1, data.length, undefined));
+          scheduleFs(() => this.ondone?.(null, data, -1, data.length, undefined));
           return undefined;
         } catch (e: any) {
           // node's C++ returns an ErrnoException object (callers run
@@ -823,7 +963,7 @@ export function makeFsBinding(ctx: NativesContext): Binding {
         const p = String(path ?? this.path);
         try {
           vfs.writeFile(p, this.data as any);
-          queueMicrotask(() => this.ondone?.(null));
+          scheduleFs(() => this.ondone?.(null));
           return undefined;
         } catch (e: any) {
           if (e instanceof VfsError) {
@@ -867,7 +1007,7 @@ export function makeFsBinding(ctx: NativesContext): Binding {
 
       if (reqOrPromise === kUsePromisesFlag) {
         return new Promise((resolve, reject) => {
-          queueMicrotask(() => {
+          scheduleFs(() => {
             try {
               const fd = openIt();
               // node's C++ FileHandle: { fd, close() → Promise } — the JS
@@ -876,7 +1016,7 @@ export function makeFsBinding(ctx: NativesContext): Binding {
                 fd,
                 close(): Promise<void> {
                   return new Promise((res, rej) => {
-                    queueMicrotask(() => {
+                    scheduleFs(() => {
                       try { fds.delete(fd); res(); }
                       catch (e) { rej(e); }
                     });
@@ -892,9 +1032,9 @@ export function makeFsBinding(ctx: NativesContext): Binding {
       if (isReq(reqOrPromise)) {
         try {
           const fd = openIt();
-          queueMicrotask(() => (reqOrPromise as ReqLike).oncomplete?.(null, fd));
+          scheduleFs(() => (reqOrPromise as ReqLike).oncomplete?.(null, fd));
         } catch (e: any) {
-          queueMicrotask(() => (reqOrPromise as ReqLike).oncomplete?.(uvCode(e)));
+          scheduleFs(() => (reqOrPromise as ReqLike).oncomplete?.(uvCode(e)));
         }
         return;
       }

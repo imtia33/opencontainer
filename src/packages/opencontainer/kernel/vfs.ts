@@ -27,6 +27,9 @@ export interface VfsWatcher {
   path: string;
   onEvent: (event: { type: 'rename' | 'change'; filename: string | null }) => void;
   close(): void;
+  /** Set when the watcher targets a FILE: only that basename fires (node's
+   *  fs.watch(file) semantics — chokidar/vite's module invalidation). */
+  fileFilter?: string;
 }
 
 /** Persistence/delta hook op — emitted on every mutating VFS operation. */
@@ -492,10 +495,24 @@ export class Vfs {
 
   watch(path: string, onEvent: VfsWatcher['onEvent']): VfsWatcher {
     const norm = this.normalize(path);
-    const dirNode = this.mustDir(norm, 'watch');
+    // node's fs.watch accepts FILES and DIRECTORIES (chokidar watches both).
+    // A file watcher registers on its PARENT dir and filters events to the
+    // file's basename — the exact event stream node delivers.
+    let dirPath = norm;
+    let fileFilter: string | undefined;
+    const node = this.lookup(norm);
+    if (!node) {
+      throw new VfsError('ENOENT', errnoOf('ENOENT'), 'watch', norm);
+    }
+    if ((node.mode & S_IFMT) !== S_IFDIR) {
+      fileFilter = this.basename(norm);
+      dirPath = this.dirname(norm);
+    }
+    const dirNode = this.mustDir(dirPath, 'watch');
     const watcher: VfsWatcher = {
       path: norm,
       onEvent,
+      fileFilter,
       close: () => {
         dirNode.watchers.delete(watcher);
         this.watchersByDir.get(dirNode)?.delete(watcher);
@@ -514,7 +531,12 @@ export class Vfs {
 
   private fireChange(filePath: string) {
     const dir = this.lookup(this.dirname(filePath), false);
-    if (dir) for (const w of dir.watchers) w.onEvent({ type: 'change', filename: this.basename(filePath) });
+    if (!dir) return;
+    const base = this.basename(filePath);
+    for (const w of dir.watchers) {
+      if (w.fileFilter !== undefined && w.fileFilter !== base) continue;
+      w.onEvent({ type: 'change', filename: base });
+    }
   }
 
   private mustNode(p: string, syscall: string): VNode {

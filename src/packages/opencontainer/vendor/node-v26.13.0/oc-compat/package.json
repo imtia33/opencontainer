@@ -1,0 +1,8 @@
+{
+  "name": "@opencontainer/oc-compat",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OpenContainer post-install WASM compatibility pass: swaps native-tool packages (esbuild, rollup) for their official WASM twins so browser-hosted dev servers work. Mounted at /usr/lib/node_modules/oc-compat; invoked from the npm/pnpm bin shims.",
+  "main": "main.js",
+  "license": "MIT"
+}
