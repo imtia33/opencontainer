@@ -2837,6 +2837,893 @@ class Vfs {
     }
   }
 }
+
+// src/packages/opencontainer/kernel/native-vfs.ts
+var ERRNO_TABLE = {
+  EPERM: 1,
+  ENOENT: 2,
+  ESRCH: 3,
+  EINTR: 4,
+  EIO: 5,
+  ENXIO: 6,
+  E2BIG: 7,
+  ENOEXEC: 8,
+  EBADF: 9,
+  ECHILD: 10,
+  EAGAIN: 11,
+  ENOMEM: 12,
+  EACCES: 13,
+  EFAULT: 14,
+  EBUSY: 16,
+  EEXIST: 17,
+  EXDEV: 18,
+  ENODEV: 19,
+  ENOTDIR: 20,
+  EISDIR: 21,
+  EINVAL: 22,
+  ENFILE: 23,
+  EMFILE: 24,
+  ENOTTY: 25,
+  EFBIG: 27,
+  ENOSPC: 28,
+  ESPIPE: 29,
+  EROFS: 30,
+  EMLINK: 31,
+  EPIPE: 32,
+  ENAMETOOLONG: 36,
+  ENOSYS: 38,
+  ENOTEMPTY: 39,
+  ELOOP: 40,
+  ENODATA: 61,
+  ENOTSOCK: 88,
+  EDESTADDRREQ: 89,
+  EMSGSIZE: 90,
+  EPROTOTYPE: 91,
+  ENOPROTOOPT: 92,
+  EPROTONOSUPPORT: 93,
+  EOPNOTSUPP: 95,
+  EAFNOSUPPORT: 97,
+  EADDRINUSE: 98,
+  EADDRNOTAVAIL: 99,
+  ENETDOWN: 100,
+  ENETUNREACH: 101,
+  ECONNABORTED: 103,
+  ECONNRESET: 104,
+  ENOBUFS: 105,
+  EISCONN: 106,
+  ENOTCONN: 107,
+  ETIMEDOUT: 110,
+  ECONNREFUSED: 111,
+  EHOSTUNREACH: 113,
+  EINPROGRESS: 115
+};
+var ERRNO_TO_CODE = new Map;
+for (const code of Object.keys(ERRNO_TABLE))
+  ERRNO_TO_CODE.set(ERRNO_TABLE[code], code);
+for (const code of Object.keys(ERRNO_TABLE)) {
+  if (errnoOf(code) !== ERRNO_TABLE[code]) {
+    throw new Error(`native-vfs: errno table drift at ${code} — sync ERRNO_TABLE with vfs.ts`);
+  }
+}
+function throwErrno(errno, syscall, path) {
+  const code = ERRNO_TO_CODE.get(errno);
+  if (code === undefined) {
+    throw new Error(`native-core: unknown errno ${errno} from ${syscall} (${path})`);
+  }
+  throw new VfsError(code, errno, syscall, path);
+}
+var S_IFMT2 = 61440;
+var S_IFREG2 = 32768;
+var S_IFDIR2 = 16384;
+var S_IFLNK2 = 40960;
+var ENC = new TextEncoder;
+var DEC = new TextDecoder;
+function parentOf(norm) {
+  let p = norm;
+  while (p.length > 1 && p.endsWith("/"))
+    p = p.slice(0, -1);
+  if (p === "/")
+    return "/";
+  const i = p.lastIndexOf("/");
+  return i <= 0 ? "/" : p.slice(0, i);
+}
+function baseOf(norm) {
+  let p = norm;
+  while (p.length > 1 && p.endsWith("/"))
+    p = p.slice(0, -1);
+  if (p === "/")
+    return "/";
+  return p.slice(p.lastIndexOf("/") + 1);
+}
+var KNOWN_TIME_IMPORTS = /^(oc_)?(now_ms|now|time_ms|time|clock_ms|clock|date_now|ms)$/i;
+
+class Core {
+  memory;
+  exports;
+  statSlot;
+  retSlot;
+  mem;
+  dv;
+  statView;
+  lastCwd;
+  beforeRun;
+  constructor(wasm) {
+    const mod = wasm instanceof WebAssembly.Module ? wasm : new WebAssembly.Module(wasm);
+    const imports = WebAssembly.Module.imports(mod);
+    const importObject = {};
+    const memBox = { m: null };
+    let memory;
+    const unmet = [];
+    for (const imp of imports) {
+      const ns = importObject[imp.module] ??= {};
+      if (Object.prototype.hasOwnProperty.call(ns, imp.name))
+        continue;
+      if (imp.kind === "memory") {
+        if (!memory)
+          memory = new WebAssembly.Memory({ initial: 16 });
+        ns[imp.name] = memory;
+      } else if (imp.kind === "function") {
+        if (imp.name === "oc_mem_size") {
+          ns.oc_mem_size = () => memBox.m ? memBox.m.buffer.byteLength : 0;
+        } else if (KNOWN_TIME_IMPORTS.test(imp.name)) {
+          ns[imp.name] = () => Date.now();
+        } else {
+          unmet.push(`${imp.module}.${imp.name} (${imp.kind})`);
+        }
+      } else {
+        unmet.push(`${imp.module}.${imp.name} (${imp.kind})`);
+      }
+    }
+    if (unmet.length > 0) {
+      throw new Error(`native-core: module imports unsupported symbol(s): ${unmet.join(", ")} — ` + `the bridge provides oc_mem_size and Date.now()-style time imports; ` + `add the symbol to the import object in kernel/native-vfs.ts.`);
+    }
+    const instance = new WebAssembly.Instance(mod, importObject);
+    const ex = instance.exports;
+    const exportedMemory = ex.memory;
+    this.memory = memory ?? exportedMemory;
+    if (!this.memory) {
+      throw new Error("native-core: module neither exports nor imports linear memory");
+    }
+    memBox.m = this.memory;
+    const version = ex.oc_version();
+    if (version !== 1) {
+      throw new Error(`native-core: ABI version ${version} is not supported (frozen contract v1)`);
+    }
+    this.statSlot = ex.oc_stat_slot() >>> 0;
+    this.retSlot = ex.oc_ret_slot() >>> 0;
+    this.exports = ex;
+    this.recache();
+    this.lastCwd = this.getcwdInternal();
+  }
+  recache() {
+    const buf = this.memory.buffer;
+    this.mem = new Uint8Array(buf);
+    this.dv = new DataView(buf);
+    this.statView = new Float64Array(buf, this.statSlot, 18);
+  }
+  touch() {
+    if (this.mem.buffer !== this.memory.buffer)
+      this.recache();
+  }
+  stage(bytes) {
+    const n = bytes.byteLength;
+    if (n === 0)
+      return 0;
+    const ptr = this.exports.oc_arena_alloc(n) >>> 0;
+    if (ptr === 0) {
+      throw new Error(`native-core: arena OOM (oc_arena_alloc(${n}) returned 0)`);
+    }
+    this.touch();
+    this.mem.set(bytes, ptr);
+    return ptr;
+  }
+  run(syscall, errPath, fn) {
+    try {
+      if (this.beforeRun)
+        this.beforeRun();
+      this.touch();
+      const rc = fn();
+      this.touch();
+      if (rc < 0)
+        throwErrno(-rc, syscall, errPath);
+      return rc;
+    } finally {
+      this.exports.oc_arena_reset();
+    }
+  }
+  tryRun(fn) {
+    try {
+      if (this.beforeRun)
+        this.beforeRun();
+      this.touch();
+      const rc = fn();
+      this.touch();
+      return rc;
+    } finally {
+      this.exports.oc_arena_reset();
+    }
+  }
+  retView() {
+    const ptr = this.dv.getUint32(this.retSlot, true);
+    const len = this.dv.getUint32(this.retSlot + 4, true);
+    return this.mem.subarray(ptr, ptr + len);
+  }
+  retCopy() {
+    return new Uint8Array(this.retView());
+  }
+  retString() {
+    return DEC.decode(this.retView());
+  }
+  withPath(abs, syscall, errPath, fn) {
+    const b = ENC.encode(abs);
+    const ptr = this.stage(b);
+    return this.run(syscall, errPath, () => fn(ptr, b.byteLength));
+  }
+  withPaths(a, b, syscall, errPath, fn) {
+    const ab = ENC.encode(a);
+    const bb = ENC.encode(b);
+    const ap = this.stage(ab);
+    const bp = this.stage(bb);
+    return this.run(syscall, errPath, () => fn(ap, ab.byteLength, bp, bb.byteLength));
+  }
+  withPathBytes(abs, data, syscall, errPath, fn) {
+    const pb = ENC.encode(abs);
+    const pp = this.stage(pb);
+    const dp = this.stage(data);
+    return this.run(syscall, errPath, () => fn(pp, pb.byteLength, dp, data.byteLength));
+  }
+  getcwdInternal() {
+    this.run("getcwd", "", () => this.exports.oc_getcwd());
+    return this.retString();
+  }
+}
+
+class NativeSys {
+  core;
+  constructor(wasm, sharedCore) {
+    this.core = sharedCore instanceof Core ? sharedCore : new Core(wasm);
+  }
+  version() {
+    return this.core.exports.oc_version();
+  }
+  open(path, flags, mode = 0) {
+    return this.core.withPath(path, "open", path, (ptr, len) => this.core.exports.oc_open(ptr, len, flags, mode));
+  }
+  close(fd) {
+    this.core.run("close", String(fd), () => this.core.exports.oc_close(fd));
+  }
+  read(fd, length, position) {
+    const core = this.core;
+    const advance = position === undefined || position === null || position === -1;
+    core.run("read", String(fd), () => advance ? core.exports.oc_read(fd, length) : core.exports.oc_pread(fd, length, BigInt(Math.trunc(position))));
+    return core.retView();
+  }
+  write(fd, data, position) {
+    const core = this.core;
+    const ptr = core.stage(data);
+    const advance = position === undefined || position === null || position === -1;
+    return core.run("write", String(fd), () => advance ? core.exports.oc_write(fd, ptr, data.byteLength) : core.exports.oc_pwrite(fd, ptr, data.byteLength, BigInt(Math.trunc(position))));
+  }
+  ftruncate(fd, len) {
+    this.core.run("ftruncate", String(fd), () => this.core.exports.oc_ftruncate(fd, BigInt(Math.trunc(len))));
+  }
+  fstat(fd) {
+    this.core.run("fstat", String(fd), () => this.core.exports.oc_fstat(fd));
+    return this.core.statView;
+  }
+  fchmod(fd, mode) {
+    this.core.run("fchmod", String(fd), () => this.core.exports.oc_fchmod(fd, mode));
+  }
+  chdir(path) {
+    this.core.withPath(path, "chdir", path, (ptr, len) => this.core.exports.oc_chdir(ptr, len));
+    this.core.lastCwd = this.getcwd();
+  }
+  getcwd() {
+    this.core.run("getcwd", "", () => this.core.exports.oc_getcwd());
+    return this.core.retString();
+  }
+  statRaw(path, opts = {}) {
+    const follow = opts.follow !== false;
+    const core = this.core;
+    core.withPath(path, follow ? "stat" : "lstat", path, (ptr, len) => follow ? core.exports.oc_stat(ptr, len) : core.exports.oc_lstat(ptr, len));
+    if (opts.bigint) {
+      const out = new BigInt64Array(18);
+      for (let i = 0;i < 18; i++)
+        out[i] = BigInt(core.statView[i]);
+      return out;
+    }
+    return core.statView;
+  }
+  extractTar(bytes, destDir) {
+    const core = this.core;
+    const dp = core.stage(bytes);
+    const db = ENC.encode(destDir);
+    const pp = core.stage(db);
+    return core.run("extractTar", destDir, () => core.exports.oc_extract_tar(dp, bytes.byteLength, pp, db.byteLength));
+  }
+  debugCounts() {
+    const core = this.core;
+    core.run("debug_counts", "", () => core.exports.oc_debug_counts());
+    const ptr = core.dv.getUint32(core.retSlot, true);
+    const u = (i) => core.dv.getUint32(ptr + i * 4, true);
+    return { inodes: u(0), files: u(1), dirs: u(2), fds: u(3) };
+  }
+}
+
+class NativeVfs extends Vfs {
+  sys;
+  core;
+  dirWatchers = new Map;
+  cwdProviderStore;
+  constructor(wasm, now = () => Date.now()) {
+    super(now);
+    const core = new Core(wasm);
+    this.core = core;
+    this.sys = new NativeSys(wasm, core);
+    core.beforeRun = () => this.syncWasmCwd();
+    Object.defineProperty(this, "cwdProvider", {
+      get: () => this.cwdProviderStore,
+      set: (v) => {
+        this.cwdProviderStore = v;
+      },
+      enumerable: true,
+      configurable: true
+    });
+  }
+  syncingCwd = false;
+  syncWasmCwd() {
+    if (this.syncingCwd)
+      return;
+    const prov = this.cwdProviderStore;
+    if (!prov)
+      return;
+    let cwd;
+    try {
+      cwd = prov();
+    } catch {
+      return;
+    }
+    if (typeof cwd !== "string" || cwd === "" || cwd === this.core.lastCwd)
+      return;
+    const core = this.core;
+    this.syncingCwd = true;
+    try {
+      core.withPath(cwd, "chdir", cwd, (ptr, len) => core.exports.oc_chdir(ptr, len));
+      core.lastCwd = cwd;
+    } catch {} finally {
+      this.syncingCwd = false;
+    }
+  }
+  normalize(p) {
+    if (p === "") {
+      throw new VfsError("ERR_INVALID_ARG_VALUE", 22, "normalize", p, 'The "path" argument must not be empty');
+    }
+    const core = this.core;
+    if (p.startsWith("/")) {
+      core.withPath(p, "normalize", p, (ptr, len) => core.exports.oc_normalize(ptr, len));
+      return core.retString();
+    }
+    const prov = this.cwdProviderStore;
+    if (!prov) {
+      core.withPath(p, "normalize", p, (ptr, len) => core.exports.oc_normalize(ptr, len));
+      return core.retString();
+    }
+    let base = "/";
+    try {
+      const b = prov();
+      if (typeof b === "string" && b !== "")
+        base = b;
+    } catch {}
+    this.syncWasmCwd();
+    const abs = `${base.replace(/\/+$/, "")}/${p}`;
+    core.withPath(abs, "normalize", p, (ptr, len) => core.exports.oc_normalize(ptr, len));
+    return core.retString();
+  }
+  joinPaths(a, b) {
+    if (b.startsWith("/"))
+      return this.normalize(b);
+    return this.normalize(a.replace(/\/+$/, "") + "/" + b);
+  }
+  dirname(p) {
+    const norm = this.normalize(p);
+    if (norm === "/")
+      return "/";
+    const segs = norm.split("/").filter(Boolean);
+    segs.pop();
+    return segs.length ? "/" + segs.join("/") : "/";
+  }
+  basename(p) {
+    const segs = this.normalize(p).split("/").filter(Boolean);
+    return segs.length ? segs[segs.length - 1] : "/";
+  }
+  pathOf(_node) {
+    throw new Error("NativeVfs.pathOf() is not supported: the wasm core has no VNode objects");
+  }
+  modeOf(norm, follow) {
+    const core = this.core;
+    const b = ENC.encode(norm);
+    const ptr = core.stage(b);
+    const rc = core.tryRun(() => follow ? core.exports.oc_stat(ptr, b.byteLength) : core.exports.oc_lstat(ptr, b.byteLength));
+    return rc === 0 ? core.statView[1] : null;
+  }
+  statFieldsFromSlot() {
+    const v = this.core.statView;
+    const ms = (i) => v[i] * 1000 + v[i + 1] / 1e6;
+    return {
+      dev: v[0],
+      ino: v[7],
+      mode: v[1],
+      nlink: v[2],
+      uid: v[3],
+      gid: v[4],
+      rdev: v[5],
+      size: v[8],
+      blksize: v[6],
+      blocks: v[9],
+      atimeMs: ms(10),
+      mtimeMs: ms(12),
+      ctimeMs: ms(14),
+      birthtimeMs: ms(16)
+    };
+  }
+  stat(p, followSymlinks = true) {
+    const norm = this.normalize(p);
+    const core = this.core;
+    core.withPath(norm, followSymlinks ? "stat" : "lstat", p, (ptr, len) => followSymlinks ? core.exports.oc_stat(ptr, len) : core.exports.oc_lstat(ptr, len));
+    return this.statFieldsFromSlot();
+  }
+  lstat(p) {
+    return this.stat(p, false);
+  }
+  exists(p) {
+    try {
+      const norm = this.normalize(p);
+      return this.core.withPath(norm, "exists", p, (ptr, len) => this.core.exports.oc_exists(ptr, len)) === 1;
+    } catch {
+      return false;
+    }
+  }
+  isDirectory(p) {
+    try {
+      const norm = this.normalize(p);
+      const mode = this.modeOf(norm, true);
+      return mode !== null && (mode & S_IFMT2) === S_IFDIR2;
+    } catch {
+      return false;
+    }
+  }
+  mkdir(p, recursive = false, mode = 511) {
+    const norm = this.normalize(p);
+    const core = this.core;
+    if (norm === "/") {
+      if (recursive)
+        return null;
+      throw new VfsError("EEXIST", errnoOf("EEXIST"), "mkdir", p);
+    }
+    const entryMode = this.modeOf(norm, false);
+    if (entryMode !== null) {
+      const followMode = this.modeOf(norm, true);
+      if (followMode === null) {
+        throw new VfsError("ENOTDIR", errnoOf("ENOTDIR"), "mkdir", p);
+      }
+      if ((followMode & S_IFMT2) === S_IFDIR2 && recursive)
+        return null;
+      throw new VfsError("EEXIST", errnoOf("EEXIST"), "mkdir", p);
+    }
+    if (!recursive) {
+      const parentMode = this.modeOf(parentOf(norm), true);
+      if (parentMode === null || (parentMode & S_IFMT2) !== S_IFDIR2) {
+        throw new VfsError("ENOENT", errnoOf("ENOENT"), "mkdir", p);
+      }
+    }
+    const segs = norm.split("/").filter(Boolean);
+    let cur = "/";
+    let createdAny = false;
+    for (let i = 0;i < segs.length; i++) {
+      const path = cur === "/" ? "/" + segs[i] : cur + "/" + segs[i];
+      let m = this.modeOf(path, false);
+      if (m === null) {
+        core.withPath(path, "mkdir", p, (ptr, len) => core.exports.oc_mkdir(ptr, len, mode & 511));
+        this.emitRenameAt(cur);
+        createdAny = true;
+        cur = path;
+        continue;
+      }
+      if ((m & S_IFMT2) === S_IFLNK2) {
+        m = this.modeOf(path, true);
+        if (m === null) {
+          throw new VfsError("ENOTDIR", errnoOf("ENOTDIR"), "mkdir", p);
+        }
+      }
+      if ((m & S_IFMT2) !== S_IFDIR2) {
+        throw new VfsError("ENOTDIR", errnoOf("ENOTDIR"), "mkdir", p);
+      }
+      cur = path;
+    }
+    if (createdAny)
+      this.persist?.({ type: "mkdir", path: norm });
+    return norm;
+  }
+  readdir(p) {
+    const norm = this.normalize(p);
+    const core = this.core;
+    core.withPath(norm, "readdir", p, (ptr, len) => core.exports.oc_readdir(ptr, len));
+    const view = core.retView();
+    if (view.byteLength === 0)
+      return [];
+    return DEC.decode(view).split("\x00").filter((s) => s !== "");
+  }
+  dirents(p) {
+    const norm = this.normalize(p);
+    const core = this.core;
+    core.withPath(norm, "readdir", p, (ptr, len) => core.exports.oc_dirents(ptr, len));
+    const v = core.retView();
+    const out = [];
+    let i = 0;
+    while (i < v.byteLength) {
+      let j = i;
+      while (j < v.byteLength && v[j] !== 0)
+        j++;
+      if (j >= v.byteLength)
+        break;
+      const name = DEC.decode(v.subarray(i, j));
+      const code = v[j + 1];
+      out.push({ name, type: code << 12 & S_IFMT2 });
+      i = j + 2;
+    }
+    return out;
+  }
+  readFile(p) {
+    const norm = this.normalize(p);
+    const core = this.core;
+    core.withPath(norm, "readFile", p, (ptr, len) => core.exports.oc_read_file(ptr, len));
+    return core.retCopy();
+  }
+  readTextFile(p) {
+    return DEC.decode(this.readFile(p));
+  }
+  writeFile(p, data, mode = 438, owned = false) {
+    const isString = typeof data === "string";
+    const bytes = isString ? ENC.encode(data) : data;
+    const norm = this.normalize(p);
+    const core = this.core;
+    const entryMode = this.modeOf(norm, false);
+    if (entryMode !== null) {
+      const t = entryMode & S_IFMT2;
+      if (t === S_IFDIR2) {
+        throw new VfsError("EISDIR", errnoOf("EISDIR"), "open", p);
+      }
+      if (t === S_IFLNK2) {
+        const target = this.readlinkOf(norm);
+        const resolved = this.joinPaths(parentOf(norm), target);
+        this.writeFile(resolved, bytes, mode, owned || isString);
+        return;
+      }
+    }
+    const parentMode = this.modeOf(parentOf(norm), true);
+    if (parentMode === null || (parentMode & S_IFMT2) !== S_IFDIR2) {
+      throw new VfsError("ENOENT", errnoOf("ENOENT"), "open", p);
+    }
+    core.withPathBytes(norm, bytes, "open", p, (pp, pl, dp, dl) => core.exports.oc_write_file(pp, pl, dp, dl, mode & 511));
+    if (entryMode !== null)
+      this.emitChangeAt(parentOf(norm), baseOf(norm));
+    else
+      this.emitRenameAt(parentOf(norm));
+    this.persist?.({ type: "write", path: norm, data: bytes });
+  }
+  appendFile(p, data) {
+    const existing = this.exists(p) ? this.readFile(p) : new Uint8Array(0);
+    const add = typeof data === "string" ? ENC.encode(data) : data;
+    const merged = new Uint8Array(existing.byteLength + add.byteLength);
+    merged.set(existing);
+    merged.set(add, existing.byteLength);
+    this.writeFile(p, merged, 438, true);
+  }
+  copyFile(src, dest) {
+    this.writeFile(dest, this.readFile(src));
+  }
+  rm(p, opts = {}) {
+    const norm = this.normalize(p);
+    const core = this.core;
+    if (norm === "/") {
+      if (!opts.recursive && this.readdir("/").length > 0) {
+        throw new VfsError("ENOTEMPTY", errnoOf("ENOTEMPTY"), "rm", p);
+      }
+      this.emitRenameAt("/");
+      this.persist?.({ type: "unlink", path: "/" });
+      return;
+    }
+    const entryMode = this.modeOf(norm, false);
+    if (entryMode === null) {
+      if (opts.force)
+        return;
+      throw new VfsError("ENOENT", errnoOf("ENOENT"), "rm", p);
+    }
+    const force = opts.force ? 1 : 0;
+    if (opts.recursive) {
+      core.withPath(norm, "rm", p, (ptr, len) => core.exports.oc_rmrf(ptr, len, force));
+    } else {
+      core.withPath(norm, "rm", p, (ptr, len) => core.exports.oc_rm_nonrecursive(ptr, len, force));
+    }
+    this.emitRenameAt(parentOf(norm));
+    this.persist?.({ type: "unlink", path: norm });
+  }
+  rename(oldPath, newPath) {
+    const a = this.normalize(oldPath);
+    const b = this.normalize(newPath);
+    const core = this.core;
+    if (this.modeOf(a, false) === null) {
+      throw new VfsError("ENOENT", errnoOf("ENOENT"), "rename", oldPath);
+    }
+    const rc = core.tryRun(() => {
+      const ab = ENC.encode(a);
+      const bb = ENC.encode(b);
+      const ap = core.stage(ab);
+      const bp = core.stage(bb);
+      return core.exports.oc_rename(ap, ab.byteLength, bp, bb.byteLength);
+    });
+    if (rc < 0) {
+      const errno = -rc;
+      if (errno === 2) {
+        throw new VfsError("ENOENT", errnoOf("ENOENT"), "rename", newPath);
+      }
+      throwErrno(errno, "rename", newPath);
+    }
+    this.emitRenameAt(parentOf(a));
+    this.emitRenameAt(parentOf(b));
+    this.persist?.({ type: "rename", from: a, to: b });
+    const movedMode = this.modeOf(b, false);
+    if (movedMode !== null && (movedMode & S_IFMT2) === S_IFREG2) {
+      this.persist?.({ type: "write", path: b, data: this.readFileOf(b) });
+    }
+  }
+  symlink(target, path) {
+    const norm = this.normalize(path);
+    const core = this.core;
+    if (this.modeOf(norm, false) !== null)
+      return;
+    core.withPaths(target, norm, "symlink", path, (tp, tl, pp, pl) => core.exports.oc_symlink(tp, tl, pp, pl));
+    this.emitRenameAt(parentOf(norm));
+    this.persist?.({ type: "symlink", path: norm, target });
+  }
+  readlink(p) {
+    const norm = this.normalize(p);
+    return this.readlinkOf(norm, p);
+  }
+  readlinkOf(norm, errPath = norm) {
+    const core = this.core;
+    core.withPath(norm, "readlink", errPath, (ptr, len) => core.exports.oc_readlink(ptr, len));
+    return core.retString();
+  }
+  chmod(p, mode) {
+    const norm = this.normalize(p);
+    const core = this.core;
+    core.withPath(norm, "chmod", p, (ptr, len) => core.exports.oc_chmod(ptr, len, mode & 4095));
+  }
+  utimes(p, atimeMs, mtimeMs) {
+    const norm = this.normalize(p);
+    const core = this.core;
+    core.withPath(norm, "utimes", p, (ptr, len) => core.exports.oc_utimes(ptr, len, atimeMs, mtimeMs));
+  }
+  mountTree(dir, tree) {
+    for (const [name, node] of Object.entries(tree)) {
+      const path = this.joinPaths(dir, name);
+      const anyNode = node;
+      if (anyNode && typeof anyNode === "object" && "file" in anyNode) {
+        const contents = anyNode.file.contents;
+        if (typeof contents === "string")
+          this.writeFile(path, contents);
+        else if (contents instanceof Uint8Array)
+          this.writeFile(path, contents);
+      } else if (anyNode && typeof anyNode === "object" && "directory" in anyNode) {
+        this.mkdir(path, true);
+        this.mountTree(path, anyNode.directory.contents ?? {});
+      } else if (typeof anyNode === "string") {
+        this.writeFile(path, anyNode);
+      }
+    }
+  }
+  watch(path, onEvent) {
+    const norm = this.normalize(path);
+    const followMode = this.modeOf(norm, true);
+    if (followMode === null) {
+      throw new VfsError("ENOENT", errnoOf("ENOENT"), "watch", norm);
+    }
+    let dirPath = norm;
+    let fileFilter;
+    if ((followMode & S_IFMT2) !== S_IFDIR2) {
+      fileFilter = baseOf(norm);
+      dirPath = parentOf(norm);
+    }
+    const dirMode = this.modeOf(dirPath, true);
+    if (dirMode === null || (dirMode & S_IFMT2) !== S_IFDIR2) {
+      throw new VfsError("ENOTDIR", errnoOf("ENOTDIR"), "watch", dirPath);
+    }
+    const canon = this.canonicalizeDir(dirPath);
+    let watchers = this.dirWatchers.get(canon);
+    if (!watchers) {
+      watchers = new Set;
+      this.dirWatchers.set(canon, watchers);
+    }
+    const w = {
+      path: norm,
+      onEvent,
+      fileFilter,
+      close: () => {
+        watchers.delete(w);
+        if (watchers.size === 0)
+          this.dirWatchers.delete(canon);
+      }
+    };
+    watchers.add(w);
+    return w;
+  }
+  canonicalizeDir(dirPath) {
+    const segs = dirPath.split("/").filter(Boolean);
+    let cur = "/";
+    let budget = 40;
+    for (const seg of segs) {
+      const path = cur === "/" ? "/" + seg : cur + "/" + seg;
+      const m = this.modeOf(path, false);
+      if (m === null)
+        return dirPath;
+      if ((m & S_IFMT2) === S_IFLNK2) {
+        if (--budget < 0)
+          return dirPath;
+        let target;
+        try {
+          target = this.readlinkOf(path);
+        } catch {
+          return dirPath;
+        }
+        cur = target.startsWith("/") ? this.normalize(target) : this.joinPaths(cur, target);
+        continue;
+      }
+      cur = path;
+    }
+    return cur;
+  }
+  emitRenameAt(dirPath) {
+    if (this.dirWatchers.size === 0)
+      return;
+    const watchers = this.dirWatchers.get(this.canonicalizeDir(dirPath));
+    if (!watchers)
+      return;
+    for (const w of watchers)
+      w.onEvent({ type: "rename", filename: null });
+  }
+  emitChangeAt(dirPath, base) {
+    if (this.dirWatchers.size === 0)
+      return;
+    const watchers = this.dirWatchers.get(this.canonicalizeDir(dirPath));
+    if (!watchers)
+      return;
+    for (const w of watchers) {
+      if (w.fileFilter !== undefined && w.fileFilter !== base)
+        continue;
+      w.onEvent({ type: "change", filename: base });
+    }
+  }
+  dump(dir = "/", depth = 0) {
+    const norm = this.normalize(dir);
+    const mode = this.modeOf(norm, true);
+    if (mode === null)
+      return "(missing)";
+    if ((mode & S_IFMT2) !== S_IFDIR2)
+      return "";
+    const lines = [];
+    for (const e of this.dirents(norm)) {
+      lines.push("  ".repeat(depth) + e.name + ((e.type & S_IFMT2) === S_IFDIR2 ? "/" : ""));
+      if ((e.type & S_IFMT2) === S_IFDIR2) {
+        lines.push(this.dump(this.joinPaths(norm, e.name), depth + 1));
+      }
+    }
+    return lines.filter(Boolean).join(`
+`);
+  }
+  exportTree(dir = "/") {
+    const norm = this.normalize(dir);
+    const dirs = [];
+    const files = [];
+    const symlinks = [];
+    const rootMode = this.modeOf(norm, false);
+    if (rootMode !== null && (rootMode & S_IFMT2) !== S_IFDIR2) {
+      return { dirs, files, symlinks };
+    }
+    const realRoot = rootMode === null ? "/" : norm;
+    const base = norm;
+    const walk = (realDir, baseDir) => {
+      for (const e of this.dirents(realDir)) {
+        const realChild = realDir === "/" ? "/" + e.name : realDir + "/" + e.name;
+        const cp = baseDir === "/" ? "/" + e.name : baseDir + "/" + e.name;
+        const t = e.type & S_IFMT2;
+        if (t === S_IFDIR2) {
+          dirs.push(cp);
+          walk(realChild, cp);
+        } else if (t === S_IFLNK2) {
+          symlinks.push([cp, this.readlinkOf(realChild)]);
+        } else {
+          files.push([cp, this.readFileOf(realChild)]);
+        }
+      }
+    };
+    walk(realRoot, base);
+    return { dirs, files, symlinks };
+  }
+  importTree(tree) {
+    const prev = this.persist;
+    this.persist = undefined;
+    try {
+      for (const d of tree.dirs) {
+        try {
+          this.mkdir(d, true);
+        } catch {}
+      }
+      const ensureParents = (p) => {
+        const i = p.lastIndexOf("/");
+        if (i <= 0)
+          return;
+        try {
+          this.mkdir(p.slice(0, i), true);
+        } catch {}
+      };
+      for (const [p, data] of tree.files) {
+        try {
+          ensureParents(p);
+          this.writeFile(p, data, 438, true);
+        } catch {}
+      }
+      for (const [p, target] of tree.symlinks) {
+        try {
+          ensureParents(p);
+          this.symlink(target, p);
+        } catch {}
+      }
+    } finally {
+      this.persist = prev;
+    }
+  }
+  applyExternalOps(ops) {
+    const prev = this.persist;
+    this.persist = undefined;
+    try {
+      for (const op of ops) {
+        try {
+          switch (op.type) {
+            case "write":
+              this.writeFile(op.path, op.data, 438, true);
+              break;
+            case "mkdir":
+              this.mkdir(op.path, true);
+              break;
+            case "symlink":
+              this.symlink(op.target, op.path);
+              break;
+            case "unlink": {
+              try {
+                this.rm(op.path, { recursive: true, force: true });
+              } catch {}
+              break;
+            }
+            case "rename": {
+              try {
+                this.rename(op.from, op.to);
+              } catch {}
+              break;
+            }
+          }
+        } catch {}
+      }
+    } finally {
+      this.persist = prev;
+    }
+  }
+  readFileOf(abs) {
+    const core = this.core;
+    core.withPath(abs, "readFile", abs, (ptr, len) => core.exports.oc_read_file(ptr, len));
+    return core.retCopy();
+  }
+}
 // src/packages/opencontainer/vendor/node-v26.13.0/manifest.json
 var manifest_default = {
   nodeVersion: "v26.13.0",
@@ -4903,6 +5790,8 @@ function uvDirentOfHelper(mode) {
 }
 function makeFsBinding(ctx) {
   const vfs = ctx.vfs;
+  const nsys = vfs instanceof NativeVfs ? vfs.sys : null;
+  const fdPaths = nsys !== null ? new Map : null;
   function syncError(e, syscall, path) {
     if (e instanceof VfsError) {
       const err = new Error(e.message);
@@ -5029,9 +5918,21 @@ function makeFsBinding(ctx) {
   }
   const dualRead = dual("read", (a) => fdPath(a[0]), (fd, buffer, offset, length, position) => readFd(fd, buffer, offset, length, position));
   function fdPath(fd) {
+    if (nsys !== null) {
+      const p = fdPaths.get(fd);
+      if (p === undefined)
+        throw new VfsError("EBADF", errnoOf("EBADF"), "read", String(fd));
+      return p;
+    }
     return mustFd(fd, "read").path;
   }
   function readFd(fd, buffer, offset, length, position) {
+    if (nsys !== null) {
+      const explicit = position !== -1 && position !== null && position !== undefined;
+      const view = nsys.read(fd, length, explicit ? position : undefined);
+      buffer.set(view, offset);
+      return view.byteLength;
+    }
     const f = mustFd(fd, "read");
     const data = vfs.readFile(f.path);
     const pos = position === -1 || position === null || position === undefined ? f.pos : position;
@@ -5046,6 +5947,10 @@ function makeFsBinding(ctx) {
     if (fd === 1 || fd === 2) {
       ctx.hooks.onStdio(fd, bytes);
       return bytes.byteLength;
+    }
+    if (nsys !== null) {
+      const explicit = position !== -1 && position !== null && position !== undefined;
+      return nsys.write(fd, bytes, explicit ? position : undefined);
     }
     const f = mustFd(fd, "write");
     const explicitPos = position !== -1 && position !== null && position !== undefined;
@@ -5117,6 +6022,10 @@ function makeFsBinding(ctx) {
     ];
   }
   function statFields(p, followSymlinks, bigint = false) {
+    if (nsys !== null) {
+      const arr = nsys.statRaw(String(p), { follow: followSymlinks, bigint: bigint === true });
+      return bigint ? arr : Float64Array.from(arr);
+    }
     const s = followSymlinks ? vfs.stat(p) : vfs.lstat(p);
     if (!followSymlinks && (s.mode & 61440) === 40960) {
       try {
@@ -5218,8 +6127,20 @@ function makeFsBinding(ctx) {
   }
   const binding = {
     FSReqCallback,
-    open: dual("open", (a) => String(a[0]), (path, flags, _mode) => registerFd(String(path), flags)),
+    open: dual("open", (a) => String(a[0]), (path, flags, mode) => {
+      if (nsys !== null) {
+        const fd = nsys.open(String(path), flags, mode);
+        fdPaths.set(fd, String(path));
+        return fd;
+      }
+      return registerFd(String(path), flags);
+    }),
     close: dual("close", (a) => String(a[0]), (fd) => {
+      if (nsys !== null) {
+        nsys.close(fd);
+        fdPaths.delete(fd);
+        return;
+      }
       mustFd(fd, "close");
       fds.delete(fd);
     }),
@@ -5305,6 +6226,16 @@ function makeFsBinding(ctx) {
       const [fd, bigint, x, y] = all;
       const throwIfNoEntry = typeof x === "boolean" ? x : y;
       try {
+        if (nsys !== null) {
+          const view = nsys.fstat(fd);
+          if (bigint === true) {
+            const out = new BigInt64Array(18);
+            for (let i = 0;i < 18; i++)
+              out[i] = BigInt(view[i]);
+            return out;
+          }
+          return Float64Array.from(view);
+        }
         return statFields(fdPath(fd), true, bigint === true);
       } catch (e) {
         if (throwIfNoEntry === false && e instanceof VfsError && e.code === "ENOENT")
@@ -5398,7 +6329,13 @@ function makeFsBinding(ctx) {
     link: dual("link", (a) => String(a[0]), (existing, newPath) => vfs.symlink(String(existing), String(newPath))),
     readlink: dual("readlink", (a) => String(a[0]), (path) => vfs.readlink(String(path))),
     chmod: dual("chmod", (a) => String(a[0]), (path, mode) => vfs.chmod(String(path), mode)),
-    fchmod: dual("fchmod", (a) => fdPath(a[0]), (fd, mode) => vfs.chmod(fdPath(fd), mode)),
+    fchmod: dual("fchmod", (a) => fdPath(a[0]), (fd, mode) => {
+      if (nsys !== null) {
+        nsys.fchmod(fd, mode);
+        return;
+      }
+      vfs.chmod(fdPath(fd), mode);
+    }),
     utimes: dual("utimes", (a) => String(a[0]), (path, atime, mtime) => vfs.utimes(String(path), atime, mtime)),
     futimes: dual("futimes", (a) => fdPath(a[0]), (fd, atime, mtime) => vfs.utimes(fdPath(fd), atime, mtime)),
     lutimes: dual("lutimes", (a) => String(a[0]), (path, atime, mtime) => vfs.utimes(String(path), atime, mtime)),
@@ -5407,6 +6344,10 @@ function makeFsBinding(ctx) {
       vfs.writeFile(String(path), new Uint8Array(data));
     }),
     ftruncate: dual("ftruncate", (a) => fdPath(a[0]), (fd, len) => {
+      if (nsys !== null) {
+        nsys.ftruncate(fd, len);
+        return;
+      }
       const f = mustFd(fd, "ftruncate");
       const data = vfs.readFile(f.path).subarray(0, len);
       vfs.writeFile(f.path, new Uint8Array(data));
@@ -15587,7 +16528,7 @@ async function bootKernel(opts) {
   if (typeof globalThis.SharedArrayBuffer === "undefined") {
     globalThis.SharedArrayBuffer = ArrayBuffer;
   }
-  const vfs = opts.vfs ?? new Vfs;
+  const vfs = opts.vfs ?? (opts.nativeCore ? new NativeVfs(opts.nativeCore) : new Vfs);
   const cwd = opts.cwd ?? "/home/project";
   for (const d of [
     "/home",
@@ -16540,6 +17481,33 @@ async function loadBlob(entry, phase, marks) {
   writeCache(entry.file, raw);
   return raw;
 }
+async function toRawWasm(buf) {
+  if (buf.byteLength >= 4) {
+    const b = new Uint8Array(buf, 0, 4);
+    if (b[0] === 0 && b[1] === 97 && b[2] === 115 && b[3] === 109)
+      return buf;
+  }
+  if (buf.byteLength >= 2) {
+    const b = new Uint8Array(buf, 0, 2);
+    if (b[0] === 31 && b[1] === 139)
+      return gunzip2(buf);
+  }
+  throw new Error("native-core wasm has unexpected leading bytes (expected wasm or gzip magic)");
+}
+async function loadNativeCore(entry) {
+  const cached = await readCache(entry.file);
+  if (cached) {
+    try {
+      return await toRawWasm(cached);
+    } catch {}
+  }
+  const res = await fetch(cacheKeyUrl(entry.file));
+  if (!res.ok)
+    throw new Error(`native-core fetch failed: ${entry.file} (${res.status})`);
+  const raw = await toRawWasm(await res.arrayBuffer());
+  writeCache(entry.file, raw);
+  return raw;
+}
 var kernel = null;
 var amaroReady = false;
 var booting = false;
@@ -16629,7 +17597,15 @@ async function boot(msg) {
     index = await indexRes.json();
   }
   lap("indexMs");
+  const nativeCorePromise = index.nativeCore ? loadNativeCore(index.nativeCore).catch((e) => {
+    post({
+      type: "error",
+      message: `native-core (Rust kernel) unavailable — booted the JS VFS fallback: ${e?.message ?? e}`
+    });
+    return null;
+  }) : Promise.resolve(null);
   const coreBuf = await loadBlob(index.core, "core", marks);
+  const nativeCoreBuf = await nativeCorePromise;
   lap("coreTotalMs");
   post({ type: "boot-progress", phase: "core:decode", loaded: 0, total: index.core.rawBytes });
   const count = attachBlob(coreBuf);
@@ -16651,6 +17627,7 @@ async function boot(msg) {
   globalThis.__ocConnIdBase = pid * 1e5 + 1;
   kernel = await bootKernel({
     store: makeLazyStore(),
+    nativeCore: nativeCoreBuf ?? undefined,
     hydrate: hydrateTree ?? undefined,
     pid,
     ppid: msg.ppid ?? 0,

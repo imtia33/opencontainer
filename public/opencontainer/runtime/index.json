@@ -1,6 +1,6 @@
 {
   "nodeVersion": "v26.13.0",
-  "generatedAt": "2026-11-07T13:52:27.491Z",
+  "generatedAt": "2026-11-07T15:28:37.230Z",
   "core": {
     "file": "node-v26.13.0-core-0d806b2a.ocrt",
     "sha256": "0d806b2a",
@@ -28,5 +28,12 @@
     "rawBytes": 18048951,
     "gzBytes": 3924383,
     "modules": 1058
+  },
+  "nativeCore": {
+    "file": "oc-core-48938957.wasm.gz",
+    "sha256": "48938957",
+    "rawBytes": 97983,
+    "gzBytes": 46422,
+    "modules": 0
   }
 }

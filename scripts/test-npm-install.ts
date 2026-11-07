@@ -14,6 +14,7 @@
 import * as nodeFs from 'node:fs';
 import * as nodePath from 'node:path';
 import { bootKernel } from '../src/packages/opencontainer/kernel/boot';
+import { nativeCoreOpt } from './native-core-loader';
 
 const VENDOR = '/home/z/my-project/src/packages/opencontainer/vendor';
 const NPM_OC_CLI = '/usr/lib/node_modules/npm-oc/cli.js';
@@ -84,7 +85,7 @@ async function main() {
       return gunzipSync(gz);
     }
   };
-  const kernel = await bootKernel({ store: diskStore as any, hooks: makeHooks() });
+  const kernel = await bootKernel({ nativeCore: nativeCoreOpt(), store: diskStore as any, hooks: makeHooks() });
   (globalThis as any).__ocUncaught = (err: any, pt: any) =>
     hostErr(`[uncaught${pt ? ' (promise)' : ''}]`, err?.stack ?? String(err));
 

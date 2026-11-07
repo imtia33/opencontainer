@@ -14,6 +14,7 @@
 import * as nodeFs from 'node:fs';
 import * as nodePath from 'node:path';
 import { bootKernel } from '../src/packages/opencontainer/kernel/boot';
+import { nativeCoreOpt } from './native-core-loader';
 import type { EsmServing } from '../src/packages/opencontainer/kernel/esm-graph';
 
 const VENDOR = nodePath.resolve(__dirname, '../src/packages/opencontainer/vendor');
@@ -97,6 +98,7 @@ async function main() {
     },
   };
   const kernel = await bootKernel({
+    nativeCore: nativeCoreOpt(),
     store: diskStore as any,
     argv: ['node', CLI, ...pnpmArgs.split(' ')],
     hooks: {

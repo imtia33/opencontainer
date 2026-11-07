@@ -9,6 +9,7 @@
  */
 import * as nodeZlib from 'node:zlib';
 import { bootKernel } from '../src/packages/opencontainer/kernel/boot';
+import { nativeCoreOpt } from './native-core-loader';
 import * as nodeFs from 'node:fs';
 import * as nodePath from 'node:path';
 
@@ -108,6 +109,7 @@ async function main() {
   let stdout = '';
   let stderr = '';
   const kernel = await bootKernel({
+    nativeCore: nativeCoreOpt(),
     store: diskStore as any,
     argv: ['node', '/home/project/zcheck.js'],
     hooks: {

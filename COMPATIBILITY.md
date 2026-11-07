@@ -68,6 +68,32 @@
 
 ## 2. Runtime & process model
 
+### 2.0 The native kernel core (Rust→WASM)
+
+The kernel's filesystem data plane is **Rust compiled to WebAssembly**
+(`kernel/native-core`, ABI documented in `docs/native-core-spec.md`): inode
+arena with O(1) child lookup and insertion-ordered readdir, a real fd table
+(open(2) flags incl. O_EXCL/O_TRUNC/O_APPEND, positioned read/write where
+pwrite never moves the offset), iterative symlink resolution with a 40-follow
+budget, whole-file fast paths, and a ustar/pax/GNU tar extractor. The kernel
+worker loads it at boot (~96 KB / 45 KB gz, cached like the other runtime
+assets) and `internalBinding('fs')` routes fd syscalls through it — one wasm
+call per syscall. This is the same architecture class as WebContainers,
+whose kernel is also Rust→wasm running beneath Node's JS standard library
+(neither system compiles Node's C++ — Node's `lib/*.js` runs on the browser
+engine in both).
+
+What is intentionally NOT native (v1): watchers, the persistence/delta hook,
+`ErrnoException` shaping, fds 0–2 stdio bridging, async scheduling — these
+are JS because they ARE JS-facing callbacks/objects. Decompression stays on
+the browser's native `DecompressionStream`. When the wasm asset is missing
+the kernel boots a TypeScript VFS with identical semantics (the fallback the
+kernel gates can force via `OC_NO_NATIVE=1`).
+
+One deliberate behavior fix that came with the native core: `open()` with
+`O_CREAT|O_EXCL` (`'wx'`) now returns **EEXIST** on an existing path, like
+real Node — the previous JS fd table silently re-opened existing files.
+
 | Feature | Status | Notes |
 |---|---|---|
 | Process manager (pid table, parent/children) | **Fully implemented and tested** | one kernel worker per process; nested children via guest `child_process` (pid 8 → 8001 → 8001001) |

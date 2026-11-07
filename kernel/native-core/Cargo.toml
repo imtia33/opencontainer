@@ -1,0 +1,20 @@
+[package]
+name = "native-core"
+version = "1.0.0"
+edition = "2021"
+description = "OpenContainer native kernel core: Rust -> wasm32-unknown-unknown, frozen ABI v1 (docs/native-core-spec.md)"
+license = "MIT"
+publish = false
+
+[lib]
+name = "native_core"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+# Spec-mandated release profile (docs/native-core-spec.md §1).
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

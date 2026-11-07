@@ -19,6 +19,7 @@ import { spawnSync } from 'node:child_process';
 import * as nodeFs from 'node:fs';
 import * as nodePath from 'node:path';
 import { bootKernel } from '../src/packages/opencontainer/kernel/boot';
+import { nativeCoreOpt } from './native-core-loader';
 
 const hostLog = console.log.bind(console);
 const hostError = console.error.bind(console);
@@ -53,6 +54,7 @@ const diskStore = {
 
 async function boot() {
   return bootKernel({
+    nativeCore: nativeCoreOpt(),
     store: diskStore as any,
     argv: ['node', '/home/project/parity-main.js'],
     hooks: {
@@ -363,6 +365,7 @@ const DIAG_TEXT_EXT = new Set([
 async function npmDiag() {
   const npmArgs = (process.env.OC_PARITY_NPM ?? '-v').split(' ');
   const kernel = await bootKernel({
+    nativeCore: nativeCoreOpt(),
     store: diskStore as any,
     argv: ['node', CLI_DIAG, ...npmArgs],
     hooks: {

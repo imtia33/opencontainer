@@ -59,6 +59,7 @@
     "test:http-client": "bun run scripts/test-http-client.ts",
     "prepublishOnly": "npm run build",
     "test:zlib": "bun run scripts/test-zlib.ts",
+    "test:native": "bun run scripts/test-native-bridge.ts && node kernel/native-core/smoke.mjs",
     "test:npm-real": "bun run scripts/test-npm-real.ts",
     "test:node-api": "bun run scripts/test-node-api.ts"
   },

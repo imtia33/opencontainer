@@ -29,5 +29,12 @@ export const RUNTIME_INDEX = {
     "rawBytes": 18048951,
     "gzBytes": 3924383,
     "modules": 1058
+  },
+  "nativeCore": {
+    "file": "oc-core-48938957.wasm.gz",
+    "sha256": "48938957",
+    "rawBytes": 97983,
+    "gzBytes": 46422,
+    "modules": 0
   }
 } as const;

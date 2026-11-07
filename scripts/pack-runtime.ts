@@ -176,6 +176,30 @@ function main() {
   }
   const pnpm = write('pnpm', pnpmFiles, PNPM_VENDOR, `pnpm-${pnpmVersion}`);
 
+  // Fifth asset: the Rust→WASM native kernel core (kernel/native-core,
+  // ABI v1 — docs/native-core-spec.md). A RAW binary, not an OCRT text
+  // container; served gzipped like the blobs. The worker's loader accepts
+  // both raw-wasm and gzip wire forms. Optional: when absent the kernel
+  // boots the JS VFS fallback with identical semantics.
+  const NATIVE_CORE_WASM = path.join(ROOT, 'kernel/native-core/pkg/oc_core.wasm');
+  let nativeCore: { file: string; sha256: string; rawBytes: number; gzBytes: number; modules: number } | undefined;
+  if (fs.existsSync(NATIVE_CORE_WASM)) {
+    const t0 = Bun.nanoseconds();
+    const blob = fs.readFileSync(NATIVE_CORE_WASM);
+    const hash = sha(blob);
+    const gz = gzipSync(blob, { level: 9 });
+    const file = `oc-core-${hash}.wasm.gz`;
+    fs.writeFileSync(path.join(OUT_DIR, file), gz);
+    const ms = ((Bun.nanoseconds() - t0) / 1e6).toFixed(0);
+    console.log(
+      `[opencontainer] native-core: ${(blob.length / 1024).toFixed(1)} KB raw → ` +
+      `${(gz.length / 1024).toFixed(1)} KB gz (Rust→WASM kernel core, ${ms} ms)`,
+    );
+    nativeCore = { file, sha256: hash, rawBytes: blob.length, gzBytes: gz.length, modules: 0 };
+  } else {
+    console.warn('[opencontainer] native-core: kernel/native-core/pkg/oc_core.wasm missing — packing without it (JS VFS fallback)');
+  }
+
   const index = {
     nodeVersion,
     generatedAt: new Date().toISOString(),
@@ -183,6 +207,7 @@ function main() {
     amaro,
     npm,
     pnpm,
+    nativeCore,
   };
   fs.writeFileSync(
     path.join(OUT_DIR, 'index.json'),

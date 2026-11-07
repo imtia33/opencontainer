@@ -18,6 +18,7 @@
 import * as nodeFs from 'node:fs';
 import * as nodePath from 'node:path';
 import { bootKernel } from '../src/packages/opencontainer/kernel/boot';
+import { nativeCoreOpt } from './native-core-loader';
 
 const VENDOR = nodePath.resolve(__dirname, '../src/packages/opencontainer/vendor');
 const NPM_VENDOR = nodePath.resolve(__dirname, '../vendor/npm-12.2.1');
@@ -81,6 +82,7 @@ async function runNpm(
   // browser /oc-esm transport and the optional /api/oc-net bridge).
   const ESM_TMP = '/tmp/oc-esm-realtest';
   const kernel = await bootKernel({
+    nativeCore: nativeCoreOpt(),
     store: diskStore as any,
     vfs,
     argv: ['node', ...argv],

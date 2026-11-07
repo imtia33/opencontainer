@@ -214,6 +214,8 @@ interface RuntimeIndex {
   amaro: RuntimeIndexEntry;
   npm?: RuntimeIndexEntry;
   pnpm?: RuntimeIndexEntry;
+  /** Rust→WASM native kernel core (optional; JS VFS fallback when absent). */
+  nativeCore?: RuntimeIndexEntry;
 }
 
 // v2: the blobs were renamed .ocrt.gz → .ocrt (static hosts stamp
@@ -441,6 +443,37 @@ async function loadBlob(
   return raw;
 }
 
+/** Normalize a fetched/cached native-core wasm to the RAW wasm binary:
+ *  wasm magic (\0asm) → as-is; gzip magic (1f 8b) → gunzip. */
+async function toRawWasm(buf: ArrayBuffer): Promise<ArrayBuffer> {
+  if (buf.byteLength >= 4) {
+    const b = new Uint8Array(buf, 0, 4);
+    if (b[0] === 0x00 && b[1] === 0x61 && b[2] === 0x73 && b[3] === 0x6d) return buf;
+  }
+  if (buf.byteLength >= 2) {
+    const b = new Uint8Array(buf, 0, 2);
+    if (b[0] === 0x1f && b[1] === 0x8b) return gunzip(buf);
+  }
+  throw new Error('native-core wasm has unexpected leading bytes (expected wasm or gzip magic)');
+}
+
+/** Load the Rust→WASM native kernel core (~100 KB): cache-first, both wire
+ *  forms accepted, raw wasm cached. Non-fatal by contract — the caller
+ *  degrades to the JS VFS fallback on rejection. */
+async function loadNativeCore(entry: RuntimeIndexEntry): Promise<ArrayBuffer> {
+  const cached = await readCache(entry.file);
+  if (cached) {
+    try {
+      return await toRawWasm(cached);
+    } catch { /* poisoned cache entry — fall through to a refetch */ }
+  }
+  const res = await fetch(cacheKeyUrl(entry.file));
+  if (!res.ok) throw new Error(`native-core fetch failed: ${entry.file} (${res.status})`);
+  const raw = await toRawWasm(await res.arrayBuffer());
+  void writeCache(entry.file, raw);
+  return raw;
+}
+
 // ---------------------------------------------------------------------------
 // Kernel lifecycle
 // ---------------------------------------------------------------------------
@@ -572,7 +605,22 @@ async function boot(msg: {
   }
   lap('indexMs');
 
+  // Native core (Rust→WASM kernel, ~100 KB) races the core blob fetch.
+  // NON-FATAL by contract: on any failure the kernel boots the JS VFS
+  // fallback with identical semantics (the host is told why).
+  const nativeCorePromise: Promise<ArrayBuffer | null> = index!.nativeCore
+    ? loadNativeCore(index!.nativeCore)
+        .catch((e: any) => {
+          post({
+            type: 'error',
+            message: `native-core (Rust kernel) unavailable — booted the JS VFS fallback: ${e?.message ?? e}`,
+          });
+          return null;
+        })
+    : Promise.resolve(null);
+
   const coreBuf = await loadBlob(index.core, 'core', marks);
+  const nativeCoreBuf = await nativeCorePromise;
   lap('coreTotalMs');
   post({ type: 'boot-progress', phase: 'core:decode', loaded: 0, total: index.core.rawBytes });
   // S3.1: register zero-copy views; sources decode lazily on first require.
@@ -608,6 +656,7 @@ async function boot(msg: {
 
   kernel = await bootKernel({
     store: makeLazyStore(),
+    nativeCore: nativeCoreBuf ?? undefined,
     hydrate: hydrateTree ?? undefined,
     pid,
     ppid: msg.ppid ?? 0,

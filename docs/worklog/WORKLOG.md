@@ -819,3 +819,114 @@ preview pane layout, Snazzy palette, local fonts + server route).
    user ran — the drivers never typed Enter into a busy prompt. E2E
    must include the interactive y/N flows (npx prompts), not just
    fire-and-collect commands.
+
+## Session 20-22 — 2026-11-07 (real shell builtins + pnpm + JS-VFS perf — commit f2cc6e3)
+
+(Condensed from the commit message; the live worklog was cut off at S19.)
+S20: SHELL_BUILTINS route through oc-sh — a REAL shell process with `; && ||`
+and redirections; OC_CWD_REPORT moves the session cwd; full base-image dirs
+every boot. S21: VFS hot-path JS tuning (children Map, owned stores,
+incremental snapshot fold, tty batching, pwrite-after-O_TRUNC fast path).
+S22: http client maxSockets semaphore (the reify OOM at ~300 packages).
+Real pnpm 10.34.9 vendored (last pure-JS upstream line), entry-gated mount.
+Verified: kernel gates green, cd/pwd/mkdir compound lines, pnpm -v/init/add.
+
+## Session 23 — 2026-11-07 (NATIVE kernel core: Rust→WASM — the WebContainers architecture)
+
+**User directive: "everything native, exactly the same way WebContainer
+does it, nothing different, no DIY — write it in C++ or Rust compiled to
+WebAssembly. Speed is everything."** No benchmarking this session per
+directive; correctness gates only.
+
+### Research first (docs/native-kernel-research.md, ~30 primary sources)
+- WebContainers' kernel is **Rust compiled to WASM** — confirmed by their
+  engineers' public statements AND by disassembly of their ~440 KB wasm
+  (rust toolchain, libc-like fs code).
+- V8/Node C++ was NEVER compiled — their Node lib/*.js runs on the browser
+  engine (proven by the Firefox port needing V8-API polyfills). So our
+  architecture class was already identical; the missing piece was the
+  native DATA PLANE under the JS bindings layer.
+- Emscripten MEMFS is JS glue (verified from source) — NOT the reference;
+  the C++ reference is WasmFS. Decision: **Rust → wasm32-unknown-unknown**,
+  same as WebContainers.
+
+### The build (frozen ABI first — docs/native-core-spec.md)
+- ABI v1 frozen BEFORE implementation: chunked no-move bump arena (inbound),
+  RET_SLOT (ptr,len) out-buffer, 144-byte STAT_SLOT with node's 18-f64
+  positional stat layout, negative-errno returns, 40+ oc_* exports.
+- `kernel/native-core/` (Rust, std-only, zero deps): inode arena (u32 ids,
+  free-list, monotonic ino), Dir{HashMap children + order Vec with
+  tombstone compaction} preserving INSERTION-ORDER readdir, fd table
+  (Vec<Option>, first-free, 0-2 reserved, EMFILE at 4096), iterative
+  symlink resolution (parent-join rule, 40-follow ELOOP), POSIX rename
+  matrix, whole-file fast paths, ustar/pax/GNU tar with ../escape rejection.
+  panic=abort-safe: every ptr/len validated before deref (-EFAULT).
+- `kernel/native-vfs.ts` (the bridge): NativeVfs extends Vfs (drop-in),
+  NativeSys raw syscall layer; view re-derivation on memory growth; errno
+  reverse-table with a load-time drift check against errnoOf; watchers +
+  persist hooks stay JS (spec §6).
+- `natives/fs.ts` refactor: fd table + I/O moved into wasm — ONE oc_* call
+  per syscall replaces registerFd's 4 tree walks, readFd's whole-file copy
+  and writeFd's read-merge-write. statFields reads the Rust-filled slot.
+  fdPaths Map kept ONLY for ErrnoException.path parity.
+
+### Bugs found by the fix-loop (all four classes hit)
+1. FdTable::new() with an empty Vec — first fd landed at 0 (stdio!) not 3;
+   cascaded into ~15 test failures. Fix: pre-seed 3 None slots.
+2. Errno sign bugs: syscalls::stat/readlink/readdir propagated Err(e) from
+   resolve() WITHOUT negating (+ENOENT/+ELOOP leaking to the ABI); fixing
+   stat then broke chmod/utimes/truncate (double negation) — the callers
+   had compensated. tar entry_dest returned negative while call sites
+   negated again (+22). Lesson: ONE sign convention, applied at ONE layer.
+3. **memory_size(0)**: the 2026-era intrinsic is const-generic
+   (memory_size::<0>()) — the runtime-arg form compiles against a
+   deprecated shim and returns GARBAGE. Found via an EFAULT smoke probe
+   (valid pointers rejected, invalid accepted). The single most dangerous
+   bug of the session: silent memory-corruption class.
+4. Test-authoring bugs in the subagent suites (missing prerequisites,
+   reversed tb::symlink(name, target) args, off-by-one ELOOP chain, array-
+   passed-as-single-arg in the JS smoke). Fixed against the SPEC, never by
+   weakening the implementation.
+
+### Integration (all layers)
+- boot.ts: `nativeCore?: ArrayBuffer | WebAssembly.Module` → NativeVfs
+  (JS VFS fallback when absent — gates force it via OC_NO_NATIVE=1).
+- Core.beforeRun hook: EVERY syscall re-syncs the wasm cwd from the live
+  cwdProvider (process.chdir + raw relative sys.open paths) — reentrancy-
+  guarded.
+- worker-entry: oc-core-<hash>.wasm.gz as a fifth runtime asset — races the
+  core blob fetch, NON-FATAL (falls back + tells the host), cached in
+  opencontainer-runtime-v2. pack-runtime emits it + the index entry.
+- All bun gates load the wasm via scripts/native-core-loader.ts.
+
+### Verification (all green, native core ACTIVE unless noted)
+- cargo test (host): **65/65**. node smoke (ABI from JS): **42/42**,
+  wasm = 96 KB raw / 45 KB gz (WebContainers' kernel: ~440 KB).
+- TS bridge acceptance (bun): **153/153** — Vfs-surface parity, rename
+  matrix, symlink split, watchers, persist ops, import/export round-trips,
+  arena/growth, fd semantics, tar.
+- Kernel gates: node-api **45/45** (real fs ops through NativeSys), zlib
+  **23/23**, buffer-parity **53/53**, req-esm ok, **npm-real 12/12 — the
+  real npm CLI installing through the Rust kernel**.
+- Browser (Chromium): kernel worker fetches + caches oc-core-48938957.wasm.gz,
+  boots Node v26.13.0 on the native VFS, `node -e` fs write/read/stat ok,
+  `npm -v` 12.2.1 ok, console clean. NATIVE_BOOT_OK.
+
+### Honest claims for the website (research §7)
+True: "real Node stdlib + real npm/pnpm + a native Rust/WASM kernel core —
+the same architecture class as WebContainers." FALSE for anyone (including
+StackBlitz): "Node compiled to WebAssembly". The native core is shipped as
+an optional runtime asset with a semantic-identical JS fallback.
+
+### Lessons
+1. Freeze the ABI in a spec BEFORE two agents implement both sides — the
+   spec was the only coordination point and it held.
+2. Subagent code needs the same fix-loop rigor as human code: 30/66 of the
+   crate tests failed on first run, and half of those were TEST bugs, not
+   implementation bugs. Every failure was adjudicated against the spec.
+3. A "compiles fine" deprecated intrinsic shim that returns garbage is the
+   scariest failure mode a wasm build can have — smoke probes that check
+   BOUNDARY behavior (not just happy paths) are what catch it.
+4. One sign convention per layer, enforced everywhere: mixed conventions
+   produced compensating bugs that fell like dominoes when the first was
+   fixed.

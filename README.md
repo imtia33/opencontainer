@@ -22,6 +22,7 @@ That's the whole setup. Code written against `@webcontainer/api` runs by changin
 
 ## What runs inside
 
+- **A native kernel core.** The filesystem data plane — inode tree, fd table, path resolution, file I/O, tar extraction — is Rust compiled to WebAssembly (`kernel/native-core`, ~96 KB / 45 KB gz), called synchronously through a flat C ABI. Same architecture class as WebContainers (whose kernel is Rust→wasm; neither compiles Node's C++). One `oc_*` call per syscall: no JS fd maps, no whole-file read-merge-write cycles. Falls back to a TypeScript VFS with identical semantics when the wasm asset is absent.
 - **Real Node, not a look-alike.** Node's own `lib/*.js` standard library (511 modules, vendored unmodified from v26.13.0) executes on the browser's own JS engine, on a shim that implements the ~40 C++ `internalBinding` surfaces (fs → virtual filesystem, uv → browser event loop, zlib, http_parser, tcp/pipe wraps → virtual sockets) on browser primitives. No Node binary, no WASM Node.
 - **Real npm.** The unmodified upstream npm CLI (v12.2.1) runs as a guest process; `npm install` talks to the real registry directly from the browser.
 - **A real filesystem.** In-memory virtual filesystem with Node semantics (wx/EEXIST, atomic rename, symlinks, watchers). Session-scoped by design — the temporary-environment contract: the host supplies project files at boot, guests mutate them in memory, nothing survives a reload.
@@ -31,7 +32,7 @@ Every intentional divergence from Node.js and from WebContainer is documented in
 
 ## Zero hosting, by design
 
-Like WebContainer (whose runtime is fetched at boot from StackBlitz's own origin), the npm package is just the API. The runtime assets — kernel worker + Node/npm blobs — are fetched at boot from the jsDelivr CDN, pinned to the installed version, and cached via the browser's Cache API:
+Like WebContainer (whose runtime is fetched at boot from StackBlitz's own origin), the npm package is just the API. The runtime assets — kernel worker + Node/npm blobs + the native-core wasm — are fetched at boot from the jsDelivr CDN, pinned to the installed version, and cached via the browser's Cache API:
 
 ```ts
 // default: https://cdn.jsdelivr.net/npm/opencontainer@<version>/public/opencontainer
@@ -72,14 +73,16 @@ Without it, everything except preview URLs works (a console warning explains the
 | Temporary session-scoped VFS (no cross-reload restore) | ✅ by design |
 | ESM entry points + dynamic `import()` (esm-graph, in-worker blob modules) | ✅ verified by create-vite/create-expo-app E2E |
 | `vite` dev server (real vite 7.3.7 via npm) | ✅ 20/20 HMR edits, kill+restart reconnect, reload churn (E2E) |
-| pnpm (genuine CLI, vendored) | 🚧 P2 |
+| pnpm (genuine CLI, vendored 10.34.9) | ✅ `pnpm -v` / `pnpm init` / `pnpm add` |
+| Native kernel core (Rust→WASM VFS + fd syscalls + tar) | ✅ 96 KB wasm, all kernel gates green |
 | Lifecycle scripts | 🔒 off by default (permission model pending) |
 
 ## Repository layout
 
 ```
 src/packages/opencontainer/
-  kernel/                     worker entry, VFS, natives, ESM graph, HTTP client
+  kernel/                     worker entry, native-vfs bridge, VFS fallback, natives, ESM graph, HTTP client
+  kernel/native-core/         the Rust→WASM native kernel core (crate + tests + smoke)
   node-std/                   main-thread node std shapes
   webcontainer-api.ts         the @webcontainer/api-compatible facade
   runtime.ts                  OpenContainerRuntime (process manager, preview bridge)
@@ -102,6 +105,8 @@ docs/webcontainer-research.md primary-source WebContainer API reference (parity 
 ```bash
 bun install
 npm run build          # kernel worker + runtime blobs + dist bundle
+npm run test:native    # Rust-core ABI smoke + TS bridge acceptance (needs kernel/native-core/pkg/oc_core.wasm)
+cargo test             # native-core host tests (cd kernel/native-core; 65/65)
 npm run test:harness   # boots the vendored npm CLI in the kernel harness
 bun run harness/server.ts   # browser E2E harness at http://localhost:7800
 ```

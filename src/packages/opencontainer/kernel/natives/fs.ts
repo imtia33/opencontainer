@@ -1,5 +1,6 @@
 import type { Binding, NativesContext } from './index';
 import { VfsError, errnoOf } from '../vfs';
+import { NativeVfs } from '../native-vfs';
 import { ensureStdinBridge } from './stdin-bridge';
 
 /**
@@ -78,6 +79,17 @@ interface ReqLike {
 
 export function makeFsBinding(ctx: NativesContext): Binding {
   const vfs = ctx.vfs;
+  /** Native core (Rust→WASM) fast path: when the kernel boots with
+   *  NativeVfs, the fd table, path resolution and file I/O live in wasm —
+   *  ONE oc_* call per syscall replaces the JS fd Map + whole-file
+   *  read-merge-write cycles (docs/native-core-spec.md). Null = the JS
+   *  VFS fallback (harnesses/hosts without the wasm artifact); both paths
+   *  implement identical semantics. */
+  const nsys = vfs instanceof NativeVfs ? vfs.sys : null;
+  /** fd → path, NATIVE PATH ONLY: the fd table itself lives in wasm; this
+   *  map exists purely so error messages (dual()'s getPath →
+   *  ErrnoException.path) keep the exact shapes the JS table produced. */
+  const fdPaths = nsys !== null ? new Map<number, string>() : null;
 
   /** Throws node-shaped ErrnoException for a VfsError. */
   function syncError(e: unknown, syscall: string, path?: string): never {
@@ -278,10 +290,24 @@ export function makeFsBinding(ctx: NativesContext): Binding {
     readFd(fd, buffer, offset, length, position));
 
   function fdPath(fd: number): string {
+    if (nsys !== null) {
+      const p = fdPaths!.get(fd);
+      if (p === undefined) throw new VfsError('EBADF', errnoOf('EBADF'), 'read', String(fd));
+      return p;
+    }
     return mustFd(fd, 'read').path;
   }
 
   function readFd(fd: number, buffer: Uint8Array, offset: number, length: number, position: number): number {
+    if (nsys !== null) {
+      // One wasm call: read at the fd position (or pread at the explicit
+      // position — never moving the offset), copying the returned view
+      // into the caller's buffer. No whole-file readFile anymore.
+      const explicit = position !== -1 && position !== null && position !== undefined;
+      const view = nsys.read(fd, length, explicit ? position : undefined);
+      buffer.set(view, offset);
+      return view.byteLength;
+    }
     // fd 1/2 reads: EBADF in node too (writing ends are not readable).
     const f = mustFd(fd, 'read');
     const data = vfs.readFile(f.path);
@@ -302,6 +328,14 @@ export function makeFsBinding(ctx: NativesContext): Binding {
     if (fd === 1 || fd === 2) {
       (ctx.hooks as any).onStdio(fd, bytes);
       return bytes.byteLength;
+    }
+    if (nsys !== null) {
+      // One wasm call: a real fd-positioned write (O_APPEND appends at the
+      // end, an explicit position never moves the offset) — no
+      // read-merge-write, no realloc-per-write. This is THE npm-install
+      // hot loop (tar extraction writes every file through it).
+      const explicit = position !== -1 && position !== null && position !== undefined;
+      return nsys.write(fd, bytes, explicit ? position : undefined);
     }
     const f = mustFd(fd, 'write');
     const explicitPos = position !== -1 && position !== null && position !== undefined;
@@ -374,6 +408,14 @@ export function makeFsBinding(ctx: NativesContext): Binding {
   }
 
   function statFields(p: string, followSymlinks: boolean, bigint = false): any {
+    if (nsys !== null) {
+      // Rust fills the 18-f64 positional slot directly (lstat of a symlink
+      // already reports the target BYTE length there). COPY the view — the
+      // slot is overwritten by the next syscall, and dual()'s req/promise
+      // modes deliver the array on a later macrotask.
+      const arr = nsys.statRaw(String(p), { follow: followSymlinks, bigint: bigint === true });
+      return bigint ? arr : Float64Array.from(arr as Float64Array);
+    }
     const s = followSymlinks ? vfs.stat(p) : vfs.lstat(p);
     // node's internal/fs/utils.getStatsFromBinding consumes a POSITIONAL
     // array: [dev, mode, nlink, uid, gid, rdev, blksize, ino, size, blocks,
@@ -482,9 +524,23 @@ export function makeFsBinding(ctx: NativesContext): Binding {
     FSReqCallback,
 
     // ---- open/close ----------------------------------------------------------
-    open: dual('open', (a) => String(a[0]), (path: string, flags: number, _mode: number) =>
-      registerFd(String(path), flags)),
+    open: dual('open', (a) => String(a[0]), (path: string, flags: number, mode: number) => {
+      if (nsys !== null) {
+        // open(2) in wasm: O_CREAT/O_TRUNC/O_APPEND AND O_EXCL — which the
+        // JS registerFd never implemented (it silently re-opened existing
+        // files; cacache's 'wx' atomic-create finally gets its EEXIST).
+        const fd = nsys.open(String(path), flags, mode);
+        fdPaths!.set(fd, String(path));
+        return fd;
+      }
+      return registerFd(String(path), flags);
+    }),
     close: dual('close', (a) => String(a[0]), (fd: number) => {
+      if (nsys !== null) {
+        nsys.close(fd);
+        fdPaths!.delete(fd);
+        return;
+      }
       mustFd(fd, 'close');
       fds.delete(fd);
     }),
@@ -587,6 +643,15 @@ export function makeFsBinding(ctx: NativesContext): Binding {
       const [fd, bigint, x, y] = all as [number, boolean?, boolean?, boolean?];
       const throwIfNoEntry = typeof x === 'boolean' ? x : y;
       try {
+        if (nsys !== null) {
+          const view = nsys.fstat(fd);
+          if (bigint === true) {
+            const out = new BigInt64Array(18);
+            for (let i = 0; i < 18; i++) out[i] = BigInt(view[i]);
+            return out;
+          }
+          return Float64Array.from(view);
+        }
         return statFields(fdPath(fd), true, bigint === true);
       } catch (e) {
         if (throwIfNoEntry === false && e instanceof VfsError && e.code === 'ENOENT') return undefined;
@@ -701,7 +766,10 @@ export function makeFsBinding(ctx: NativesContext): Binding {
       vfs.symlink(String(existing), String(newPath))),
     readlink: dual('readlink', (a) => String(a[0]), (path: string) => vfs.readlink(String(path))),
     chmod: dual('chmod', (a) => String(a[0]), (path: string, mode: number) => vfs.chmod(String(path), mode)),
-    fchmod: dual('fchmod', (a) => fdPath(a[0]), (fd: number, mode: number) => vfs.chmod(fdPath(fd), mode)),
+    fchmod: dual('fchmod', (a) => fdPath(a[0]), (fd: number, mode: number) => {
+      if (nsys !== null) { nsys.fchmod(fd, mode); return; }
+      vfs.chmod(fdPath(fd), mode);
+    }),
     utimes: dual('utimes', (a) => String(a[0]), (path: string, atime: number, mtime: number) =>
       vfs.utimes(String(path), atime, mtime)),
     futimes: dual('futimes', (a) => fdPath(a[0]), (fd: number, atime: number, mtime: number) =>
@@ -713,6 +781,7 @@ export function makeFsBinding(ctx: NativesContext): Binding {
       vfs.writeFile(String(path), new Uint8Array(data));
     }),
     ftruncate: dual('ftruncate', (a) => fdPath(a[0]), (fd: number, len: number) => {
+      if (nsys !== null) { nsys.ftruncate(fd, len); return; }
       const f = mustFd(fd, 'ftruncate');
       const data = vfs.readFile(f.path).subarray(0, len);
       vfs.writeFile(f.path, new Uint8Array(data));

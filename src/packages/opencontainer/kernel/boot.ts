@@ -8,6 +8,7 @@
  */
 
 import { Vfs, VfsTree } from './vfs';
+import { NativeVfs } from './native-vfs';
 import { Natives, KernelHooks } from './natives';
 import { ModuleRegistry, loadPrimordials, SourceStore } from './module-registry';
 import { NODE_VERSION, VENDOR_ROOT, resolveModuleFile } from './id-map';
@@ -45,6 +46,11 @@ export interface BootOptions {
   store: SourceStore;
   hooks: KernelHooks;
   vfs?: Vfs;
+  /** Rust→WASM native core (kernel/native-core, ABI v1). When provided,
+   *  the VFS data plane + fd table live in wasm (NativeVfs) and
+   *  natives/fs.ts routes fd syscalls through it — the WebContainers-class
+   *  native kernel. Omit to boot the JS VFS fallback (identical surface). */
+  nativeCore?: ArrayBuffer | WebAssembly.Module;
   cwd?: string;
   env?: Record<string, string>;
   argv?: string[];
@@ -202,7 +208,9 @@ export async function bootKernel(opts: BootOptions): Promise<BootedKernel> {
     (globalThis as any).SharedArrayBuffer = ArrayBuffer;
   }
 
-  const vfs = opts.vfs ?? new Vfs();
+  // Native core first: opts.vfs wins (the harness may pass a pre-built
+  // NativeVfs it wants to inspect), then the wasm bytes, then the JS VFS.
+  const vfs = opts.vfs ?? (opts.nativeCore ? new NativeVfs(opts.nativeCore) : new Vfs());
   const cwd = opts.cwd ?? '/home/project';
   // Base directories every unix-ish node program expects to exist — the
   // "OS image" our runtime ships, mirroring OC_BASE_DIRS on the host side
