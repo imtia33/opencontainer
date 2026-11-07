@@ -37,7 +37,11 @@ void (async () => {
     check('WebContainer exported from package entry', typeof WebContainer === 'function' && typeof WebContainer.boot === 'function');
 
     // ---- boot ------------------------------------------------------------
-    const wc = await WebContainer.boot({ workdirName: 'project' });
+    // Self-hosted assets: the harness serves /opencontainer/* itself. The
+    // CDN default (jsDelivr) only resolves once the package is actually
+    // published to npm — a release-time concern, not an E2E gate; pinning
+    // the base keeps this driver deterministic on every commit.
+    const wc = await WebContainer.boot({ workdirName: 'project', assetsBase: '/opencontainer' });
     check('boot() resolves', !!wc);
     check('workdir property', wc.workdir === '/home/project', wc.workdir);
     check('path property', typeof wc.path === 'string' && wc.path.includes('/usr/local/bin'), wc.path);
@@ -152,11 +156,15 @@ void (async () => {
     const server = await wc.spawn('node', ['server.js'], { env: { GREETING: 'hi' } });
     const got = await waitFor(() => serverReady, 20000);
     check("on('server-ready') fires", !!got && got.port === 4173, JSON.stringify(got));
-    check("server-ready url", !!got && /localhost:4173/.test(got.url), got?.url);
+    // Per-client preview URLs: the event's url is a page-origin href of the
+    // shape /p/<sid>/4173/ (session-scoped SW routing) — the shape the
+    // previewUrl() API returns. It must be a FETCHABLE same-origin URL.
+    check("server-ready url", !!got && /^https?:\/\/[^/]+\/p\/[a-z0-9-]+\/4173\/?$/.test(got.url), got?.url);
     check("on('port') open event", portOpens.includes(4173), JSON.stringify(portOpens));
 
-    // Preview fetch through the harness ServiceWorker bridge:
-    const res = await fetch(`/opencontainer/p/4173/`);
+    // Preview fetch through the harness ServiceWorker bridge — use the
+    // URL the event delivered (the canonical per-client preview path):
+    const res = await fetch(got.url, { cache: 'no-store' });
     const body = await res.text();
     check('preview fetch through SW (env passed to server)', res.status === 200 && body.includes('WC-FACADE-OK hi'), `${res.status} ${body.slice(0, 40)}`);
 

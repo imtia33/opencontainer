@@ -54,15 +54,16 @@ void (async () => {
         "import { renderMarker } from './app.js';",
         "window.__loadedAt = Date.now();",
         "window.__hmrLog = [];",
-        "// vite's client dispatches ws lifecycle events; listen on BOTH window",
-        "// and document (dispatch target differs across vite versions).",
-        "['vite:ws:connect', 'vite:ws:disconnect'].forEach(function (ev) {",
-        "  window.addEventListener(ev, function () { window.__hmrLog.push(ev); });",
-        "  document.addEventListener(ev, function () { window.__hmrLog.push('doc:' + ev); });",
-        "});",
+        "// vite 7 dispatches ALL client events (ws lifecycle included) through",
+        "// the hot-events bus — import.meta.hot.on — NOT as DOM CustomEvents",
+        "// (verified against vite 7.3.7 client.mjs: zero window.dispatchEvent",
+        "// calls). The log below is DIAGNOSTIC ONLY: registration races with",
+        "// @vite/client's socket 'open' (the module may evaluate after the",
+        "// connect event fired), so pass/fail verdicts never depend on it.",
         "if (import.meta.hot) {",
-        "  import.meta.hot.on('vite:beforeUpdate', function (d) { window.__hmrLog.push('beforeUpdate'); });",
-        "  import.meta.hot.on('vite:afterUpdate', function () { window.__hmrLog.push('afterUpdate'); });",
+        "  ['vite:ws:connect', 'vite:ws:disconnect', 'vite:beforeUpdate', 'vite:afterUpdate'].forEach(function (ev) {",
+        "    import.meta.hot.on(ev, function () { window.__hmrLog.push(ev); });",
+        "  });",
         "}",
         "renderMarker();",
         '',
@@ -153,15 +154,16 @@ void (async () => {
     });
     R.initialFrame = iframeState(w0);
     if (R.initialFrame.marker !== 'HMR-e0') { R.phase = 'marker-wrong'; return; }
-    const firstLog = R.initialFrame.log;
-    R.firstWsConnect = firstLog.indexOf('ws:connect') >= 0;
+    // DIAGNOSTIC only (registration race with the connect event — see the
+    // main.js comment). Behavior is proven by the 20-edit loop below.
+    R.firstWsConnect = (R.initialFrame.log.indexOf('ws:connect') >= 0) || 'n/a (diagnostic; registration race)';
     // __loadedAt must remain IDENTICAL across edits — any change = a full
     // page reload (vite fallback), NOT module HMR.
     const baseLoadedAt = R.initialFrame.loadedAt;
 
     // ---- 5. 20 edits, each verified as real module HMR ---------------------
     R.phase = 'edits';
-    let afterCount0 = (w0.__hmrLog.filter((e) => e === 'afterUpdate')).length;
+    let afterCount0 = (w0.__hmrLog.filter((e) => e === 'vite:afterUpdate' || e === 'afterUpdate')).length;
     let okEdits = 0, reloadLeaks = 0, failures = [];
     // capture every WS payload the client parses (update path/acceptedPath/ts)
     try {
@@ -207,7 +209,7 @@ void (async () => {
         log = w.__hmrLog ?? [];
         loadedAt = w.__loadedAt ?? null;
       } catch (e) { /* ignore */ }
-      const afterCount = log.filter((e) => e === 'afterUpdate').length;
+      const afterCount = log.filter((e) => e === 'vite:afterUpdate' || e === 'afterUpdate').length;
       const sawHmrEvents = afterCount > afterCount0;
       const reloaded = loadedAt !== baseLoadedAt;
       if (done && sawHmrEvents && !reloaded) okEdits++;
@@ -220,20 +222,24 @@ void (async () => {
     try { R.wsPayloads = frameWs()?.__wsMsgs?.filter((m) => m.type === 'update').map((m) => ({ ts: m.updates[0].timestamp, path: m.updates[0].path, acc: m.updates[0].acceptedPath })) ?? null; } catch (e) { R.wsPayloads = 'unavailable'; }
     R.editsVerdict = { okEdits, total: EDITS, failures, fullReloadLeaks: reloadLeaks };
 
-    // ---- 6. iframe reload → WS reconnect ------------------------------------
+    // ---- 6. iframe reload → fresh page + live HMR ---------------------------
+    // Behavioral checks only (no event-log dependence):
+    //   (a) the page really reloaded (new __loadedAt)
+    //   (b) the fresh page serves the CURRENT code (marker intact)
+    //   (c) an edit AFTER the reload propagates without a further reload —
+    //       the only proof that the new page's HMR WebSocket is live.
     R.phase = 'reload';
     const loadedBefore = await (async () => { try { return iframe.contentWindow.__loadedAt; } catch (e) { return null; } })();
     iframe.src = purl + '?r=' + Date.now();
     await sleep(2500);
     const w1 = await ping();
-    let reconnectOk = false;
+    let reloaded = false;
     let reloadedAt = null;
     if (w1) {
-      const log = (w1.__hmrLog ?? []).join(',');
       reloadedAt = w1.__loadedAt ?? null;
-      reconnectOk = log.indexOf('ws:connect') >= 0 && reloadedAt !== loadedBefore;
+      reloaded = reloadedAt !== null && reloadedAt !== loadedBefore;
     }
-    R.reloadTest = { reconnectOk, marker: w1 ? w1.document.getElementById('marker')?.textContent : null };
+    R.reloadTest = { reloaded, marker: w1 ? w1.document.getElementById('marker')?.textContent : null };
 
     // one more edit AFTER the reload — HMR must keep working on the new page
     let postReloadEdit = 'FAIL';
@@ -297,35 +303,84 @@ void (async () => {
       } catch (e) { R.frameAfterRestart = 'gone'; }
     }
 
-    // ---- 8. repeated iframe reloads -----------------------------------------
+    // ---- 8. repeated iframe reloads (behavioral) -----------------------------
+    // Per round: (1) an edit propagates on the CURRENT page (live HMR),
+    // (2) reload → fresh page serves the current code (new __loadedAt,
+    // correct marker), (3) another edit propagates on the FRESH page
+    // WITHOUT a further reload — proving the reloaded page's HMR WS is live.
+    // No event-log dependence anywhere.
     R.phase = 'churn';
+    const appFile = (mark) =>
+      "export const MARKER = '" + mark + "';\n" +
+      "export function renderMarker() {\n" +
+      "  document.body.innerHTML = '';\n" +
+      "  var el = document.createElement('div');\n" +
+      "  el.id = 'marker';\n" +
+      "  el.textContent = 'HMR-' + MARKER;\n" +
+      "  document.body.appendChild(el);\n" +
+      "}\n" +
+      "if (import.meta.hot) { import.meta.hot.accept(function (newModule) { if (newModule) newModule.renderMarker(); }); }\n";
+    const waitMarker = async (expect, timeoutMs) => {
+      const t = Date.now();
+      while (Date.now() - t < timeoutMs) {
+        try {
+          if (iframe.contentWindow.document.getElementById('marker')?.textContent === expect) return true;
+        } catch (e) { /* frame replaced */ }
+        await sleep(120);
+      }
+      return false;
+    };
     const churn = [];
     for (let i = 0; i < 4; i++) {
-      iframe.src = purl + '?c=' + i + '-' + Date.now();
-      const tw = Date.now();
       let ok = false;
-      while (Date.now() - tw < 15000) {
-        try {
-          const w = iframe.contentWindow;
-          if (w.__loadedAt && w.__hmrLog && w.__hmrLog.join('').indexOf('ws:connect') >= 0) { ok = true; break; }
-        } catch (e) { /* wait */ }
-        await sleep(150);
-      }
+      try {
+        // (1) edit propagates on the current page
+        await rt.writeFile(DIR + '/src/app.js', enc.encode(appFile('c' + i + 'a')));
+        const pre = await waitMarker('HMR-c' + i + 'a', 15000);
+        const loadedAtPre = await (async () => { try { return iframe.contentWindow.__loadedAt; } catch (e) { return null; } })();
+        // (2) reload → fresh page, current code
+        iframe.src = purl + '?c=' + i + '-' + Date.now();
+        let freshLoadedAt = null;
+        const tr = Date.now();
+        while (Date.now() - tr < 15000) {
+          try {
+            const w = iframe.contentWindow;
+            if (w.__loadedAt && w.__loadedAt !== loadedAtPre
+                && w.document.getElementById('marker')?.textContent === 'HMR-c' + i + 'a') {
+              freshLoadedAt = w.__loadedAt;
+              break;
+            }
+          } catch (e) { /* wait */ }
+          await sleep(150);
+        }
+        // (3) edit AFTER the reload, without a further reload
+        let post = false;
+        if (freshLoadedAt !== null) {
+          await rt.writeFile(DIR + '/src/app.js', enc.encode(appFile('c' + i + 'b')));
+          post = await waitMarker('HMR-c' + i + 'b', 15000);
+          const loadedAtPost = await (async () => { try { return iframe.contentWindow.__loadedAt; } catch (e) { return null; } })();
+          if (loadedAtPost !== freshLoadedAt) post = false; // a leak-reload is a failure
+        }
+        ok = pre && freshLoadedAt !== null && post;
+      } catch (e) { ok = false; }
       churn.push(ok);
     }
     R.churn = churn;
 
+    R.reloadTest.reconnectOk = !!R.reloadTest.reloaded && R.postReloadEdit === 'OK';
     R.verdict = {
       vite: R.viteVersion,
       installMs: R.steps[0]?.ms,
       listen: !!listened,
-      firstWsConnect: R.firstWsConnect,
       edits: R.editsVerdict,
       iframeReloadReconnect: R.reloadTest,
       postReloadEdit: R.postReloadEdit,
       serverRestart: { relistened: R.restartListen, edit: R.restartEdit },
       churnReloads: churn,
-      hmrWorksContinuously: R.editsVerdict.okEdits === EDITS && R.postReloadEdit === 'OK',
+      hmrWorksContinuously: R.editsVerdict.okEdits === EDITS
+        && R.postReloadEdit === 'OK'
+        && !!R.reloadTest.reloaded
+        && churn.every(Boolean),
     };
     R.phase = 'done';
   } catch (e) {

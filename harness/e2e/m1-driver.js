@@ -144,7 +144,7 @@ void (async () => {
       let previewStatus = 0;
       if (portUp) {
         try {
-          const res = await fetch('/opencontainer/p/3000/');
+          const res = await fetch(rt.previewUrl(3000), { cache: 'no-store' });
           previewStatus = res.status;
           previewText = await res.text();
         } catch (e) {
@@ -177,7 +177,8 @@ void (async () => {
   }
 
   // =========================================================================
-  // PHASE B (after reload — fresh session, OPFS-hydrated)
+  // PHASE B (after reload — fresh session; the temporary-environment
+  // contract: NOTHING from phase A survives, the host remounts its files)
   // =========================================================================
   try {
     localStorage.removeItem('__ocM1Phase');
@@ -193,7 +194,10 @@ void (async () => {
     const nmGone = await waitForExact('NM=false', 8000);
     check('ephemeral: node_modules/lodash gone after reload', !!nmGone);
     await run(`node -e 'console.log("PJ=" + require("fs").existsSync("package.json"))'`);
-    check('persistent: package.json survives reload', !!(await waitForExact('PJ=true', 8000)));
+    // Temporary-environment contract (product boundary §4): NO guest file
+    // survives a reload — host-written files included. The host supplies
+    // its files again for the fresh session.
+    check('temporary env: package.json gone after reload', !!(await waitForExact('PJ=false', 8000)));
     await run('npm install lodash --no-audit --no-fund', 180000);
     check('reinstall works', !!(await waitForAdded(60000)));
     await run(`node -e 'console.log("CHUNK=" + JSON.stringify(require("lodash").chunk([1,2,3,4],2)))'`);

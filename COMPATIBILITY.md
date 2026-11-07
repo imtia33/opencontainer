@@ -15,7 +15,7 @@
 - `process.platform` → `linux` · `process.arch` → `wasm32` (same observable class as the incumbent)
 - Genuine Node.js JS source execution: `lib/**` from nodejs.org (MIT), loaded by the real CJS loader
 - Reimplemented native bindings: all `internalBinding` surfaces (TypeScript)
-- Browser API substitutions: fetch (outbound HTTP), OPFS (disk), WebCrypto (crypto), DecompressionStream/fflate (zlib), MessageChannel (IPC)
+- Browser API substitutions: fetch (outbound HTTP), in-memory VFS (disk), WebCrypto (crypto), DecompressionStream/fflate (zlib), MessageChannel (IPC)
 - Unsupported operating-system capabilities: real TCP sockets to external hosts, unix signals from other OS processes, native addons, threads — see the unsupported table
 
 **Vendored-source patches (documented, minimal):**
@@ -127,18 +127,24 @@
 
 ## 6. Persistence & storage
 
+**Product contract (2026-11-07): the guest environment is TEMPORARY.** Nothing
+about the guest filesystem, installed dependencies, or process state survives a
+reload — the host application supplies project files again for every fresh
+session (the upstream WebContainers no-persistence model). The former OPFS
+guest-VFS keeper was removed for violating this contract; losing
+`node_modules` after a reload is expected behavior, not a bug.
+
 | Feature | Status | Evidence |
 |---|---|---|
-| Project files survive reload | **Fully implemented and tested** | OPFS full-tree save (debounced 1.5 s + command boundaries); host-written files fixed 2026-11-03 (write-file RPC now reaches the keeper before the save) |
-| `node_modules` survive reload | **Fully implemented and tested** | express + cowsay re-required after reload with **zero** registry requests |
-| Cross-process file visibility | **Fully implemented and tested** | file written in process A visible in process B (harness 33/33) |
-| Server restart on persisted project | **Fully implemented and tested** | reload → `node app.js` → preview serves again |
-| Storage | OPFS sync access handles inside the worker; quota ~10.75 GB observed; best-effort eviction per MDN behavior | not a node API — browser substitution |
+| Cross-reload persistence of guest files | **Removed by design** | temporary-environment contract; enforced by the temp-env E2E driver |
+| Cross-process file visibility (in-session) | **Fully implemented and tested** | file written in process A visible in process B (harness 33/33) |
+| Immutable runtime-asset cache | **Implemented** | Cache API (not OPFS): `.ocrt` blobs cached per content hash so re-boots skip the ~7 MB download; never restores guest state |
+| Storage | Cache API for immutable runtime assets only; no guest-state storage | not a node API — browser substitution |
 
 ## 7. Security model (consumer-facing summary)
 
 - **Dependency lifecycle scripts are blocked by default** (pnpm 10 precedent): an untrusted `postinstall` runs with the page's origin — same-origin authenticated fetch is the threat. Root-project scripts always run; per-project allowlist via `"opencontainer": { "allowScripts": [...] }` or `--allow-scripts`.
-- Guest = dedicated worker: no DOM/localStorage access; full same-origin OPFS/IndexedDB/Cache access (origin isolation architecture is the S4 milestone).
+- Guest = dedicated worker: no DOM/localStorage access; same-origin Cache access for immutable runtime assets only (origin isolation architecture is the S4 milestone).
 - Process limit (8) bounds CPU/worker exhaustion; `kill`/teardown terminate workers hard.
 
 ## 8. Platform divergences (complete list)

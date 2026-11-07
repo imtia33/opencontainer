@@ -29,9 +29,6 @@ export type RpcRequest =
   /** Preview traffic routed through the service worker → page → worker. */
   | { id: number; kind: 'net'; op: 'previewFetch'; port: number; requestId: string; method: string; path: string; headers: Record<string, string>; body?: ArrayBuffer }
   | { id: number; kind: 'net'; op: 'previewAbort'; requestId: string }
-  | { id: number; kind: 'persistence'; op: 'export'; path?: string }
-  | { id: number; kind: 'persistence'; op: 'restore'; tree: unknown }
-  | { id: number; kind: 'persistence'; op: 'reset' };
 
 /* ------------------------------ responses ---------------------------- */
 

@@ -11,7 +11,7 @@
  *                   fs-event{watchId,event} | rpc-result{id,ok,result|err}
  *   host → worker : stdin | stdin-eof | resize | signal | pipe-data/eof
  *                   child-exit | tcp-connect/data/eof/connected | ports-update
- *                   listen-failed | vfs-apply | write-file | persist-vfs | eval
+ *                   listen-failed | vfs-apply | write-file | eval
  *                   fs-read/readdir/stat/apply-ops/watch/unwatch/tree | diag
  *
  * BOOT PIPELINE (unchanged WebContainers-class fast path): index.json →
@@ -31,7 +31,6 @@ import { gunzipSync } from 'fflate';
 // self-hosted base), because the worker cannot guess it — under the CDN
 // default the worker itself runs from a blob: URL with no useful location.
 let runtimeBase = '/opencontainer/runtime';
-const OPFS_ROOT_DIR = 'opencontainer-vfs';
 
 // Host bridge: capture the BROWSER's native DecompressionStream BEFORE the
 // kernel boot replaces globalThis with node's webstreams shims. Guest
@@ -424,7 +423,7 @@ let myStdio: StdioSpec[] = [
 ];
 
 // ---------------------------------------------------------------------------
-// VFS persistence: host deltas (in-session snapshots) + OPFS (cross-reload)
+// VFS deltas (in-session snapshots fanned out by the runtime)
 // ---------------------------------------------------------------------------
 
 let deltaQueue: VfsPersistOp[] = [];
@@ -476,7 +475,7 @@ function rpcReply(msg: { id?: number }, fn: () => unknown): void {
 }
 
 /** One host-initiated filesystem mutation, applied through the real VFS
- *  methods (watchers fire; the persist hook queues OPFS deltas). */
+ *  methods (watchers fire; the persist hook queues in-session deltas). */
 function applyHostFsOp(op: VfsPersistOp & { recursive?: boolean }): void {
   if (!kernel) throw new Error('kernel not booted');
   switch (op.type) {
@@ -496,137 +495,6 @@ function applyHostFsOp(op: VfsPersistOp & { recursive?: boolean }): void {
       kernel.vfs.rename(op.from, op.to);
       break;
   }
-}
-
-// ---- OPFS (cross-reload persistence; worker-only API) --------------------
-
-interface OpfsPaths { dirs: string[]; files: Array<[string, Uint8Array]>; symlinks: Array<[string, string]> }
-
-async function opfsRoot(): Promise<any | null> {
-  try {
-    const root = await (navigator as any).storage?.getDirectory?.();
-    if (!root) { diag('opfs: getDirectory() resolved falsy'); return null; }
-    return await root.getDirectoryHandle(OPFS_ROOT_DIR, { create: true });
-  } catch (e: any) {
-    diag(`opfs: opfsRoot threw: ${e && e.name}: ${e && e.message} (navigator=${typeof (globalThis as any).navigator}, getDirectory=${typeof (globalThis as any).navigator?.storage?.getDirectory})`);
-    return null; // OPFS unavailable (sandboxed context) — in-session only.
-  }
-}
-
-function opfsKey(path: string): string {
-  return encodeURIComponent(path);
-}
-
-/** Ephemeral-path rule — the WebContainers-style node_modules lifecycle.
- *
- *  Dependency weight is NEVER persisted: node_modules at ANY depth is
- *  rebuilt by npm on demand ("reload → project files kept, node_modules
- *  dropped"). The npm HTTP cache under /home/node/.npm/_cacache is
- *  content-addressed (sha-named) and contains no node_modules path segment,
- *  so it survives this rule automatically — reinstalls come back from cache
- *  in ~1 s instead of full network. Shared by save AND load: a stale
- *  manifest from an older session (which still listed node_modules) must
- *  not be able to hydrate them back. */
-function isEphemeralPath(p: string): boolean {
-  return p.includes('/node_modules/');
-}
-
-/** Temporary diagnostics channel for the OPFS save path (keeper → host).
- *  Rides the stdio message path ({type:'stdio'} has no 'error' case in the
- *  host switch — plain 'error' posts are dropped silently). */
-function diag(message: string): void {
-  try {
-    post({ type: 'stdio', fd: 2, chunk: `[oc-diag] ${message}\n` });
-    post({ type: 'error', message: `[oc-diag] ${message}` });
-  } catch { /* noop */ }
-}
-
-/** TEMPORARY guest-module evaluation audit (esm-graph prologue → host).
- *  The last module logged before a stall is the one whose top-level code
- *  pends forever. */
-(globalThis as any).__ocEvalLog = (p: string): void => {
-  try { post({ type: 'stdio', fd: 2, chunk: `[oc-eval] ${p}\n` }); } catch { /* noop */ }
-};
-
-/** TEMPORARY: module evaluation COMPLETION audit — pairs with __ocEvalLog;
- *  a logged start without a matching done names the module whose top-level
- *  code (or top-level await) never settles. */
-(globalThis as any).__ocEvalDone = (p: string): void => {
-  try { post({ type: 'stdio', fd: 2, chunk: `[oc-eval✓] ${p}\n` }); } catch { /* noop */ }
-};
-
-async function saveTreeToOpfs(): Promise<void> {
-  if (!kernel) { diag('opfs: no kernel'); return; }
-  const root = await opfsRoot();
-  if (!root) { diag('opfs: opfsRoot() returned null — getDirectory/getDirectoryHandle threw or unavailable'); return; }
-  const tree = kernel.vfs.exportTree('/home');
-  // Ephemeral filter BEFORE the manifest is built: node_modules is excluded
-  // from dirs/files/symlinks, so the manifest never lists it, and the `live`
-  // set below purges stale node_modules entries written by older sessions.
-  const eDirs = tree.dirs.filter((p) => !isEphemeralPath(p));
-  const eFiles = tree.files.filter(([p]) => !isEphemeralPath(p));
-  const eSymlinks = tree.symlinks.filter(([p]) => !isEphemeralPath(p));
-  const manifest = {
-    savedAt: Date.now(),
-    dirs: eDirs,
-    symlinks: eSymlinks,
-    files: eFiles.map(([p]) => p),
-  };
-  const mf = await root.getFileHandle('_manifest.json', { create: true });
-  const w = await mf.createSyncAccessHandle();
-  const mbytes = new TextEncoder().encode(JSON.stringify(manifest));
-  w.truncate(0);
-  w.write(mbytes, { at: 0 });
-  w.flush();
-  w.close();
-  for (const [p, data] of eFiles) {
-    const fh = await root.getFileHandle(opfsKey(p), { create: true });
-    const acc = await fh.createSyncAccessHandle();
-    acc.truncate(0);
-    acc.write(data, { at: 0 });
-    acc.flush();
-    acc.close();
-  }
-  const live = new Set(eFiles.map(([p]) => opfsKey(p)));
-  for await (const [name] of root.entries()) {
-    // Skip ONLY our own manifest (`_` prefix). A bare `.endsWith('.json')`
-    // guard here once leaked: guest package.json etc. are percent-encoded
-    // keys that END in .json, so deleted guest .json files were never
-    // purged from OPFS. The live-set is the purge authority.
-    if (name.startsWith('_')) continue;
-    if (!live.has(name)) {
-      try { await root.removeEntry(name); } catch { /* best-effort */ }
-    }
-  }
-}
-
-async function loadTreeFromOpfs(): Promise<OpfsPaths | null> {
-  const root = await opfsRoot();
-  if (!root) return null;
-  let manifest: any = null;
-  try {
-    const mf = await root.getFileHandle('_manifest.json');
-    const file = await mf.getFile();
-    manifest = JSON.parse(await file.text());
-  } catch {
-    return null; // no persisted state
-  }
-  // Load-time half of the ephemeral rule (see isEphemeralPath): manifests
-  // saved by older sessions can still list node_modules — never hydrate it.
-  const dirs: string[] = (manifest.dirs ?? []).filter((p: string) => !isEphemeralPath(p));
-  const symlinks: Array<[string, string]> = (manifest.symlinks ?? []).filter(
-    ([p]: [string, string]) => !isEphemeralPath(p),
-  );
-  const files: Array<[string, Uint8Array]> = [];
-  for (const p of manifest.files ?? []) {
-    if (isEphemeralPath(p)) continue;
-    try {
-      const fh = await root.getFileHandle(opfsKey(p));
-      const file = await fh.getFile();
-      files.push([p, new Uint8Array(await file.arrayBuffer())]);
-    } catch { /* missing file — skip */ }
-  }
-  return { dirs, files, symlinks };
 }
 
 async function boot(msg: {
@@ -682,18 +550,12 @@ async function boot(msg: {
 
   myStdio = msg.stdio ?? myStdio;
 
-  // Cross-reload persistence: with no host snapshot (fresh page load),
-  // hydrate the VFS from OPFS once and report the tree to the host.
-  let opfsTree: VfsTree | null = msg.hydrate ?? null;
-  let hydratedFrom = msg.hydrate ? 'host-snapshot' : 'none';
-  if (!opfsTree) {
-    const loaded = await loadTreeFromOpfs();
-    if (loaded && (loaded.files.length > 0 || loaded.dirs.length > 0)) {
-      opfsTree = loaded;
-      hydratedFrom = 'opfs';
-      lap('opfsLoadMs');
-    }
-  }
+  // Temporary-environment contract: the ONLY hydration source is the host
+  // snapshot supplied in the boot message (the host owns where project
+  // files come from). There is NO cross-reload restore — a fresh page load
+  // boots an empty VFS and the host supplies files again.
+  const hydrateTree: VfsTree | null = msg.hydrate ?? null;
+  const hydratedFrom = msg.hydrate ? 'host-snapshot' : 'none';
 
   // Pid-scoped id bases keep kernel-assigned child pids/pipe ids/conn ids
   // unique across every process in the tree.
@@ -704,7 +566,7 @@ async function boot(msg: {
 
   kernel = await bootKernel({
     store: makeLazyStore(),
-    hydrate: opfsTree ?? undefined,
+    hydrate: hydrateTree ?? undefined,
     pid,
     ppid: msg.ppid ?? 0,
     stdio: myStdio,
@@ -866,10 +728,7 @@ async function boot(msg: {
     bootMs: Math.round(performance.now() - t0),
     phases: marks,
     hydratedFrom,
-    // S3.1: only the OPFS-hydrating process (the keeper) reports the tree —
-    // children previously echoed the 2+ MB host snapshot back to the host,
-    // which ignored it (the host adopts only hydratedFrom==='opfs').
-    vfsSnapshot: hydratedFrom === 'opfs' ? opfsTree : undefined,
+    // The boot snapshot is host-supplied; nothing to echo back.
     pid,
   });
 
@@ -1141,16 +1000,11 @@ async function handleRpcMessage(ev: MessageEvent<RpcMsg>): Promise<void> {
         post({ type: 'write-file-done', id: msg.id });
         break;
       }
-      case 'persist-vfs': {
-        await saveTreeToOpfs();
-        post({ type: 'persist-vfs-done', id: msg.id });
-        break;
-      }
 
       // ---- IDE filesystem RPCs (served by whichever kernel receives them;
       // the host always targets the shell keeper, pid 1) --------------------
       // Uniform reply protocol: {type:'rpc-result', id, ok, result|err}. The
-      // real VFS methods are used so watchers fire and OPFS deltas queue.
+      // real VFS methods are used so watchers fire and in-session deltas queue.
       case 'fs-read': {
         if (!kernel) throw new Error('kernel not booted');
         rpcReply(msg, () => ({ data: kernel.vfs.readFile(String(msg.path)) }));
@@ -1203,7 +1057,7 @@ async function handleRpcMessage(ev: MessageEvent<RpcMsg>): Promise<void> {
       case 'fs-apply-ops': {
         // Host-initiated mutations (IDE file operations, project import).
         // Unlike 'vfs-apply' (peer fan-out, persist disabled) these run
-        // through the real methods so the persist hook queues OPFS deltas.
+        // through the real methods so the persist hook queues in-session deltas.
         if (!kernel) throw new Error('kernel not booted');
         rpcReply(msg, () => {
           for (const op of msg.ops ?? []) applyHostFsOp(op);

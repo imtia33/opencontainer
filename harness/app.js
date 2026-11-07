@@ -160,3 +160,14 @@ try {
 if (localStorage.getItem('__ocM1Phase') === 'b') {
   document.head.appendChild(Object.assign(document.createElement('script'), { src: '/e2e/m1-driver.js' }));
 }
+// Generic one-shot re-injection: a driver stores its name in
+// '__ocDriver' before reloading the page; it runs exactly once after the
+// reload (used by the temp-env contract driver to inspect the FRESH
+// session — the reload must discard all guest state).
+{
+  const ocDriver = localStorage.getItem('__ocDriver');
+  if (ocDriver) {
+    localStorage.removeItem('__ocDriver');
+    document.head.appendChild(Object.assign(document.createElement('script'), { src: `/e2e/${ocDriver}.js` }));
+  }
+}

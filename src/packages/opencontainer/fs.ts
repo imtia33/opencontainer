@@ -6,7 +6,10 @@
  *  - permission bits + mtime
  *  - recursive/force rm, mkdir -p semantics
  *  - file watchers (fs.watch-compatible events)
- *  - optional OPFS persistence with a dirty-flush pipeline
+ *
+ *  The VFS is an EXECUTION filesystem for the active session only — it is
+ *  never persisted across reloads (temporary-environment contract; the
+ *  host supplies project files at boot, guests mutate them in memory).
  *
  * Errors follow Node.js errno conventions so user code sees familiar
  * messages (ENOENT / EEXIST / ENOTDIR / ENOTEMPTY / EISDIR).
@@ -401,7 +404,7 @@ export class VirtualFileSystem {
     return walk(node);
   }
 
-  /** List every file path under `at` (for persistence + UI trees). */
+  /** List every file path under `at` (host UI trees / snapshots). */
   listAllFiles(at = '/'): string[] {
     const out: string[] = [];
     const walk = (n: VNode, prefix: string) => {
@@ -449,160 +452,6 @@ export class VirtualFileSystem {
           }
         }
       }, 0);
-    }
-  }
-
-  /* ----------------------------- OPFS persistence ----------------------------- */
-
-  private opfsRoot: FileSystemDirectoryHandle | null = null;
-  private dirtyFiles = new Set<string>();
-  private deletedFiles = new Set<string>();
-  private dirtyDirs = new Set<string>();
-  private flushTimeout: ReturnType<typeof setTimeout> | null = null;
-  private flushing = false;
-  /** Paths that are never persisted (node_modules & caches are rebuilt by npm). */
-  private persistExclude = [/^\/[^/]*\/node_modules\//, /^\/home\/nodeuser\/\.npm\//];
-
-  setPersistenceExclude(patterns: RegExp[]): void {
-    this.persistExclude = patterns;
-  }
-
-  shouldPersist(path: string): boolean {
-    return !this.persistExclude.some((re) => re.test(path));
-  }
-
-  async initOPFS(): Promise<boolean> {
-    try {
-      if (typeof navigator === 'undefined' || !navigator.storage?.getDirectory) return false;
-      const root = await navigator.storage.getDirectory();
-      this.opfsRoot = await root.getDirectoryHandle('opencontainer', { create: true });
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  private async getDir(path: string, create: boolean): Promise<FileSystemDirectoryHandle | null> {
-    if (!this.opfsRoot) return null;
-    let dir = this.opfsRoot;
-    const parts = normalizePath(path).split('/').filter(Boolean);
-    for (const part of parts) {
-      try {
-        dir = await dir.getDirectoryHandle(part, { create });
-      } catch {
-        return null;
-      }
-    }
-    return dir;
-  }
-
-  /** Load the persisted filesystem into the VFS (called once during boot). */
-  async restoreFromOPFS(): Promise<void> {
-    if (!this.opfsRoot) return;
-    const restoreDir = async (handle: FileSystemDirectoryHandle, vfsPath: string) => {
-      for await (const [name, child] of handle.entries()) {
-        const childPath = vfsPath === '/' ? `/${name}` : `${vfsPath}/${name}`;
-        if (child.kind === 'directory') {
-          this.mkdir(childPath, { recursive: true });
-          await restoreDir(child as FileSystemDirectoryHandle, childPath);
-        } else {
-          try {
-            const file = await (child as FileSystemFileHandle).getFile();
-            if (this.shouldPersist(childPath)) {
-              const buf = new Uint8Array(await file.arrayBuffer());
-              this.writeFile(childPath, buf);
-            }
-          } catch {
-            /* skip unreadable entries */
-          }
-        }
-      }
-    };
-    try {
-      await restoreDir(this.opfsRoot, '/');
-    } catch {
-      /* OPFS unavailable → memory-only */
-    }
-  }
-
-  markDirty(path: string): void {
-    if (!this.opfsRoot || !this.shouldPersist(path)) return;
-    if (this.lookupRaw(path)?.type === 'dir') this.dirtyDirs.add(path);
-    else this.dirtyFiles.add(path);
-    this.scheduleFlush();
-  }
-
-  markDeleted(path: string): void {
-    if (!this.opfsRoot) return;
-    this.deletedFiles.add(path);
-    this.deletedDirs(path).catch(() => {});
-    this.scheduleFlush();
-  }
-
-  private async deletedDirs(path: string): Promise<void> {
-    const walk = async (p: string) => {
-      const node = this.lookupRaw(p);
-      if (node?.type === 'dir') {
-        for (const name of node.children!.keys()) {
-          await walk(joinPath(p, name));
-        }
-      }
-    };
-    void walk;
-  }
-
-  private scheduleFlush(): void {
-    if (this.flushTimeout !== null) return;
-    this.flushTimeout = setTimeout(() => {
-      this.flushTimeout = null;
-      void this.flush();
-    }, 400);
-  }
-
-  async flush(): Promise<void> {
-    if (this.flushing || !this.opfsRoot) return;
-    this.flushing = true;
-    try {
-      for (const path of this.deletedFiles) {
-        const dir = await this.getDir(dirname(path), false);
-        if (dir) {
-          try {
-            await dir.removeEntry(basename(path), { recursive: true });
-          } catch {
-            /* already gone */
-          }
-        }
-      }
-      this.deletedFiles.clear();
-      for (const path of this.dirtyFiles) {
-        const node = this.lookupRaw(path);
-        if (!node || node.type !== 'file') continue;
-        const dir = await this.getDir(dirname(path), true);
-        if (!dir) continue;
-        try {
-          const fh = await dir.getFileHandle(basename(path), { create: true });
-          const writable = await fh.createWritable();
-          await writable.write(node.data!);
-          await writable.close();
-        } catch {
-          /* quota / transient errors: keep in memory */
-        }
-      }
-      this.dirtyFiles.clear();
-      this.dirtyDirs.clear();
-    } finally {
-      this.flushing = false;
-    }
-  }
-
-  async resetOPFS(): Promise<void> {
-    if (!this.opfsRoot) return;
-    try {
-      const root = await navigator.storage.getDirectory();
-      await root.removeEntry('opencontainer', { recursive: true });
-      this.opfsRoot = await root.getDirectoryHandle('opencontainer', { create: true });
-    } catch {
-      /* ignore */
     }
   }
 

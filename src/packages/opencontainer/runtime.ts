@@ -6,11 +6,13 @@
  *   - the pipe table (stdio routing between parent and child processes)
  *   - the virtual port registry (which process listens on which port)
  *   - the authoritative in-session VFS snapshot (deltas fan out to every
- *     live process; OPFS persistence flows through the shell keeper)
+ *     live process)
  *   - the foreground process (terminal input/stdio + signals)
  *
- * A hidden "shell keeper" process (pid 1) stays alive for the whole session:
- * it performs the OPFS hydration at first boot and serves persist-vfs RPCs.
+ * A hidden "shell keeper" process (pid 1) stays alive for the whole session
+ * and serves host filesystem RPCs. The VFS is session-scoped (temporary-
+ * environment contract): nothing persists across reloads — the host supplies
+ * project files at boot of every fresh session.
  */
 
 export interface RuntimeEvents {
@@ -286,8 +288,6 @@ export class OpenContainerRuntime {
    *  here and fans out to the other live processes. */
   private vfsSnapshot: { dirs: Set<string>; files: Map<string, Uint8Array>; symlinks: Map<string, string> }
     = { dirs: new Set(), files: new Map(), symlinks: new Map() };
-  private snapshotDirty = false;
-  private persistTimer: ReturnType<typeof setTimeout> | null = null;
 
   private foregroundPid: number | null = null;
   private bootedOnce = false;
@@ -301,7 +301,7 @@ export class OpenContainerRuntime {
   nodeVersion: string | null = null;
   bootMs: number | null = null;
   private _bootStart = 0;
-  /** Shell keeper — pid 1; performs OPFS hydration + persistence RPCs. */
+  /** Shell keeper — pid 1; session-long idle kernel serving host fs RPCs. */
   private keeper: KernelProcess | null = null;
   /** fs.watch callbacks (facade fs.watch / embedder watchers). */
   private fsWatchers = new Map<number, (event: { type: 'rename' | 'change'; filename: string | null }) => void>();
@@ -351,8 +351,9 @@ export class OpenContainerRuntime {
     // blocks boot — the runtime works without the SW except for preview
     // URLs (see registerPreview for the failure warning).
     void this.registerPreview().catch(() => { /* warned inside */ });
-    // The shell keeper: a real kernel process with no entry (idle). It
-    // hydrates the VFS from OPFS on a fresh page load and owns persistence.
+    // The shell keeper: a real kernel process with no entry (idle), alive
+    // for the whole session. It is the stable RPC target for host
+    // filesystem operations (see fsTarget).
     const keeper = this.createProcess({
       pid: 1,
       parentPid: null,
@@ -467,9 +468,6 @@ export class OpenContainerRuntime {
         }
         break;
       case 'ready': {
-        if (msg.hydratedFrom === 'opfs' && msg.vfsSnapshot) {
-          this.adoptSnapshot(msg.vfsSnapshot);
-        }
         if (proc.pid === 1) {
           this.nodeVersion = msg.nodeVersion;
           this.bootMs = msg.bootMs ?? null;
@@ -531,8 +529,7 @@ export class OpenContainerRuntime {
       case 'spawn-done':
       case 'resized':
       case 'boot-done':
-      case 'write-file-done':
-      case 'persist-vfs-done': {
+      case 'write-file-done': {
         const p = proc.pending.get(msg.id);
         if (p) { proc.pending.delete(msg.id); p.resolve(); }
         break;
@@ -769,8 +766,7 @@ export class OpenContainerRuntime {
       pid: proc.pid, code: signal ? null : code, signal, foreground: wasForeground,
     });
 
-    // Schedule persistence (the keeper serves the OPFS write), then free
-    // the worker. Foreground processes terminate after a tiny delay so any
+    // Free the worker. Foreground processes terminate after a tiny delay so any
     // final stdio postMessages land first (FIFO guarantees ordering).
     const terminate = () => {
       if (proc.pid === 1) return; // keeper lives for the session
@@ -1119,22 +1115,19 @@ export class OpenContainerRuntime {
         }
       }
     }
-    if (ops.length > 0) this.snapshotDirty = true;
     // Fan out to every OTHER live process (cross-process visibility).
     for (const proc of this.processes.values()) {
       if (proc !== source && !proc.exited) {
         proc.worker.postMessage({ type: 'vfs-apply', ops });
       }
     }
-    if (ops.length > 0) this.schedulePersist();
   }
 
   /** Host-side write (editor bridge): snapshot + fan-out.
-   *  The keeper's OWN VFS must receive the write too — it is the process
-   *  that performs the OPFS full-tree save, and applyDeltas treats it as the
-   *  delta SOURCE (fan-out skips the source). Skipping the write-file RPC
-   *  made host-written files vanish from OPFS on the next reload while
-   *  guest-written files (real deltas) survived. */
+   *  The keeper's OWN VFS must receive the write too — applyDeltas treats
+   *  it as the delta SOURCE (fan-out skips the source), so without the
+   *  write-file RPC the keeper would never see host-written files and
+   *  host fs RPCs (readdir/read) would go stale. */
   async writeFile(path: string, content: string | Uint8Array): Promise<void> {
     const target = this.keeper ?? this.processes.values().next().value!;
     // Byte content must stay BYTES through BOTH channels: the keeper RPC and
@@ -1153,8 +1146,8 @@ export class OpenContainerRuntime {
   }
 
   // ------------------------------------------------- IDE filesystem RPCs
-  // All served by the shell keeper (pid 1) — the always-alive process that
-  // owns OPFS persistence. Mutations additionally fold into the host
+  // All served by the shell keeper (pid 1) — the always-alive process.
+  // Mutations additionally fold into the host
   // snapshot and fan out to every other live process (cross-process
   // visibility, exactly like guest-initiated writes).
 
@@ -1200,7 +1193,7 @@ export class OpenContainerRuntime {
   }
 
   /** Apply host-initiated mutations atomically-ish (batched). Ops run in the
-   *  keeper through the real VFS methods (watchers fire, OPFS deltas queue),
+   *  keeper through the real VFS methods (watchers fire, deltas queue),
    *  then fold into the snapshot + fan out to every live process. */
   async applyFsOps(ops: Array<Record<string, any>>): Promise<void> {
     const target = this.fsTarget();
@@ -1285,20 +1278,6 @@ export class OpenContainerRuntime {
     return base;
   }
 
-  private schedulePersist(): void {
-    if (this.persistTimer !== null) return;
-    this.persistTimer = setTimeout(() => {
-      this.persistTimer = null;
-      void this.persist().catch(() => { /* best-effort */ });
-    }, 1500);
-  }
-
-  /** Full-tree OPFS save through the shell keeper (worker-only OPFS API). */
-  async persist(): Promise<void> {
-    if (!this.snapshotDirty || !this.keeper || this.keeper.exited) return;
-    await this.postTo(this.keeper, { type: 'persist-vfs' });
-    this.snapshotDirty = false;
-  }
 
   private postTo(proc: KernelProcess, msg: any): Promise<void> {
     return new Promise((resolve, reject) => {
@@ -1307,14 +1286,6 @@ export class OpenContainerRuntime {
       proc.pending.set(id, { resolve, reject });
       proc.worker.postMessage({ ...msg, id });
     });
-  }
-
-  private adoptSnapshot(tree: { dirs: string[]; files: Array<[string, unknown]>; symlinks: Array<[string, string]> }): void {
-    this.vfsSnapshot = {
-      dirs: new Set(tree.dirs ?? []),
-      files: new Map((tree.files ?? []).map(([p, d]: [string, any]) => [p, d as Uint8Array])),
-      symlinks: new Map(tree.symlinks ?? []),
-    };
   }
 
   private snapshotPayload(): any {

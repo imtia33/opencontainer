@@ -26,8 +26,6 @@ export interface WebContainerOptions {
   coep?: COEPCrossOriginIsolated;
   /** Forward console errors of preview iframes to the WebContainer 'error' event. */
   forwardPreviewErrors?: boolean;
-  /** Whether to enable the file system to be persisted. Default: true. */
-  enableFilesystemDeletion?: boolean;
   /**
    * OpenContainer extension: extra boot options (not part of the WebContainer API).
    */

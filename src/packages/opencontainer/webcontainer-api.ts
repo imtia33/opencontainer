@@ -22,9 +22,10 @@
  *   - mount() accepts FileSystemTree objects. Binary snapshots
  *     (`@webcontainer/snapshot` format) are NOT supported — mount a tree or
  *     use `importTree`.
- *   - The filesystem persists across page reloads (OPFS), with an ephemeral
- *     node_modules policy — BEYOND the WebContainer baseline (they reinstall
- *     every load); see COMPATIBILITY.md.
+ *   - The filesystem is session-scoped (the temporary-environment
+ *     contract, matching upstream WebContainers' no-persistence model):
+ *     nothing survives a reload — the host mounts its files again on every
+ *     fresh session; see COMPATIBILITY.md.
  */
 
 import { OpenContainerRuntime } from './runtime';

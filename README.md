@@ -24,7 +24,7 @@ That's the whole setup. Code written against `@webcontainer/api` runs by changin
 
 - **Real Node, not a look-alike.** Node's own `lib/*.js` standard library (511 modules, vendored unmodified from v26.13.0) executes on the browser's own JS engine, on a shim that implements the ~40 C++ `internalBinding` surfaces (fs → virtual filesystem, uv → browser event loop, zlib, http_parser, tcp/pipe wraps → virtual sockets) on browser primitives. No Node binary, no WASM Node.
 - **Real npm.** The unmodified upstream npm CLI (v12.2.1) runs as a guest process; `npm install` talks to the real registry directly from the browser.
-- **A real filesystem.** OPFS-backed virtual filesystem with Node semantics (wx/EEXIST, atomic rename, symlinks, watchers), persisted across reloads.
+- **A real filesystem.** In-memory virtual filesystem with Node semantics (wx/EEXIST, atomic rename, symlinks, watchers). Session-scoped by design — the temporary-environment contract: the host supplies project files at boot, guests mutate them in memory, nothing survives a reload.
 - **Real child processes and servers.** `child_process.spawn` between guest processes, guest `http` servers, and a ServiceWorker-based preview bridge.
 
 Every intentional divergence from Node.js and from WebContainer is documented in [COMPATIBILITY.md](./COMPATIBILITY.md). Nothing is mocked to make a demo pass.
@@ -69,9 +69,9 @@ Without it, everything except preview URLs works (a console warning explains the
 | `npx create-vite` / `npx create-expo-app` end-to-end | ✅ |
 | Guest `http` servers through the preview bridge | ✅ |
 | Buffer binding parity vs native Node | ✅ 53/53 byte-identical |
-| OPFS persistence + reload hydration | ✅ |
+| Temporary session-scoped VFS (no cross-reload restore) | ✅ by design |
 | ESM entry points + dynamic `import()` (esm-graph, in-worker blob modules) | ✅ verified by create-vite/create-expo-app E2E |
-| `vite` dev server | 🔒 blocked by the esbuild native binary (roadmap: wasm shim) |
+| `vite` dev server (real vite 7.3.7 via npm) | ✅ 20/20 HMR edits, kill+restart reconnect, reload churn (E2E) |
 | pnpm (genuine CLI, vendored) | 🚧 P2 |
 | Lifecycle scripts | 🔒 off by default (permission model pending) |
 

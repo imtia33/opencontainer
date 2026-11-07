@@ -382,6 +382,244 @@
     }
   });
 
+  /* ------------------------------ SharedWorker WebSocket tunneling -------- */
+
+  // WebSockets created inside a SharedWorker are REAL sockets: the override
+  // above only patches WebSocket in THIS window, and service workers cannot
+  // intercept WebSocket connections (the platform limit that forced the
+  // override in the first place). A worker-scoped WS therefore dials the
+  // page's own origin, where nothing upgrades it — the previewed server is
+  // unreachable from worker scopes. This is not hypothetical: Vite 7's HMR
+  // client polls its dev server for restarts with `new WebSocket(url,
+  // 'vite-ping')` from inside a SharedWorker (so pings survive page
+  // throttling); without a bridge the poll can NEVER succeed and the client
+  // never reconnects after a server restart.
+  //
+  // Fix, generically: wrap window.SharedWorker so the worker's script is
+  // suffixed with a bridge that replaces self.WebSocket with a class
+  // relaying over a BroadcastChannel to THIS shim, which opens a real
+  // tunneled OCWebSocket on the worker's behalf (full RFC6455 semantics,
+  // keepalive, pagehide teardown — the socket registers in wsInstances like
+  // every other tunneled socket). Everything else stays native: ports,
+  // connect events, errors, onclose are the browser's own.
+  //
+  // Deliberate limitations (documented in COMPATIBILITY.md):
+  //  - dedicated Workers and module workers are not wrapped; WebSocket use
+  //    there stays real (and thus unreachable) — no known tool needs it.
+  //  - the worker source is suffixed, so a WebSocket created at the
+  //    worker's top level (before the suffix runs) stays real. Event-driven
+  //    workers (Vite's ping) are bridged.
+  //  - each construction gets its own worker instance (sharing by
+  //    name+URL is not preserved) — the broadcast bridge is per
+  //    construction.
+  if (typeof window.SharedWorker === 'function') {
+    var RealSharedWorker = window.SharedWorker;
+    var bridgeSeq = 0;
+
+    // The worker-side bridge, appended to the worker's own source. Runs in
+    // SharedWorkerGlobalScope: BroadcastChannel, structured clone and the
+    // event surface are all available there.
+    var workerBridgeSource = function (channelName) {
+      return '\n;/* OpenContainer worker WebSocket bridge (appended by the preview shim) */\n' +
+        '(function () {\n' +
+        '  if (self.__ocWsBridged) return;\n' +
+        '  self.__ocWsBridged = true;\n' +
+        '  var bc = new BroadcastChannel(' + JSON.stringify(channelName) + ');\n' +
+        '  var nextId = 1;\n' +
+        '  function BridgeWebSocket(url, protocols) {\n' +
+        '    if (!(this instanceof BridgeWebSocket)) return new BridgeWebSocket(url, protocols);\n' +
+        '    var self = this;\n' +
+        '    this.id = nextId++;\n' +
+        '    this.url = String(url);\n' +
+        '    this.protocol = "";\n' +
+        '    this.extensions = "";\n' +
+        '    this.binaryType = "blob";\n' +
+        '    this.readyState = BridgeWebSocket.CONNECTING;\n' +
+        '    this._eventListeners = { open: [], message: [], close: [], error: [] };\n' +
+        '    this._closeWatchdog = null;\n' +
+        '    var protos;\n' +
+        '    if (protocols !== undefined && protocols !== null) {\n' +
+        '      protos = Array.isArray(protocols) ? protocols : [protocols];\n' +
+        '    }\n' +
+        '    try { bc.postMessage({ t: "open", id: this.id, url: this.url, protocols: protos }); }\n' +
+        '    catch (e) { this._fail(String(e)); }\n' +
+        '  }\n' +
+        '  BridgeWebSocket.CONNECTING = 0;\n' +
+        '  BridgeWebSocket.OPEN = 1;\n' +
+        '  BridgeWebSocket.CLOSING = 2;\n' +
+        '  BridgeWebSocket.CLOSED = 3;\n' +
+        '  BridgeWebSocket.prototype = {\n' +
+        '    constructor: BridgeWebSocket,\n' +
+        '    send: function (data) {\n' +
+        '      if (this.readyState !== BridgeWebSocket.OPEN) throw new Error("InvalidStateError: WebSocket is not open");\n' +
+        '      if (typeof data === "string" || data instanceof ArrayBuffer) {\n' +
+        '        try { bc.postMessage({ t: "send", id: this.id, data: data }); } catch (e) { /* dead bridge */ }\n' +
+        '        return;\n' +
+        '      }\n' +
+        '      if (ArrayBuffer.isView(data)) {\n' +
+        '        var ab = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);\n' +
+        '        try { bc.postMessage({ t: "send", id: this.id, data: ab }); } catch (e) { /* dead bridge */ }\n' +
+        '        return;\n' +
+        '      }\n' +
+        '      if (data && typeof data.arrayBuffer === "function") {\n' +
+        '        var self = this;\n' +
+        '        data.arrayBuffer().then(function (buf) {\n' +
+        '          if (self.readyState === BridgeWebSocket.OPEN) {\n' +
+        '            try { bc.postMessage({ t: "send", id: self.id, data: buf }); } catch (e) { /* dead bridge */ }\n' +
+        '          }\n' +
+        '        });\n' +
+        '        return;\n' +
+        '      }\n' +
+        '      try { bc.postMessage({ t: "send", id: this.id, data: String(data) }); } catch (e) { /* dead bridge */ }\n' +
+        '    },\n' +
+        '    close: function (code, reason) {\n' +
+        '      if (this.readyState === BridgeWebSocket.CLOSING || this.readyState === BridgeWebSocket.CLOSED) return;\n' +
+        '      this.readyState = BridgeWebSocket.CLOSING;\n' +
+        '      try { bc.postMessage({ t: "close", id: this.id, code: typeof code === "number" ? code : 1000, reason: String(reason || "") }); } catch (e) { /* dead bridge */ }\n' +
+        '      // The page-side socket runs the real closing handshake and relays the result; if the page is gone (or the relay is stuck), a browser-like forced completion after 1s — never wait forever.\n' +
+        '      var self = this;\n' +
+        '      this._closeWatchdog = setTimeout(function () {\n' +
+        '        if (self.readyState !== BridgeWebSocket.CLOSED) self._finish(1006, "", false);\n' +
+        '      }, 1000);\n' +
+        '    },\n' +
+        '    addEventListener: function (type, fn) { if (this._eventListeners[type]) this._eventListeners[type].push(fn); },\n' +
+        '    removeEventListener: function (type, fn) {\n' +
+        '      var list = this._eventListeners[type] || [];\n' +
+        '      var i = list.indexOf(fn);\n' +
+        '      if (i >= 0) list.splice(i, 1);\n' +
+        '    },\n' +
+        '    get onopen() { return this._onopen || null; },\n' +
+        '    set onopen(fn) { this._onopen = fn; },\n' +
+        '    get onmessage() { return this._onmessage || null; },\n' +
+        '    set onmessage(fn) { this._onmessage = fn; },\n' +
+        '    get onclose() { return this._onclose || null; },\n' +
+        '    set onclose(fn) { this._onclose = fn; },\n' +
+        '    get onerror() { return this._onerror || null; },\n' +
+        '    set onerror(fn) { this._onerror = fn; },\n' +
+        '    _emit: function (type, ev) {\n' +
+        '      var handler = this["_on" + type];\n' +
+        '      if (typeof handler === "function") { try { handler.call(this, ev); } catch (e) { /* app error */ } }\n' +
+        '      var list = (this._eventListeners[type] || []).slice();\n' +
+        '      for (var i = 0; i < list.length; i++) { try { list[i].call(this, ev); } catch (e) { /* app error */ } }\n' +
+        '    },\n' +
+        '    _fail: function (message) {\n' +
+        '      if (this.readyState === BridgeWebSocket.CLOSED) return;\n' +
+        '      this._finish(1006, message, false);\n' +
+        '      this._emit("error", { type: "error", message: message, target: this });\n' +
+        '    },\n' +
+        '    _finish: function (code, reason, wasClean) {\n' +
+        '      if (this.readyState === BridgeWebSocket.CLOSED) return;\n' +
+        '      if (this._closeWatchdog) { clearTimeout(this._closeWatchdog); this._closeWatchdog = null; }\n' +
+        '      this.readyState = BridgeWebSocket.CLOSED;\n' +
+        '      var self = this;\n' +
+        '      setTimeout(function () {\n' +
+        '        self._emit("close", { type: "close", code: code, reason: reason, wasClean: wasClean, target: self });\n' +
+        '      }, 0);\n' +
+        '    },\n' +
+        '  };\n' +
+        '  bc.onmessage = function (ev) {\n' +
+        '    var m = ev.data;\n' +
+        '    if (!m || typeof m !== "object") return;\n' +
+        '    // find the socket for this id — sockets are tracked on the instances\n' +
+        '    var ws = null;\n' +
+        '    for (var i = 0; i < liveSockets.length; i++) { if (liveSockets[i].id === m.id) { ws = liveSockets[i]; break; } }\n' +
+        '    if (m.t === "opened") {\n' +
+        '      if (ws) { ws.protocol = m.protocol || ""; ws.readyState = BridgeWebSocket.OPEN; ws._emit("open", { type: "open", target: ws }); }\n' +
+        '    } else if (m.t === "message") {\n' +
+        '      if (ws && ws.readyState === BridgeWebSocket.OPEN) ws._emit("message", { type: "message", data: m.data, target: ws });\n' +
+        '    } else if (m.t === "closed") {\n' +
+        '      if (ws && ws.readyState !== BridgeWebSocket.CLOSED) {\n' +
+        '        if (m.code === 1006 && !m.wasClean) ws._emit("error", { type: "error", message: m.reason || "connection failed", target: ws });\n' +
+        '        ws._finish(m.code || 1006, m.reason || "", !!m.wasClean);\n' +
+        '        var idx = liveSockets.indexOf(ws);\n' +
+        '        if (idx >= 0) liveSockets.splice(idx, 1);\n' +
+        '      }\n' +
+        '    }\n' +
+        '  };\n' +
+        '  var liveSockets = [];\n' +
+        '  var RealBridge = BridgeWebSocket;\n' +
+        '  self.WebSocket = function (url, protocols) {\n' +
+        '    var ws = RealBridge(url, protocols);\n' +
+        '    liveSockets.push(ws);\n' +
+        '    return ws;\n' +
+        '  };\n' +
+        '  self.WebSocket.prototype = RealBridge.prototype;\n' +
+        '  self.WebSocket.CONNECTING = 0;\n' +
+        '  self.WebSocket.OPEN = 1;\n' +
+        '  self.WebSocket.CLOSING = 2;\n' +
+        '  self.WebSocket.CLOSED = 3;\n' +
+        '})();\n';
+    };
+
+    window.SharedWorker = function OCSharedWorker(url, options) {
+      // The constructor API is synchronous, so the source must be resolved
+      // synchronously. Sync XHR resolves blob:, data: and same-origin URLs;
+      // if the source cannot be read (cross-origin, network error, …) we
+      // fall back to the NATIVE worker — unpatched, exactly the behavior
+      // before this bridge existed (its WebSockets stay real).
+      var source = null;
+      try {
+        var xhr = new XMLHttpRequest();
+        xhr.open('GET', String(url), false);
+        xhr.send(null);
+        if (xhr.status >= 200 && xhr.status < 300) source = xhr.responseText;
+      } catch (e) { source = null; }
+      if (source === null) {
+        return options === undefined
+          ? new RealSharedWorker(url)
+          : new RealSharedWorker(url, options);
+      }
+
+      var channelName = 'oc-ws-bridge-' + (++bridgeSeq) + '-' + Math.random().toString(36).slice(2);
+      var patched = source + workerBridgeSource(channelName);
+      var patchedUrl = URL.createObjectURL(new Blob([patched], { type: 'application/javascript' }));
+
+      // Page side of the bridge: every worker WS open becomes a tunneled
+      // OCWebSocket in this window. Registration in wsInstances gives it
+      // keepalive + pagehide teardown for free.
+      var bc = new BroadcastChannel(channelName);
+      var bridged = new Map(); // worker socket id → page-side OCWebSocket
+      bc.onmessage = function (ev) {
+        var m = ev.data;
+        if (!m || typeof m !== 'object') return;
+        var ws = bridged.get(m.id);
+        if (m.t === 'open') {
+          var s = null;
+          try {
+            s = new OCWebSocket(m.url, m.protocols);
+          } catch (e) {
+            try { bc.postMessage({ t: 'closed', id: m.id, code: 1006, reason: String(e && e.message || e), wasClean: false }); } catch (e2) { /* dead */ }
+            return;
+          }
+          bridged.set(m.id, s);
+          s.addEventListener('open', function () {
+            try { bc.postMessage({ t: 'opened', id: m.id, protocol: s.protocol }); } catch (e) { /* dead */ }
+          });
+          s.addEventListener('message', function (e2) {
+            try { bc.postMessage({ t: 'message', id: m.id, data: e2.data }); } catch (e) { /* dead */ }
+          });
+          s.addEventListener('close', function (e2) {
+            try { bc.postMessage({ t: 'closed', id: m.id, code: e2.code, reason: e2.reason, wasClean: e2.wasClean }); } catch (e) { /* dead */ }
+            bridged.delete(m.id);
+          });
+          return;
+        }
+        if (m.t === 'send' && ws) {
+          try { ws.send(m.data); } catch (e) { /* app sent too early/late — real WS throws too */ }
+        } else if (m.t === 'close' && ws) {
+          try { ws.close(m.code, m.reason); } catch (e) { /* already closed */ }
+        }
+      };
+
+      // Construct the REAL SharedWorker from the patched source. Ports,
+      // connect events and error events are fully native.
+      return options === undefined
+        ? new RealSharedWorker(patchedUrl)
+        : new RealSharedWorker(patchedUrl, options);
+    };
+    try { window.SharedWorker.prototype = RealSharedWorker.prototype; } catch (e) { /* frozen realm */ }
+  }
+
   /* ------------------------------------------------- RFC6455 frame helpers */
 
   function buildClientFrame(opcode, payload) {

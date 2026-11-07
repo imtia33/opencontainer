@@ -1,7 +1,7 @@
 {
   "name": "opencontainer",
   "version": "1.0.0-beta.2",
-  "description": "Browser-native Node.js runtime \u2014 real Node v26 lib tree, the real npm CLI, OPFS-backed VFS. A drop-in, open-source WebContainers alternative: npm install and boot, nothing to host.",
+  "description": "Browser-native Node.js runtime \u2014 real Node v26 lib tree, the real npm CLI, a temporary session-scoped VFS. A drop-in, open-source WebContainers alternative: npm install and boot, nothing to host.",
   "type": "module",
   "license": "MIT",
   "private": false,
@@ -20,7 +20,6 @@
     "browser",
     "runtime",
     "virtual-filesystem",
-    "opfs",
     "web-worker",
     "stackblitz-alternative",
     "in-browser"

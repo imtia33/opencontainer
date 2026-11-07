@@ -16234,7 +16234,6 @@ function setProto(obj, proto) {
 // src/packages/opencontainer/kernel/worker-entry.ts
 init_browser();
 var runtimeBase = "/opencontainer/runtime";
-var OPFS_ROOT_DIR = "opencontainer-vfs";
 var NativeDecompressionStream = globalThis.DecompressionStream;
 globalThis.__ocHostGunzip = async (gz) => {
   if (typeof NativeDecompressionStream === "function") {
@@ -16519,116 +16518,6 @@ function applyHostFsOp(op) {
       break;
   }
 }
-async function opfsRoot() {
-  try {
-    const root = await navigator.storage?.getDirectory?.();
-    if (!root) {
-      diag("opfs: getDirectory() resolved falsy");
-      return null;
-    }
-    return await root.getDirectoryHandle(OPFS_ROOT_DIR, { create: true });
-  } catch (e) {
-    diag(`opfs: opfsRoot threw: ${e && e.name}: ${e && e.message} (navigator=${typeof globalThis.navigator}, getDirectory=${typeof globalThis.navigator?.storage?.getDirectory})`);
-    return null;
-  }
-}
-function opfsKey(path) {
-  return encodeURIComponent(path);
-}
-function isEphemeralPath(p) {
-  return p.includes("/node_modules/");
-}
-function diag(message) {
-  try {
-    post({ type: "stdio", fd: 2, chunk: `[oc-diag] ${message}
-` });
-    post({ type: "error", message: `[oc-diag] ${message}` });
-  } catch {}
-}
-globalThis.__ocEvalLog = (p) => {
-  try {
-    post({ type: "stdio", fd: 2, chunk: `[oc-eval] ${p}
-` });
-  } catch {}
-};
-globalThis.__ocEvalDone = (p) => {
-  try {
-    post({ type: "stdio", fd: 2, chunk: `[oc-eval✓] ${p}
-` });
-  } catch {}
-};
-async function saveTreeToOpfs() {
-  if (!kernel) {
-    diag("opfs: no kernel");
-    return;
-  }
-  const root = await opfsRoot();
-  if (!root) {
-    diag("opfs: opfsRoot() returned null — getDirectory/getDirectoryHandle threw or unavailable");
-    return;
-  }
-  const tree = kernel.vfs.exportTree("/home");
-  const eDirs = tree.dirs.filter((p) => !isEphemeralPath(p));
-  const eFiles = tree.files.filter(([p]) => !isEphemeralPath(p));
-  const eSymlinks = tree.symlinks.filter(([p]) => !isEphemeralPath(p));
-  const manifest = {
-    savedAt: Date.now(),
-    dirs: eDirs,
-    symlinks: eSymlinks,
-    files: eFiles.map(([p]) => p)
-  };
-  const mf = await root.getFileHandle("_manifest.json", { create: true });
-  const w = await mf.createSyncAccessHandle();
-  const mbytes = new TextEncoder().encode(JSON.stringify(manifest));
-  w.truncate(0);
-  w.write(mbytes, { at: 0 });
-  w.flush();
-  w.close();
-  for (const [p, data] of eFiles) {
-    const fh = await root.getFileHandle(opfsKey(p), { create: true });
-    const acc = await fh.createSyncAccessHandle();
-    acc.truncate(0);
-    acc.write(data, { at: 0 });
-    acc.flush();
-    acc.close();
-  }
-  const live = new Set(eFiles.map(([p]) => opfsKey(p)));
-  for await (const [name] of root.entries()) {
-    if (name.startsWith("_"))
-      continue;
-    if (!live.has(name)) {
-      try {
-        await root.removeEntry(name);
-      } catch {}
-    }
-  }
-}
-async function loadTreeFromOpfs() {
-  const root = await opfsRoot();
-  if (!root)
-    return null;
-  let manifest = null;
-  try {
-    const mf = await root.getFileHandle("_manifest.json");
-    const file = await mf.getFile();
-    manifest = JSON.parse(await file.text());
-  } catch {
-    return null;
-  }
-  const dirs = (manifest.dirs ?? []).filter((p) => !isEphemeralPath(p));
-  const symlinks = (manifest.symlinks ?? []).filter(([p]) => !isEphemeralPath(p));
-  const files = [];
-  for (const p of manifest.files ?? []) {
-    if (isEphemeralPath(p))
-      continue;
-    try {
-      const fh = await root.getFileHandle(opfsKey(p));
-      const file = await fh.getFile();
-      files.push([p, new Uint8Array(await file.arrayBuffer())]);
-    } catch {}
-  }
-  return { dirs, files, symlinks };
-}
 async function boot(msg) {
   const t0 = performance.now();
   const marks = {};
@@ -16661,23 +16550,15 @@ async function boot(msg) {
   });
   post({ type: "boot-progress", phase: "bootstrap", loaded: 0, total: count });
   myStdio = msg.stdio ?? myStdio;
-  let opfsTree = msg.hydrate ?? null;
-  let hydratedFrom = msg.hydrate ? "host-snapshot" : "none";
-  if (!opfsTree) {
-    const loaded = await loadTreeFromOpfs();
-    if (loaded && (loaded.files.length > 0 || loaded.dirs.length > 0)) {
-      opfsTree = loaded;
-      hydratedFrom = "opfs";
-      lap("opfsLoadMs");
-    }
-  }
+  const hydrateTree = msg.hydrate ?? null;
+  const hydratedFrom = msg.hydrate ? "host-snapshot" : "none";
   const pid = msg.pid ?? 1;
   globalThis.__ocPidBase = pid * 1000 + 1;
   globalThis.__ocPipeIdBase = pid * 1e4 + 1;
   globalThis.__ocConnIdBase = pid * 1e5 + 1;
   kernel = await bootKernel({
     store: makeLazyStore(),
-    hydrate: opfsTree ?? undefined,
+    hydrate: hydrateTree ?? undefined,
     pid,
     ppid: msg.ppid ?? 0,
     stdio: myStdio,
@@ -16798,7 +16679,6 @@ async function boot(msg) {
     bootMs: Math.round(performance.now() - t0),
     phases: marks,
     hydratedFrom,
-    vfsSnapshot: hydratedFrom === "opfs" ? opfsTree : undefined,
     pid
   });
   if (Array.isArray(msg.initialPorts) && msg.initialPorts.length > 0) {
@@ -17050,11 +16930,6 @@ async function handleRpcMessage(ev) {
           throw new Error("kernel not booted");
         kernel.vfs.writeFile(msg.path ?? "/home/project/file.js", msg.content ?? "");
         post({ type: "write-file-done", id: msg.id });
-        break;
-      }
-      case "persist-vfs": {
-        await saveTreeToOpfs();
-        post({ type: "persist-vfs-done", id: msg.id });
         break;
       }
       case "fs-read": {
