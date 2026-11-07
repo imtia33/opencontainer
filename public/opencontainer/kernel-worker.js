@@ -2339,7 +2339,8 @@ class Vfs {
       ctimeMs: t,
       birthtimeMs: t,
       ino: nextIno++,
-      watchers: new Set
+      watchers: new Set,
+      children: new Map
     };
   }
   normalize(p) {
@@ -2375,7 +2376,7 @@ class Vfs {
       }
       if ((cur.mode & S_IFMT) !== S_IFDIR)
         return null;
-      const child = this.childrenOf(cur).find((c) => c.name === seg);
+      const child = cur.children.get(seg);
       if (!child)
         return null;
       if ((child.mode & S_IFMT) === S_IFLNK && followLast) {
@@ -2389,21 +2390,6 @@ class Vfs {
       }
     }
     return cur;
-  }
-  childrenOf(dir) {
-    return dir._children ?? [];
-  }
-  attach(parent, child) {
-    parent._children = parent._children ?? [];
-    parent._children.push(child);
-  }
-  detach(parent, child) {
-    const kids = parent._children;
-    if (!kids)
-      return;
-    const i = kids.indexOf(child);
-    if (i >= 0)
-      kids.splice(i, 1);
   }
   pathOf(node) {
     if (!node.parent)
@@ -2491,14 +2477,14 @@ class Vfs {
     let createdAny = false;
     for (let i = 0;i < segs.length; i++) {
       const name = segs[i];
-      let child = this.childrenOf(cur).find((c) => c.name === name);
+      let child = cur.children.get(name);
       if (!child) {
         if (i === segs.length - 1 && this.lookup(this.joinPaths(this.pathOf(cur), name))) {
           throw new VfsError("EEXIST", errnoOf("EEXIST"), "mkdir", p);
         }
         child = this.makeNode(name, cur, S_IFDIR | mode & 511);
-        this.attach(cur, child);
-        this.fireRename(this.pathOf(cur));
+        cur.children.set(child.name, child);
+        this.fireRenameAt(cur);
         createdAny = true;
       } else if ((child.mode & S_IFMT) === S_IFLNK) {
         child = this.lookup(this.joinPaths(this.pathOf(cur), child.target ?? "/")) ?? child;
@@ -2531,33 +2517,36 @@ class Vfs {
   readTextFile(p) {
     return new TextDecoder().decode(this.readFile(p));
   }
-  writeFile(p, data, mode = 438) {
-    const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+  writeFile(p, data, mode = 438, owned = false) {
+    const isString = typeof data === "string";
+    const bytes = isString ? new TextEncoder().encode(data) : data;
     const norm = this.normalize(p);
     const parentNode = this.lookup(this.dirname(norm));
     if (!parentNode || (parentNode.mode & S_IFMT) !== S_IFDIR) {
       throw new VfsError("ENOENT", errnoOf("ENOENT"), "open", p);
     }
-    let node = this.childrenOf(parentNode).find((c) => c.name === this.basename(norm));
+    const base = this.basename(norm);
+    let node = parentNode.children.get(base);
     if (node && (node.mode & S_IFMT) === S_IFDIR) {
       throw new VfsError("EISDIR", errnoOf("EISDIR"), "open", p);
     }
     if (node && (node.mode & S_IFMT) === S_IFLNK) {
       const target = this.joinPaths(this.dirname(norm), node.target ?? "/");
-      this.writeFile(target, bytes);
+      this.writeFile(target, bytes, mode, owned || isString);
       return;
     }
+    const store = owned || isString ? bytes : bytes.slice();
     const t = this.now();
     if (!node) {
-      node = this.makeNode(this.basename(norm), parentNode, S_IFREG | mode & 511, bytes.slice());
-      this.attach(parentNode, node);
-      this.fireRename(this.dirname(norm));
+      node = this.makeNode(base, parentNode, S_IFREG | mode & 511, store);
+      parentNode.children.set(node.name, node);
+      this.fireRenameAt(parentNode);
     } else {
-      node.data = bytes.slice();
+      node.data = store;
       node.mtimeMs = node.ctimeMs = t;
-      this.fireChange(norm);
+      this.fireChangeAt(parentNode, base);
     }
-    this.persist?.({ type: "write", path: norm, data: bytes });
+    this.persist?.({ type: "write", path: norm, data: store });
   }
   appendFile(p, data) {
     const existing = this.exists(p) ? this.readFile(p) : new Uint8Array(0);
@@ -2565,18 +2554,21 @@ class Vfs {
     const merged = new Uint8Array(existing.byteLength + add.byteLength);
     merged.set(existing);
     merged.set(add, existing.byteLength);
-    this.writeFile(p, merged);
+    this.writeFile(p, merged, 438, true);
   }
   readdir(p) {
     const node = this.mustDir(p, "readdir");
-    return this.childrenOf(node).filter((c) => (c.mode & S_IFMT) !== 0).map((c) => c.name);
+    const out = [];
+    for (const c of node.children.values())
+      out.push(c.name);
+    return out;
   }
   dirents(p) {
     const node = this.mustDir(p, "readdir");
-    return this.childrenOf(node).map((c) => ({
-      name: c.name,
-      type: c.mode & S_IFMT
-    }));
+    const out = [];
+    for (const c of node.children.values())
+      out.push({ name: c.name, type: c.mode & S_IFMT });
+    return out;
   }
   rm(p, opts = {}) {
     const norm = this.normalize(p);
@@ -2587,12 +2579,12 @@ class Vfs {
       throw new VfsError("ENOENT", errnoOf("ENOENT"), "rm", p);
     }
     const isDir = (node.mode & S_IFMT) === S_IFDIR;
-    if (isDir && !opts.recursive && this.childrenOf(node).length > 0) {
+    if (isDir && !opts.recursive && node.children.size > 0) {
       throw new VfsError("ENOTEMPTY", errnoOf("ENOTEMPTY"), "rm", p);
     }
     const parent = node.parent ?? this.root;
-    this.detach(parent, node);
-    this.fireRename(this.pathOf(parent));
+    parent.children.delete(node.name);
+    this.fireRenameAt(parent);
     this.persist?.({ type: "unlink", path: norm });
   }
   rename(oldPath, newPath) {
@@ -2604,30 +2596,30 @@ class Vfs {
     if (!parentB || (parentB.mode & S_IFMT) !== S_IFDIR) {
       throw new VfsError("ENOENT", errnoOf("ENOENT"), "rename", newPath);
     }
-    const existing = this.childrenOf(parentB).find((c) => c.name === this.basename(b));
+    const existing = parentB.children.get(this.basename(b));
     if (existing && existing !== node) {
       const existingIsDir = (existing.mode & S_IFMT) === S_IFDIR;
       const nodeIsDir = (node.mode & S_IFMT) === S_IFDIR;
       if (existingIsDir && nodeIsDir) {
-        if (this.childrenOf(existing).length) {
+        if (existing.children.size) {
           throw new VfsError("ENOTEMPTY", errnoOf("ENOTEMPTY"), "rename", newPath);
         }
-        this.detach(parentB, existing);
+        parentB.children.delete(existing.name);
       } else if (existingIsDir && !nodeIsDir) {
         throw new VfsError("EISDIR", errnoOf("EISDIR"), "rename", newPath);
       } else if (!existingIsDir && nodeIsDir) {
         throw new VfsError("ENOTDIR", errnoOf("ENOTDIR"), "rename", newPath);
       } else {
-        this.detach(parentB, existing);
+        parentB.children.delete(existing.name);
       }
     }
     const oldParent = node.parent ?? this.root;
-    this.detach(oldParent, node);
+    oldParent.children.delete(node.name);
     node.name = this.basename(b);
     node.parent = parentB;
-    this.attach(parentB, node);
-    this.fireRename(this.pathOf(oldParent));
-    this.fireRename(this.dirname(b));
+    parentB.children.set(node.name, node);
+    this.fireRenameAt(oldParent);
+    this.fireRenameAt(parentB);
     this.persist?.({ type: "rename", from: a, to: b });
     if ((node.mode & S_IFMT) === S_IFREG && node.data) {
       this.persist?.({ type: "write", path: b, data: node.data });
@@ -2640,8 +2632,8 @@ class Vfs {
       throw new VfsError("ENOENT", errnoOf("ENOENT"), "symlink", path);
     const node = this.makeNode(this.basename(norm), parentNode, S_IFLNK | 511);
     node.target = target;
-    this.attach(parentNode, node);
-    this.fireRename(this.dirname(norm));
+    parentNode.children.set(node.name, node);
+    this.fireRenameAt(parentNode);
     this.persist?.({ type: "symlink", path: norm, target });
   }
   readlink(p) {
@@ -2712,17 +2704,11 @@ class Vfs {
     this.watchersByDir.get(dirNode).add(watcher);
     return watcher;
   }
-  fireRename(dirPath) {
-    const dir = this.lookup(dirPath, false);
-    if (dir)
-      for (const w of dir.watchers)
-        w.onEvent({ type: "rename", filename: null });
+  fireRenameAt(dir) {
+    for (const w of dir.watchers)
+      w.onEvent({ type: "rename", filename: null });
   }
-  fireChange(filePath) {
-    const dir = this.lookup(this.dirname(filePath), false);
-    if (!dir)
-      return;
-    const base = this.basename(filePath);
+  fireChangeAt(dir, base) {
     for (const w of dir.watchers) {
       if (w.fileFilter !== undefined && w.fileFilter !== base)
         continue;
@@ -2754,7 +2740,7 @@ class Vfs {
     const node = this.lookup(dir);
     if (!node)
       return "(missing)";
-    for (const c of this.childrenOf(node)) {
+    for (const c of node.children.values()) {
       lines.push("  ".repeat(depth) + c.name + ((c.mode & S_IFMT) === S_IFDIR ? "/" : ""));
       if ((c.mode & S_IFMT) === S_IFDIR)
         lines.push(this.dump(this.joinPaths(dir, c.name), depth + 1));
@@ -2767,7 +2753,7 @@ class Vfs {
     const files = [];
     const symlinks = [];
     const walk = (node, p) => {
-      for (const c of this.childrenOf(node)) {
+      for (const c of node.children.values()) {
         const cp = p === "/" ? "/" + c.name : p + "/" + c.name;
         const t = c.mode & S_IFMT;
         if (t === S_IFDIR) {
@@ -2802,7 +2788,7 @@ class Vfs {
       for (const [p, data] of tree.files) {
         try {
           ensureParents(p);
-          this.writeFile(p, data);
+          this.writeFile(p, data, 438, true);
         } catch {}
       }
       for (const [p, target] of tree.symlinks) {
@@ -2823,7 +2809,7 @@ class Vfs {
         try {
           switch (op.type) {
             case "write":
-              this.writeFile(op.path, op.data);
+              this.writeFile(op.path, op.data, 438, true);
               break;
             case "mkdir":
               this.mkdir(op.path, true);
@@ -5062,23 +5048,45 @@ function makeFsBinding(ctx) {
       return bytes.byteLength;
     }
     const f = mustFd(fd, "write");
-    if (position !== -1 && position !== null && position !== undefined) {
+    const explicitPos = position !== -1 && position !== null && position !== undefined;
+    const truncEmptyNow = () => {
+      if (!(f.flags & 512))
+        return false;
+      const atZero = explicitPos ? position === 0 : f.pos === 0;
+      if (!atZero)
+        return false;
+      try {
+        return vfs.stat(f.path).size === 0;
+      } catch {
+        return true;
+      }
+    };
+    if (explicitPos && position === 0 && truncEmptyNow()) {
+      vfs.writeFile(f.path, bytes);
+      return bytes.byteLength;
+    }
+    if (explicitPos) {
       const existing = vfs.readFile(f.path);
       const merged = new Uint8Array(Math.max(existing.byteLength, position + bytes.byteLength));
       merged.set(existing);
       merged.set(bytes, position);
-      vfs.writeFile(f.path, merged);
+      vfs.writeFile(f.path, merged, 438, true);
       return bytes.byteLength;
     }
     if (f.flags & 1024) {
       vfs.appendFile(f.path, bytes);
       f.pos = vfs.stat(f.path).size;
     } else {
+      if (truncEmptyNow()) {
+        vfs.writeFile(f.path, bytes);
+        f.pos = bytes.byteLength;
+        return bytes.byteLength;
+      }
       const existing = vfs.readFile(f.path);
       const merged = new Uint8Array(Math.max(existing.byteLength, f.pos + bytes.byteLength));
       merged.set(existing);
       merged.set(bytes, f.pos);
-      vfs.writeFile(f.path, merged);
+      vfs.writeFile(f.path, merged, 438, true);
       f.pos += bytes.byteLength;
     }
     return bytes.byteLength;
@@ -14214,6 +14222,32 @@ function installNetPendingGlobalFetch() {
 }
 
 // src/packages/opencontainer/kernel/http-fetch-client.ts
+var httpMaxSockets = 15;
+var httpActiveSockets = 0;
+var httpSocketWaiters = [];
+function setHttpMaxSockets(n) {
+  httpMaxSockets = Math.max(1, n | 0);
+  while (httpActiveSockets < httpMaxSockets && httpSocketWaiters.length > 0) {
+    httpActiveSockets++;
+    const next = httpSocketWaiters.shift();
+    queueMicrotask(next);
+  }
+}
+function acquireHttpSocket(continuation) {
+  if (httpActiveSockets < httpMaxSockets) {
+    httpActiveSockets++;
+    continuation();
+    return;
+  }
+  httpSocketWaiters.push(continuation);
+}
+function releaseHttpSocket() {
+  if (httpSocketWaiters.length > 0) {
+    queueMicrotask(httpSocketWaiters.shift());
+  } else {
+    httpActiveSockets = Math.max(0, httpActiveSockets - 1);
+  }
+}
 var CORS_SAFELISTED_REQUEST_HEADERS = new Set([
   "accept",
   "accept-language",
@@ -14689,6 +14723,7 @@ class FetchClientRequest extends TinyEmitter {
   res = null;
   socket = null;
   method;
+  _socketReleased = false;
   path;
   host;
   port;
@@ -14893,8 +14928,23 @@ class FetchClientRequest extends TinyEmitter {
     }
     const socket = new FakeSocket(this.host, this.port);
     this.socket = socket;
-    this.emit("socket", socket);
+    acquireHttpSocket(() => this._fetchWithPermit(absUrl, headers, body));
+  }
+  _fetchWithPermit(absUrl, headers, body) {
+    if (this.destroyed) {
+      releaseHttpSocket();
+      return;
+    }
+    this.emit("socket", this.socket);
     this._armIdle();
+    if (!this._socketReleased) {
+      this.once("close", () => {
+        if (this._socketReleased)
+          return;
+        this._socketReleased = true;
+        releaseHttpSocket();
+      });
+    }
     const fetchFn = this._fetchImpl ?? globalThis.fetch;
     const opts = {
       method: this.method,
@@ -15084,6 +15134,9 @@ function installFetchHttpClient(opts) {
   const { http, https } = opts;
   if (!http || !https)
     throw new Error("installFetchHttpClient: `http` and `https` module objects are required");
+  if (typeof opts.maxSockets === "number" && opts.maxSockets > 0) {
+    setHttpMaxSockets(opts.maxSockets);
+  }
   const rewrite = opts.rewrite;
   const fetchImpl = opts.fetchImpl;
   const isLoopback = opts.isLoopback ?? defaultIsLoopback;
@@ -15536,10 +15589,22 @@ async function bootKernel(opts) {
   }
   const vfs = opts.vfs ?? new Vfs;
   const cwd = opts.cwd ?? "/home/project";
-  vfs.mkdir("/home", true);
+  for (const d of [
+    "/home",
+    "/home/project",
+    "/home/node",
+    "/tmp",
+    "/usr",
+    "/usr/bin",
+    "/bin",
+    "/usr/local",
+    "/usr/local/bin",
+    "/usr/lib",
+    "/usr/lib/node_modules"
+  ]) {
+    vfs.mkdir(d, true);
+  }
   vfs.mkdir(cwd, true);
-  vfs.mkdir("/home/node", true);
-  vfs.mkdir("/tmp", true);
   if (opts.hydrate) {
     vfs.importTree(opts.hydrate);
     __stage("hydrate");
@@ -15614,7 +15679,11 @@ try { require(${JSON.stringify(requirePath)}); } catch (e) { process.stderr.writ
 ` + `const __ocTrace = (tag) => { try { process.stderr.write('OC-TRACE ' + tag + ' argv=' + JSON.stringify(process.argv) + ' exitCode=' + JSON.stringify(process.exitCode) + ' at ' + new Error().stack.split('\\n').slice(2,6).join(' <- ') + '\\n'); } catch (_) {} };
 ` + `process.exit = function (code) { if (process.env && process.env.OC_TRACE_EXIT === '1') __ocTrace('exit(' + code + ')'); __ocRunCompat(() => __ocRealExit(code)); };
 ` + `let __ocResult;
-` + `try { __ocResult = require(${JSON.stringify(entry)})(process); }
+` + `// npm's lib/cli.js exports fn(process) -> promise; pnpm's bin/pnpm.cjs
+` + `// is a SIDE-EFFECT module (returns nothing and boots its CLI on
+` + `// require). Calling the result unconditionally killed pnpm's async
+` + `// bootstrap with "require(...) is not a function" before any output.
+` + `try { const __ocMod = require(${JSON.stringify(entry)}); __ocResult = typeof __ocMod === 'function' ? __ocMod(process) : undefined; }
 ` + `catch (e) { process.stderr.write('OC-SHIM-ERROR ${p}: ' + (e && e.stack || e) + '\\n'); process.exit(42); }
 ` + `if (__ocResult && typeof __ocResult.then === 'function') {
 ` + `  // The CLI settled. Run the compat pass (install-class commands
@@ -16293,6 +16362,30 @@ globalThis.__ocWorkerMsgDebug = (s) => {
 function post(msg) {
   nativePostMessage(msg);
 }
+var stdioBatch = [];
+var stdioBatchBytes = 0;
+var stdioBatchTimer = null;
+function flushStdioBatch() {
+  if (stdioBatchTimer !== null) {
+    clearTimeout(stdioBatchTimer);
+    stdioBatchTimer = null;
+  }
+  if (stdioBatch.length === 0)
+    return;
+  const items = stdioBatch;
+  stdioBatch = [];
+  stdioBatchBytes = 0;
+  post({ type: "stdio-batch", items });
+}
+function queueStdioText(fd2, text) {
+  stdioBatch.push({ fd: fd2, text });
+  stdioBatchBytes += text.length;
+  if (stdioBatchTimer === null) {
+    stdioBatchTimer = setTimeout(flushStdioBatch, 16);
+  }
+  if (stdioBatchBytes >= 262144)
+    flushStdioBatch();
+}
 var CACHE_NAME = "opencontainer-runtime-v2";
 function cacheKeyUrl(file) {
   return `${runtimeBase}/${file}`;
@@ -16576,6 +16669,8 @@ async function boot(msg) {
         }
       },
       onExit(code, signal) {
+        flushStdioBatch();
+        flushVfsDeltasNow();
         post({ type: "exit", code, signal: signal ?? null });
       },
       onStdio(fd2, chunk) {
@@ -16585,7 +16680,7 @@ async function boot(msg) {
           post({ type: "stdio", fd: fd2, pipeId: mode.pipeId, bytes });
         } else {
           const text = typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk);
-          post({ type: "stdio", fd: fd2, chunk: text });
+          queueStdioText(fd2, text);
         }
       },
       now: () => Date.now(),

@@ -204,13 +204,21 @@ export async function bootKernel(opts: BootOptions): Promise<BootedKernel> {
 
   const vfs = opts.vfs ?? new Vfs();
   const cwd = opts.cwd ?? '/home/project';
-  vfs.mkdir('/home', true);
-  vfs.mkdir(cwd, true);
-  vfs.mkdir('/home/node', true); // os.homedir() — REPL history lives here
-  // Standard base directories every unix-ish node program expects to exist
-  // (the "OS image" our runtime ships). /tmp backs os.tmpdir(); chdir into
-  // these paths must not ENOENT.
-  vfs.mkdir('/tmp', true);
+  // Base directories every unix-ish node program expects to exist — the
+  // "OS image" our runtime ships, mirroring OC_BASE_DIRS on the host side
+  // (runtime.ts). /tmp backs os.tmpdir(); chdir into these paths must never
+  // ENOENT. S20 fix: the FULL set is created on EVERY boot — previously
+  // only the spawn cwd existed, so once the session cwd moved elsewhere
+  // (`cd /usr`), `cd /home/project` ENOENT'd in every fresh process (the
+  // host snapshot records only MUTATED dirs, never the boot image).
+  for (const d of [
+    '/home', '/home/project', '/home/node', '/tmp',
+    '/usr', '/usr/bin', '/bin', '/usr/local', '/usr/local/bin',
+    '/usr/lib', '/usr/lib/node_modules',
+  ]) {
+    vfs.mkdir(d, true);
+  }
+  vfs.mkdir(cwd, true); // the spawn cwd itself (may be anywhere the session moved)
   if (opts.hydrate) {
     vfs.importTree(opts.hydrate);
     __stage('hydrate');
@@ -308,7 +316,11 @@ export async function bootKernel(opts: BootOptions): Promise<BootedKernel> {
           `const __ocTrace = (tag) => { try { process.stderr.write('OC-TRACE ' + tag + ' argv=' + JSON.stringify(process.argv) + ' exitCode=' + JSON.stringify(process.exitCode) + ' at ' + new Error().stack.split('\\n').slice(2,6).join(' <- ') + '\\n'); } catch (_) {} };\n` +
           `process.exit = function (code) { if (process.env && process.env.OC_TRACE_EXIT === '1') __ocTrace('exit(' + code + ')'); __ocRunCompat(() => __ocRealExit(code)); };\n` +
           `let __ocResult;\n` +
-          `try { __ocResult = require(${JSON.stringify(entry)})(process); }\n` +
+          `// npm's lib/cli.js exports fn(process) -> promise; pnpm's bin/pnpm.cjs\n` +
+          `// is a SIDE-EFFECT module (returns nothing and boots its CLI on\n` +
+          `// require). Calling the result unconditionally killed pnpm's async\n` +
+          `// bootstrap with "require(...) is not a function" before any output.\n` +
+          `try { const __ocMod = require(${JSON.stringify(entry)}); __ocResult = typeof __ocMod === 'function' ? __ocMod(process) : undefined; }\n` +
           `catch (e) { process.stderr.write('OC-SHIM-ERROR ${p}: ' + (e && e.stack || e) + '\\n'); process.exit(42); }\n` +
           `if (__ocResult && typeof __ocResult.then === 'function') {\n` +
           `  // The CLI settled. Run the compat pass (install-class commands\n` +

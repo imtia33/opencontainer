@@ -796,9 +796,22 @@ async function runScript(script) {
     }
   } catch (err) {
     process.stderr.write(`oc-sh: ${err && err.message ? err.message : String(err)}\n`);
+    writeCwdReport();
     process.exit(2);
   }
+  writeCwdReport();
   process.exit(code);
+}
+
+// S20 — cwd report channel: when the host terminal spawns this shell to
+// run a builtin/coreutil line (OC_CWD_REPORT names a path), report the FINAL
+// cwd so the host session can follow compound lines like `mkdir x && cd x`
+// (each terminal command is a fresh process, so the host owns the session
+// cwd — the shell is the authority on where the line ended up).
+function writeCwdReport() {
+  const p = process.env.OC_CWD_REPORT;
+  if (!p) return;
+  try { require('fs').writeFileSync(p, shellState.cwd); } catch { /* best-effort */ }
 }
 
 function main() {
@@ -808,6 +821,7 @@ function main() {
     process.exit(0);
   }
   for (const [k, v] of Object.entries(process.env)) shellState.env[k] = v;
+  try { process.on('exit', writeCwdReport); } catch { /* exit hook unavailable */ }
 
   if (argv[0] === '-c') {
     if (argv[1] === undefined) {

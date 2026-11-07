@@ -164,6 +164,40 @@ function post(msg: RpcMsg) {
 }
 
 // ---------------------------------------------------------------------------
+// S21 — tty stdio batching. npm's spinner/progress emits many small writes
+// per second; each was its own postMessage, and the MAIN thread handled
+// every one (decode + ONLCR regex + event emit + xterm write) — the "install
+// slows the whole browser" report. Coalesce per ~frame (16ms), bounded by
+// queued bytes, flushed synchronously on exit so output ordering with the
+// prompt return is preserved. Pipe stdio stays per-chunk (byte-exact,
+// reader-owned). Piped/programmatic output never batches.
+// ---------------------------------------------------------------------------
+let stdioBatch: Array<{ fd: 1 | 2; text: string }> = [];
+let stdioBatchBytes = 0;
+let stdioBatchTimer: ReturnType<typeof setTimeout> | null = null;
+
+function flushStdioBatch(): void {
+  if (stdioBatchTimer !== null) {
+    clearTimeout(stdioBatchTimer);
+    stdioBatchTimer = null;
+  }
+  if (stdioBatch.length === 0) return;
+  const items = stdioBatch;
+  stdioBatch = [];
+  stdioBatchBytes = 0;
+  post({ type: 'stdio-batch', items });
+}
+
+function queueStdioText(fd: 1 | 2, text: string): void {
+  stdioBatch.push({ fd, text });
+  stdioBatchBytes += text.length;
+  if (stdioBatchTimer === null) {
+    stdioBatchTimer = setTimeout(flushStdioBatch, 16);
+  }
+  if (stdioBatchBytes >= 262_144) flushStdioBatch(); // bound memory
+}
+
+// ---------------------------------------------------------------------------
 // Blob loading (single-request boot + Cache API persistence)
 // ---------------------------------------------------------------------------
 
@@ -462,6 +496,14 @@ function wireVfsDeltas(): void {
 /** VFS watchers registered by the host (watchId → watcher). */
 const fsWatchers = new Map<number, { close(): void }>();
 
+// S21 note — the keeper (entry-less idle process) applies peer deltas
+// EAGERLY like every other process. A journaling variant was measured
+// SLOWER: retaining every intermediate write buffer (cacache rewrites its
+// index per package) ballooned memory with total write volume instead of
+// final size, and GC pressure cost 2.5x on a 65-package install. With the
+// Map-indexed VFS + owned (zero-copy) stores, eager application is the
+// cheap path.
+
 /** Uniform RPC success/error reply. VfsError carries node-style codes. */
 function rpcReply(msg: { id?: number }, fn: () => unknown): void {
   try {
@@ -600,6 +642,12 @@ async function boot(msg: {
         },
       },
       onExit(code: number, signal?: string | null) {
+        // S21: flush queued tty output AND pending VFS deltas BEFORE the
+        // exit message — the terminal renders output before the prompt
+        // returns, and last-turn writes (the oc-sh cwd report, final
+        // renames) must reach the host before 'exit' triggers readers.
+        flushStdioBatch();
+        flushVfsDeltasNow();
         post({ type: 'exit', code, signal: signal ?? null });
       },
       onStdio(fd: 1 | 2, chunk: Uint8Array | string) {
@@ -612,7 +660,7 @@ async function boot(msg: {
           post({ type: 'stdio', fd, pipeId: mode.pipeId, bytes });
         } else {
           const text = typeof chunk === 'string' ? chunk : new TextDecoder().decode(chunk);
-          post({ type: 'stdio', fd, chunk: text });
+          queueStdioText(fd, text);
         }
       },
       now: () => Date.now(),
@@ -988,6 +1036,9 @@ async function handleRpcMessage(ev: MessageEvent<RpcMsg>): Promise<void> {
       }
       case 'vfs-apply': {
         // Deltas from OTHER processes — cross-process file visibility.
+        // applyExternalOps stores op.data OWNED (it arrived by structured
+        // clone — a private copy), so the fan-out costs one Map insert per
+        // op and never re-copies bytes.
         if (!kernel) break;
         kernel.vfs.applyExternalOps(msg.ops ?? []);
         break;

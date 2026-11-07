@@ -299,9 +299,21 @@ export class OpenContainerRuntime {
   private cwd = '/home/project';
 
   /** In-session VFS snapshot — every mutation from any process folds in
-   *  here and fans out to the other live processes. */
+   *  here EAGERLY and fans out to the other live processes. S21: the fold
+   *  is incremental through the children index (below) — O(1) per op,
+   *  O(subtree) for rename/unlink, and memory holds only the FINAL state.
+   *  (This replaces both earlier designs: the pre-S20 eager fold scanned
+   *  every file key per unlink/rename op — O(total files) per op, the "tab
+   *  slows the browser" report — and the S20 lazy journal retained every
+   *  INTERMEDIATE write buffer until first read, so memory grew with total
+   *  write volume — cacache rewrites its index per package — and GC
+   *  pressure made a 65-package install 2.5x slower.) */
   private vfsSnapshot: { dirs: Set<string>; files: Map<string, Uint8Array>; symlinks: Map<string, string> }
     = { dirs: new Set(), files: new Map(), symlinks: new Map() };
+
+  /** S21 — parent path → child paths (files + dirs + symlinks), maintained
+   *  incrementally so unlink/rename resolve subtrees without key scans. */
+  private vfsKids = new Map<string, Set<string>>();
 
   private foregroundPid: number | null = null;
   private bootedOnce = false;
@@ -522,6 +534,16 @@ export class OpenContainerRuntime {
         this.emit('stdio', fd, ttyOut(msg.bytes
           ? new TextDecoder().decode(msg.bytes)
           : (msg.chunk ?? '')));
+        break;
+      }
+      case 'stdio-batch': {
+        // S21 — coalesced tty writes from the worker (see queueStdioText):
+        // one postMessage per ~16ms instead of one per spinner frame. Same
+        // ONLCR line discipline per item as the single-chunk path above.
+        for (const it of msg.items ?? []) {
+          const fd = (it?.fd ?? 1) as 1 | 2;
+          this.emit('stdio', fd, ttyOut(String(it?.text ?? '')));
+        }
         break;
       }
       case 'pipe-write': {
@@ -1055,90 +1077,112 @@ export class OpenContainerRuntime {
 
   // ------------------------------------------------------------------ VFS
   private applyDeltas(source: KernelProcess, ops: Array<Record<string, any>>): void {
-    for (const op of ops) {
-      const recordAncestorDirs = (p: string) => {
-        // The snapshot's dir set must cover every intermediate directory —
-        // spawned processes hydrate from it, and importTree cannot place a
-        // file whose parent is absent (node's fs semantics: no implicit
-        // mkdir -p on write).
-        const segs = String(p).split('/');
-        for (let i = 2; i < segs.length; i++) {
-          this.vfsSnapshot.dirs.add(segs.slice(0, i).join('/'));
-        }
-      };
-      switch (op.type) {
-        case 'write':
-          this.vfsSnapshot.files.set(op.path, op.data);
-          this.vfsSnapshot.symlinks.delete(op.path);
-          this.vfsSnapshot.dirs.delete(op.path);
-          recordAncestorDirs(op.path);
-          break;
-        case 'mkdir':
-          this.vfsSnapshot.dirs.add(op.path);
-          recordAncestorDirs(op.path);
-          break;
-        case 'symlink':
-          this.vfsSnapshot.symlinks.set(op.path, op.target);
-          recordAncestorDirs(op.path);
-          break;
-        case 'unlink': {
-          this.vfsSnapshot.files.delete(op.path);
-          this.vfsSnapshot.symlinks.delete(op.path);
-          this.vfsSnapshot.dirs.delete(op.path);
-          const prefix = op.path + '/';
-          for (const p of [...this.vfsSnapshot.files.keys()]) {
-            if (p.startsWith(prefix)) this.vfsSnapshot.files.delete(p);
-          }
-          for (const p of [...this.vfsSnapshot.symlinks.keys()]) {
-            if (p.startsWith(prefix)) this.vfsSnapshot.symlinks.delete(p);
-          }
-          for (const d of [...this.vfsSnapshot.dirs]) {
-            if (d.startsWith(prefix)) this.vfsSnapshot.dirs.delete(d);
-          }
-          break;
-        }
-        case 'rename': {
-          const { from, to } = op;
-          const renameKey = (p: string): string => (p === from ? to : to + p.slice(from.length));
-          // Exact file at the source path.
-          const data = this.vfsSnapshot.files.get(from);
-          if (data !== undefined) {
-            this.vfsSnapshot.files.delete(from);
-            this.vfsSnapshot.files.set(to, data);
-          }
-          // DIRECTORY renames move the whole subtree (pnpm imports packages
-          // through a temp dir: lodash_tmp_2_1 → lodash — a one-file rename
-          // handler left the entire tree stranded under the temp name).
-          const prefix = from + '/';
-          for (const p of [...this.vfsSnapshot.files.keys()]) {
-            if (p.startsWith(prefix)) {
-              const d = this.vfsSnapshot.files.get(p)!;
-              this.vfsSnapshot.files.delete(p);
-              this.vfsSnapshot.files.set(renameKey(p), d);
-            }
-          }
-          for (const p of [...this.vfsSnapshot.symlinks.keys()]) {
-            if (p === from || p.startsWith(prefix)) {
-              const t = this.vfsSnapshot.symlinks.get(p)!;
-              this.vfsSnapshot.symlinks.delete(p);
-              this.vfsSnapshot.symlinks.set(renameKey(p), t);
-            }
-          }
-          for (const d of [...this.vfsSnapshot.dirs]) {
-            if (d === from || d.startsWith(prefix)) {
-              this.vfsSnapshot.dirs.delete(d);
-              this.vfsSnapshot.dirs.add(renameKey(d));
-            }
-          }
-          recordAncestorDirs(to);
-          break;
-        }
-      }
+    // S21 — EAGER incremental fold: each op applies to the snapshot through
+    // the persistent children index (O(1) per op; rename/unlink resolve
+    // their subtree through the index, never a key scan). Peers keep
+    // receiving deltas (cross-process visibility) exactly as before.
+    if (ops.length > 0) {
+      for (const op of ops) this.foldVfsOp(op);
     }
     // Fan out to every OTHER live process (cross-process visibility).
     for (const proc of this.processes.values()) {
       if (proc !== source && !proc.exited) {
         proc.worker.postMessage({ type: 'vfs-apply', ops });
+      }
+    }
+  }
+
+  private kidsIndexAdd(p: string): void {
+    const i = p.lastIndexOf('/');
+    const parent = i > 0 ? p.slice(0, i) : '/';
+    let s = this.vfsKids.get(parent);
+    if (!s) this.vfsKids.set(parent, s = new Set());
+    s.add(p);
+  }
+
+  private kidsIndexDel(p: string): void {
+    const i = p.lastIndexOf('/');
+    const parent = i > 0 ? p.slice(0, i) : '/';
+    this.vfsKids.get(parent)?.delete(p);
+  }
+
+  private recordAncestorDirs(p: string): void {
+    // The snapshot's dir set must cover every intermediate directory —
+    // spawned processes hydrate from it, and importTree cannot place a
+    // file whose parent is absent (node's fs semantics: no implicit
+    // mkdir -p on write).
+    const segs = String(p).split('/');
+    for (let i = 2; i < segs.length; i++) {
+      this.vfsSnapshot.dirs.add(segs.slice(0, i).join('/'));
+    }
+  }
+
+  /** root + everything under it, via the children index (O(subtree)). */
+  private subtreePaths(root: string): string[] {
+    const found: string[] = [];
+    const stack = [root];
+    while (stack.length > 0) {
+      const p = stack.pop()!;
+      found.push(p);
+      for (const c of this.vfsKids.get(p) ?? []) stack.push(c);
+    }
+    return found;
+  }
+
+  /** S21 — fold one delta op into the snapshot. Idempotent by
+   *  construction: fs-apply-ops on the keeper re-queues the same ops
+   *  through the worker's persist hook, so applyDeltas can see them twice
+   *  (pre-existing, harmless with the old fold too). */
+  private foldVfsOp(op: Record<string, any>): void {
+    const snap = this.vfsSnapshot;
+    switch (op.type) {
+      case 'write':
+        this.kidsIndexDel(op.path);
+        snap.symlinks.delete(op.path);
+        snap.dirs.delete(op.path);
+        snap.files.set(op.path, op.data);
+        this.kidsIndexAdd(op.path);
+        this.recordAncestorDirs(op.path);
+        break;
+      case 'mkdir':
+        snap.dirs.add(op.path);
+        this.kidsIndexAdd(op.path);
+        this.recordAncestorDirs(op.path);
+        break;
+      case 'symlink':
+        this.kidsIndexDel(op.path);
+        snap.files.delete(op.path);
+        snap.dirs.delete(op.path);
+        snap.symlinks.set(op.path, op.target);
+        this.kidsIndexAdd(op.path);
+        this.recordAncestorDirs(op.path);
+        break;
+      case 'unlink': {
+        // rm -r semantics: op path + everything under it.
+        for (const p of this.subtreePaths(String(op.path))) {
+          this.kidsIndexDel(p);
+          snap.files.delete(p);
+          snap.symlinks.delete(p);
+          snap.dirs.delete(p);
+        }
+        break;
+      }
+      case 'rename': {
+        const from = String(op.from);
+        const to = String(op.to);
+        const renameKey = (p: string): string => (p === from ? to : to + p.slice(from.length));
+        for (const p of this.subtreePaths(from)) {
+          const np = renameKey(p);
+          const f = snap.files.get(p);
+          if (f !== undefined) { snap.files.delete(p); snap.files.set(np, f); }
+          const l = snap.symlinks.get(p);
+          if (l !== undefined) { snap.symlinks.delete(p); snap.symlinks.set(np, l); }
+          if (snap.dirs.has(p)) { snap.dirs.delete(p); snap.dirs.add(np); }
+          this.kidsIndexDel(p);
+          this.kidsIndexAdd(np);
+        }
+        this.recordAncestorDirs(to);
+        break;
       }
     }
   }
@@ -1326,10 +1370,18 @@ export class OpenContainerRuntime {
     await this.ready;
     const { cmd, args } = parseCommand(command);
     const background = opts.background === true;
-    const spec = this.resolveShellCommand(cmd, args);
+    const spec = this.resolveShellCommand(cmd, args, command);
     if (spec.error) {
       this.emit('stdio', 2, ttyOut(`${spec.error}\n`));
       this.emit('exit', { pid: -1, code: 127, signal: null, foreground: !background });
+      return;
+    }
+    if (!spec.entry) {
+      // clear/help (host-UX commands with no kernel equivalent): a process
+      // with NO entry never exits — the keeper is exactly that, by design.
+      // Resolving immediately keeps the prompt authority loop alive (the
+      // old path hung the terminal forever on `clear`).
+      this.emit('exit', { pid: -1, code: 0, signal: null, foreground: !background });
       return;
     }
     const repl = spec.entry?.type === 'repl';
@@ -1350,11 +1402,43 @@ export class OpenContainerRuntime {
     this.emit('processStart', { pid: proc.pid, repl, background });
     if (background) return; // prompt returns immediately
     // Foreground: resolve when the process exits (terminal prompt authority).
+    // S20: builtin/coreutil lines sync the session cwd from the shell's own
+    // exit report BEFORE the prompt returns (the shell ran the real chdir,
+    // including compound lines like `mkdir x && cd x` — the host session
+    // follows so the NEXT command starts where the user expects).
     await new Promise<void>((resolve) => {
       const off = this.on('exit', (info) => {
-        if (info.pid === proc.pid) { off(); resolve(); }
+        if (info.pid === proc.pid) {
+          off();
+          if (SHELL_BUILTINS.has(cmd)) {
+            this.syncCwdFromGuestReport(cmd, args).then(resolve, resolve);
+          } else {
+            resolve();
+          }
+        }
       });
     });
+  }
+
+  /** S20 — adopt the guest shell's final cwd (oc-sh writes it to
+   *  OC_CWD_REPORT_PATH at exit when the terminal spawned it). Falls back
+   *  to the old direct `cd <dir>` mirror when no report exists (older
+   *  blobs). The guest shell already echoed any real error; a failed chdir
+   *  leaves both cws unchanged. */
+  private async syncCwdFromGuestReport(cmd: string, args: string[]): Promise<void> {
+    try {
+      const bytes = await this.readFile(OC_CWD_REPORT_PATH);
+      const reported = new TextDecoder().decode(bytes).trim();
+      if (reported.startsWith('/')) {
+        if (OC_BASE_DIRS.has(reported) || this.vfsSnapshot.dirs.has(reported)) {
+          if (reported !== this.cwd) this.cwd = reported;
+          return;
+        }
+      }
+    } catch { /* no report — fall through to the direct mirror */ }
+    if (cmd === 'cd' && (args[0] ?? '') !== '-') {
+      this.chdir(args[0]);
+    }
   }
 
   // ------------------------------------------------------- programmatic spawn
@@ -1382,7 +1466,8 @@ export class OpenContainerRuntime {
     if (opts.cwd) this.cwd = opts.cwd; // resolveShellCommand resolves via cwd
     let spec: ReturnType<OpenContainerRuntime['resolveShellCommand']>;
     try {
-      spec = this.resolveShellCommand(command, args);
+      spec = this.resolveShellCommand(command, args,
+        command + (args.length ? ' ' + args.map(shQuote).join(' ') : ''));
     } finally {
       if (opts.cwd) this.cwd = prevCwd;
     }
@@ -1481,13 +1566,29 @@ export class OpenContainerRuntime {
   }
 
   /** Resolve a shell command against the internal bins + VFS PATH. */
-  private resolveShellCommand(cmd: string, args: string[]): {
+  private resolveShellCommand(cmd: string, args: string[], line?: string): {
     entry: EntrySpec | null; argv?: string[]; env?: Record<string, string>;
     cwd?: string; error?: string;
   } {
     const INTERNAL = new Set(['node', 'npm', 'npx', 'pnpm', 'pnpx', 'corepack', 'sh', 'bash', 'clear', 'help']);
     if (cmd === 'clear' || cmd === 'help') {
       return { entry: null, error: undefined };
+    }
+    // S20 — REAL shell builtins & coreutils route through oc-sh (our
+    // POSIX-subset /bin/sh): cd/pwd/export/echo + ls/mkdir/cat/rm/mv/cp/…
+    // run as REAL fs operations in the guest, with ; && || and
+    // redirections honored by the shell. The old DIY dispatcher
+    // PATH-searched for a `cd` binary and answered 127.
+    if (SHELL_BUILTINS.has(cmd)) {
+      const script = line ?? [cmd, ...args.map(shQuote)].join(' ');
+      return {
+        entry: { type: 'main', path: '/usr/bin/sh' },
+        argv: ['/usr/local/bin/node', '/usr/bin/sh', '-c', script],
+        // S20: the shell reports its final cwd back through this file (see
+        // syncCwdFromGuestReport) — compound lines (`mkdir x && cd x`) move
+        // the session cwd too, which an args[0] mirror alone would miss.
+        env: { OC_CWD_REPORT: OC_CWD_REPORT_PATH },
+      };
     }
     if (INTERNAL.has(cmd)) {
       if (cmd === 'node') {
@@ -1593,11 +1694,7 @@ export class OpenContainerRuntime {
     }
     // Base dirs exist in every kernel (boot mkdirs cwd; the image provides
     // the rest) even when the host snapshot has no explicit entry for them.
-    const BASE_DIRS = new Set([
-      '/', '/home', '/home/project', '/home/node', '/tmp', '/usr', '/usr/bin',
-      '/usr/local', '/usr/local/bin', '/usr/lib', '/usr/lib/node_modules',
-    ]);
-    const isDir = BASE_DIRS.has(target) || this.vfsSnapshot.dirs.has(target);
+    const isDir = OC_BASE_DIRS.has(target) || this.vfsSnapshot.dirs.has(target);
     if (!isDir) {
       return { ok: false, error: `cd: no such file or directory: ${dir}` };
     }
@@ -2096,6 +2193,38 @@ function normalizeDir(fromPath: string, relTarget: string): string {
 
 function quoteIfNeeded(code: string): string {
   return code.includes(' ') ? JSON.stringify(code) : code;
+}
+
+/** S20 — where the guest shell reports its final cwd (oc-sh's
+ *  writeCwdReport). /tmp is session scratch — never part of project trees. */
+const OC_CWD_REPORT_PATH = '/tmp/.oc-cwd';
+
+/** Directories every kernel boots with, even when the host snapshot has no
+ *  explicit entry for them (chdir / cwd-report validation). */
+const OC_BASE_DIRS = new Set([
+  '/', '/home', '/home/project', '/home/node', '/tmp', '/usr', '/usr/bin',
+  '/usr/local', '/usr/local/bin', '/usr/lib', '/usr/lib/node_modules',
+]);
+
+/** S20 — commands the guest oc-sh implements for real (vendor/node-v26.13.0/
+ *  oc-sh/sh.js BUILTINS + COREUTILS, merged in its COMMANDS table): shell
+ *  builtins (cd/pwd/export/unset/echo/exit/true/false/:) and coreutils
+ *  (ls/mkdir/rmdir/touch/cat/rm/mv/cp/head/tail/wc/which) run as REAL fs
+ *  operations inside a real shell process with ; && || and redirections —
+ *  not host-side reimplementations, and not a PATH search for a `cd`
+ *  binary (the old dispatcher answered 127). */
+const SHELL_BUILTINS = new Set([
+  'cd', 'pwd', 'export', 'unset', 'echo', 'exit', 'true', 'false', ':',
+  'ls', 'mkdir', 'rmdir', 'touch', 'cat', 'rm', 'mv', 'cp', 'head', 'tail',
+  'wc', 'which',
+]);
+
+/** S20 — POSIX-quote one argv element into a single shell word. spawnProgram
+ *  reconstructs a command line from (cmd, args); oc-sh re-parses it, so
+ *  every argument must survive the round-trip exactly. Single quotes admit
+ *  no escapes — the only trick needed is '\'' to close/escape/reopen. */
+function shQuote(arg: string): string {
+  return `'${String(arg).replace(/'/g, `'\\''`)}'`;
 }
 
 /** Quote-aware tokenizer (handles "a b" 'c d' and backslash escapes).

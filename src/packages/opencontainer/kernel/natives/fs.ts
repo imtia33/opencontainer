@@ -304,12 +304,34 @@ export function makeFsBinding(ctx: NativesContext): Binding {
       return bytes.byteLength;
     }
     const f = mustFd(fd, 'write');
-    if (position !== -1 && position !== null && position !== undefined) {
+    const explicitPos = position !== -1 && position !== null && position !== undefined;
+    // S21 fast path — the dominant install shape is open('w') (O_TRUNC
+    // emptied the file at open time) followed by ONE whole-content write:
+    // fs.writeFileSync / npm's tar extractor write every file this way.
+    // The old path did read-modify-write per call: readFile (copy) + a
+    // merged realloc + two memcpys + writeFile's own snapshot copy — four
+    // allocations where one suffices. Guarded on the write landing at
+    // offset 0 AND the file being genuinely empty (a concurrent writer may
+    // have refilled it since our open) so overwrite semantics are
+    // preserved byte-for-byte.
+    const truncEmptyNow = (): boolean => {
+      if (!(f.flags & 512 /* O_TRUNC */)) return false;
+      const atZero = explicitPos ? position === 0 : f.pos === 0;
+      if (!atZero) return false;
+      try { return vfs.stat(f.path).size === 0; } catch { return true; /* missing → write creates */ }
+    };
+    // pwrite(fd, buf, …, 0) over a just-truncated file → this write IS the
+    // content (pwrite never moves the fd offset).
+    if (explicitPos && position === 0 && truncEmptyNow()) {
+      vfs.writeFile(f.path, bytes);
+      return bytes.byteLength;
+    }
+    if (explicitPos) {
       const existing = vfs.readFile(f.path);
       const merged = new Uint8Array(Math.max(existing.byteLength, position + bytes.byteLength));
       merged.set(existing);
       merged.set(bytes, position);
-      vfs.writeFile(f.path, merged);
+      vfs.writeFile(f.path, merged, 0o666, true);
       // pwrite semantics (verified against real node): an EXPLICIT position
       // write does NOT move the fd's file offset — only position:null reads/
       // writes advance f.pos. (fs.writeSync(fd, 'foo', 0) leaves the offset
@@ -320,11 +342,18 @@ export function makeFsBinding(ctx: NativesContext): Binding {
       vfs.appendFile(f.path, bytes);
       f.pos = vfs.stat(f.path).size;
     } else {
+      // S21 fast path (position:null writes at offset 0 after a truncating
+      // open — see above): the file is empty, this write IS the content.
+      if (truncEmptyNow()) {
+        vfs.writeFile(f.path, bytes);
+        f.pos = bytes.byteLength;
+        return bytes.byteLength;
+      }
       const existing = vfs.readFile(f.path);
       const merged = new Uint8Array(Math.max(existing.byteLength, f.pos + bytes.byteLength));
       merged.set(existing);
       merged.set(bytes, f.pos);
-      vfs.writeFile(f.path, merged);
+      vfs.writeFile(f.path, merged, 0o666, true);
       f.pos += bytes.byteLength;
     }
     return bytes.byteLength;

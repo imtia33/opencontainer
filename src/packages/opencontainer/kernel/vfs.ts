@@ -66,6 +66,13 @@ interface VNode {
   birthtimeMs: number;
   ino: number;
   watchers: Set<VfsWatcher>;
+  /** S21 — children indexed by name. The old plain-array `find()` made
+   *  every lookup O(siblings): an install with 559 packages in node_modules
+   *  scanned a 559-element array per path segment for EVERY one of the tens
+   *  of thousands of writes/reads (O(files × packages) total — the dominant
+   *  cost of a slow install). Map.get is O(1); insertion order still
+   *  determines readdir order (Map iterates in insertion order). */
+  children: Map<string, VNode>;
 }
 
 export class VfsError extends Error {
@@ -132,7 +139,7 @@ export class Vfs {
     return {
       name, parent, mode, data,
       mtimeMs: t, atimeMs: t, ctimeMs: t, birthtimeMs: t,
-      ino: nextIno++, watchers: new Set(),
+      ino: nextIno++, watchers: new Set(), children: new Map(),
     };
   }
 
@@ -166,7 +173,7 @@ export class Vfs {
         cur = this.lookup(this.joinPaths(this.pathOf(cur.parent ?? this.root), t)) ?? cur;
       }
       if ((cur.mode & S_IFMT) !== S_IFDIR) return null;
-      const child = this.childrenOf(cur).find((c) => c.name === seg);
+      const child = cur.children.get(seg);
       if (!child) return null;
       if ((child.mode & S_IFMT) === S_IFLNK && followLast) {
         const target = this.joinPaths(this.pathOf(child.parent ?? this.root), child.target ?? '/');
@@ -178,23 +185,6 @@ export class Vfs {
       }
     }
     return cur;
-  }
-
-  private childrenOf(dir: VNode): VNode[] {
-    // children are stored on the parent via a map in this simple impl
-    return (dir as any)._children ?? [];
-  }
-
-  private attach(parent: VNode, child: VNode) {
-    (parent as any)._children = (parent as any)._children ?? [];
-    (parent as any)._children.push(child);
-  }
-
-  private detach(parent: VNode, child: VNode) {
-    const kids = (parent as any)._children as VNode[] | undefined;
-    if (!kids) return;
-    const i = kids.indexOf(child);
-    if (i >= 0) kids.splice(i, 1);
   }
 
   pathOf(node: VNode): string {
@@ -276,14 +266,14 @@ export class Vfs {
     let createdAny = false;
     for (let i = 0; i < segs.length; i++) {
       const name = segs[i];
-      let child = this.childrenOf(cur).find((c) => c.name === name);
+      let child = cur.children.get(name);
       if (!child) {
         if (i === segs.length - 1 && this.lookup(this.joinPaths(this.pathOf(cur), name))) {
           throw new VfsError('EEXIST', errnoOf('EEXIST'), 'mkdir', p);
         }
         child = this.makeNode(name, cur, S_IFDIR | (mode & 0o777));
-        this.attach(cur, child);
-        this.fireRename(this.pathOf(cur));
+        cur.children.set(child.name, child);
+        this.fireRenameAt(cur);
         createdAny = true;
       } else if ((child.mode & S_IFMT) === S_IFLNK) {
         child = this.lookup(this.joinPaths(this.pathOf(cur), child.target ?? '/')) ?? child;
@@ -319,33 +309,44 @@ export class Vfs {
     return new TextDecoder().decode(this.readFile(p));
   }
 
-  writeFile(p: string, data: Uint8Array | string, mode = 0o666): void {
-    const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : data;
+  /** S21 — `owned`: the caller GUARANTEES `data` is a private, freshly
+   *  allocated buffer nobody else references (a TextEncoder result, an
+   *  importTree/applyExternalOps buffer that arrived by structured clone,
+   *  a freshly built merge). The VFS stores it directly instead of copying.
+   *  String data is inherently owned (encode() allocates). Guest-passed
+   *  Uint8Arrays are NOT owned (node Buffers share pooled ArrayBuffers) and
+   *  still get the defensive snapshot copy — real fs semantics: the file
+   *  content is frozen at write(2) time. */
+  writeFile(p: string, data: Uint8Array | string, mode = 0o666, owned = false): void {
+    const isString = typeof data === 'string';
+    const bytes = isString ? new TextEncoder().encode(data) : data;
     const norm = this.normalize(p);
     const parentNode = this.lookup(this.dirname(norm));
     if (!parentNode || (parentNode.mode & S_IFMT) !== S_IFDIR) {
       throw new VfsError('ENOENT', errnoOf('ENOENT'), 'open', p);
     }
-    let node = this.childrenOf(parentNode).find((c) => c.name === this.basename(norm));
+    const base = this.basename(norm);
+    let node = parentNode.children.get(base);
     if (node && (node.mode & S_IFMT) === S_IFDIR) {
       throw new VfsError('EISDIR', errnoOf('EISDIR'), 'open', p);
     }
     if (node && (node.mode & S_IFMT) === S_IFLNK) {
       const target = this.joinPaths(this.dirname(norm), node.target ?? '/');
-      this.writeFile(target, bytes);
+      this.writeFile(target, bytes, mode, owned || isString);
       return;
     }
+    const store = (owned || isString) ? bytes : bytes.slice();
     const t = this.now();
     if (!node) {
-      node = this.makeNode(this.basename(norm), parentNode, S_IFREG | (mode & 0o777), bytes.slice());
-      this.attach(parentNode, node);
-      this.fireRename(this.dirname(norm));
+      node = this.makeNode(base, parentNode, S_IFREG | (mode & 0o777), store);
+      parentNode.children.set(node.name, node);
+      this.fireRenameAt(parentNode);
     } else {
-      node.data = bytes.slice();
+      node.data = store;
       node.mtimeMs = node.ctimeMs = t;
-      this.fireChange(norm);
+      this.fireChangeAt(parentNode, base);
     }
-    this.persist?.({ type: 'write', path: norm, data: bytes });
+    this.persist?.({ type: 'write', path: norm, data: store });
   }
 
   appendFile(p: string, data: Uint8Array | string): void {
@@ -353,22 +354,21 @@ export class Vfs {
     const add = typeof data === 'string' ? new TextEncoder().encode(data) : data;
     const merged = new Uint8Array(existing.byteLength + add.byteLength);
     merged.set(existing); merged.set(add, existing.byteLength);
-    this.writeFile(p, merged);
+    this.writeFile(p, merged, 0o666, true);
   }
 
   readdir(p: string): string[] {
     const node = this.mustDir(p, 'readdir');
-    return this.childrenOf(node)
-      .filter((c) => (c.mode & S_IFMT) !== 0)
-      .map((c) => c.name);
+    const out: string[] = [];
+    for (const c of node.children.values()) out.push(c.name);
+    return out;
   }
 
   dirents(p: string): Array<{ name: string; type: number }> {
     const node = this.mustDir(p, 'readdir');
-    return this.childrenOf(node).map((c) => ({
-      name: c.name,
-      type: c.mode & S_IFMT,
-    }));
+    const out: Array<{ name: string; type: number }> = [];
+    for (const c of node.children.values()) out.push({ name: c.name, type: c.mode & S_IFMT });
+    return out;
   }
 
   rm(p: string, opts: { recursive?: boolean; force?: boolean } = {}): void {
@@ -379,12 +379,12 @@ export class Vfs {
       throw new VfsError('ENOENT', errnoOf('ENOENT'), 'rm', p);
     }
     const isDir = (node.mode & S_IFMT) === S_IFDIR;
-    if (isDir && !opts.recursive && this.childrenOf(node).length > 0) {
+    if (isDir && !opts.recursive && node.children.size > 0) {
       throw new VfsError('ENOTEMPTY', errnoOf('ENOTEMPTY'), 'rm', p);
     }
     const parent = node.parent ?? this.root;
-    this.detach(parent, node);
-    this.fireRename(this.pathOf(parent));
+    parent.children.delete(node.name);
+    this.fireRenameAt(parent);
     this.persist?.({ type: 'unlink', path: norm });
   }
 
@@ -396,7 +396,7 @@ export class Vfs {
     if (!parentB || (parentB.mode & S_IFMT) !== S_IFDIR) {
       throw new VfsError('ENOENT', errnoOf('ENOENT'), 'rename', newPath);
     }
-    const existing = this.childrenOf(parentB).find((c) => c.name === this.basename(b));
+    const existing = parentB.children.get(this.basename(b));
     if (existing && existing !== node) {
       // POSIX rename(2) semantics matrix:
       //   file  → existing file  : silent atomic replace (atomic writers
@@ -409,25 +409,25 @@ export class Vfs {
       const existingIsDir = (existing.mode & S_IFMT) === S_IFDIR;
       const nodeIsDir = (node.mode & S_IFMT) === S_IFDIR;
       if (existingIsDir && nodeIsDir) {
-        if (this.childrenOf(existing).length) {
+        if (existing.children.size) {
           throw new VfsError('ENOTEMPTY', errnoOf('ENOTEMPTY'), 'rename', newPath);
         }
-        this.detach(parentB, existing); // replace empty dir
+        parentB.children.delete(existing.name); // replace empty dir
       } else if (existingIsDir && !nodeIsDir) {
         throw new VfsError('EISDIR', errnoOf('EISDIR'), 'rename', newPath);
       } else if (!existingIsDir && nodeIsDir) {
         throw new VfsError('ENOTDIR', errnoOf('ENOTDIR'), 'rename', newPath);
       } else {
-        this.detach(parentB, existing); // file onto file → replace
+        parentB.children.delete(existing.name); // file onto file → replace
       }
     }
     const oldParent = node.parent ?? this.root;
-    this.detach(oldParent, node);
+    oldParent.children.delete(node.name);
     node.name = this.basename(b);
     node.parent = parentB;
-    this.attach(parentB, node);
-    this.fireRename(this.pathOf(oldParent));
-    this.fireRename(this.dirname(b));
+    parentB.children.set(node.name, node);
+    this.fireRenameAt(oldParent);
+    this.fireRenameAt(parentB);
     this.persist?.({ type: 'rename', from: a, to: b });
     if ((node.mode & S_IFMT) === S_IFREG && node.data) {
       this.persist?.({ type: 'write', path: b, data: node.data });
@@ -440,8 +440,8 @@ export class Vfs {
     if (!parentNode) throw new VfsError('ENOENT', errnoOf('ENOENT'), 'symlink', path);
     const node = this.makeNode(this.basename(norm), parentNode, S_IFLNK | 0o777);
     node.target = target;
-    this.attach(parentNode, node);
-    this.fireRename(this.dirname(norm));
+    parentNode.children.set(node.name, node);
+    this.fireRenameAt(parentNode);
     this.persist?.({ type: 'symlink', path: norm, target });
   }
 
@@ -524,15 +524,15 @@ export class Vfs {
     return watcher;
   }
 
-  private fireRename(dirPath: string) {
-    const dir = this.lookup(dirPath, false);
-    if (dir) for (const w of dir.watchers) w.onEvent({ type: 'rename', filename: null });
+  /** S21 — fire* take the directory NODE directly (every mutation site
+   *  already holds it). The old path-based variants re-walked the whole
+   *  tree from the root on EVERY write just to find the watcher set — a
+   *  second full lookup per write in the install hot path. */
+  private fireRenameAt(dir: VNode): void {
+    for (const w of dir.watchers) w.onEvent({ type: 'rename', filename: null });
   }
 
-  private fireChange(filePath: string) {
-    const dir = this.lookup(this.dirname(filePath), false);
-    if (!dir) return;
-    const base = this.basename(filePath);
+  private fireChangeAt(dir: VNode, base: string): void {
     for (const w of dir.watchers) {
       if (w.fileFilter !== undefined && w.fileFilter !== base) continue;
       w.onEvent({ type: 'change', filename: base });
@@ -566,7 +566,7 @@ export class Vfs {
     const lines: string[] = [];
     const node = this.lookup(dir);
     if (!node) return '(missing)';
-    for (const c of this.childrenOf(node)) {
+    for (const c of node.children.values()) {
       lines.push('  '.repeat(depth) + c.name + ((c.mode & S_IFMT) === S_IFDIR ? '/' : ''));
       if ((c.mode & S_IFMT) === S_IFDIR) lines.push(this.dump(this.joinPaths(dir, c.name), depth + 1));
     }
@@ -579,7 +579,7 @@ export class Vfs {
     const files: Array<[string, Uint8Array]> = [];
     const symlinks: Array<[string, string]> = [];
     const walk = (node: VNode, p: string) => {
-      for (const c of this.childrenOf(node)) {
+      for (const c of node.children.values()) {
         const cp = p === '/' ? '/' + c.name : p + '/' + c.name;
         const t = c.mode & S_IFMT;
         if (t === S_IFDIR) { dirs.push(cp); walk(c, cp); }
@@ -610,7 +610,10 @@ export class Vfs {
         try { this.mkdir(p.slice(0, i), true); } catch { /* exists */ }
       };
       for (const [p, data] of tree.files) {
-        try { ensureParents(p); this.writeFile(p, data); } catch { /* best-effort */ }
+        // S21: hydrate buffers arrived by structured clone — private by
+        // construction, so the VFS takes them without the defensive copy
+        // (the old slice() doubled the memory of every spawn hydration).
+        try { ensureParents(p); this.writeFile(p, data, 0o666, true); } catch { /* best-effort */ }
       }
       for (const [p, target] of tree.symlinks) {
         try { ensureParents(p); this.symlink(target, p); } catch { /* best-effort */ }
@@ -632,7 +635,10 @@ export class Vfs {
       for (const op of ops) {
         try {
           switch (op.type) {
-            case 'write': this.writeFile(op.path, op.data); break;
+            // S21: op.data arrived by structured clone (a private copy) —
+            // store owned, no second slice. This halves the byte cost of the
+            // peer fan-out path (the source process already paid one copy).
+            case 'write': this.writeFile(op.path, op.data, 0o666, true); break;
             case 'mkdir': this.mkdir(op.path, true); break;
             case 'symlink': this.symlink(op.target, op.path); break;
             case 'unlink': {

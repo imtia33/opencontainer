@@ -1,5 +1,57 @@
 import { netBodyOpen, netBodyClose } from './net-pending';
 
+// ---------------------------------------------------------------------------
+// S22 — maxSockets: the Agent-parity concurrency semaphore.
+//
+// @npmcli/agent's Agent flows in as options.agent and is deliberately
+// ignored by this client (see header) — which also discarded the agent's
+// maxSockets throttle. npm assumes node's Agent semantics and fires its
+// whole reify batch at once: with the cap gone, hundreds of tarball
+// fetches streamed CONCURRENTLY, every response buffering in JS streams
+// while extraction lagged behind, and a ~300-package install grew the
+// kernel past 2GB RSS (OOM-killed — measured 2026-11-07, scale harness).
+// This semaphore restores the node Agent contract: a permit is held for
+// the request+body lifetime (acquire at fetch start, release on request
+// 'close' — emitted exactly once by _closeAll / _watchResponse /
+// _destroyQuietly). npm's own default (config maxsockets) is 15.
+// ---------------------------------------------------------------------------
+let httpMaxSockets = 15;
+let httpActiveSockets = 0;
+const httpSocketWaiters: Array<() => void> = [];
+
+/** Tune the cap (hosts/tests). npm default: 15. */
+export function setHttpMaxSockets(n: number): void {
+  httpMaxSockets = Math.max(1, n | 0);
+  while (httpActiveSockets < httpMaxSockets && httpSocketWaiters.length > 0) {
+    httpActiveSockets++;
+    const next = httpSocketWaiters.shift()!;
+    queueMicrotask(next);
+  }
+}
+
+function acquireHttpSocket(continuation: () => void): void {
+  if (httpActiveSockets < httpMaxSockets) {
+    httpActiveSockets++;
+    continuation();
+    return;
+  }
+  httpSocketWaiters.push(continuation);
+}
+
+function releaseHttpSocket(): void {
+  if (httpSocketWaiters.length > 0) {
+    // Permit handoff — the active count is unchanged.
+    queueMicrotask(httpSocketWaiters.shift()!);
+  } else {
+    httpActiveSockets = Math.max(0, httpActiveSockets - 1);
+  }
+}
+
+/** Diagnostics: live permits + queued requests. */
+export function httpSocketStats(): { active: number; queued: number; max: number } {
+  return { active: httpActiveSockets, queued: httpSocketWaiters.length, max: httpMaxSockets };
+}
+
 /**
  * OpenContainer — fetch-backed node `http`/`https` CLIENT for the guest kernel.
  *
@@ -91,6 +143,14 @@ export interface FetchHttpClientOptions {
   http: any;
   /** The guest's `https` module object (patched in place). */
   https: any;
+  /**
+   * S22 — concurrent outbound request+body limit (Agent maxSockets parity).
+   * The guest's Agent objects are ignored by this client, so the npm CLI's
+   * own throttle would otherwise be discarded — unbounded concurrent
+   * tarball fetches OOM'd the kernel at scale (2GB RSS, ~300 packages).
+   * Default: 15 (npm's own maxsockets default).
+   */
+  maxSockets?: number;
   /**
    * URL rewrite applied to the absolute outbound URL right before fetch.
    * Default: NONE — outbound requests go DIRECT to their destination.
@@ -702,6 +762,8 @@ class FetchClientRequest extends TinyEmitter {
   res: FetchIncomingMessage | null = null;
   socket: FakeSocket | null = null;
   method: string;
+  /** S22 — maxSockets permit released exactly once (request 'close'). */
+  private _socketReleased = false;
   path: string;
   host: string;
   port: number;
@@ -939,10 +1001,29 @@ class FetchClientRequest extends TinyEmitter {
 
     const socket = new FakeSocket(this.host, this.port);
     this.socket = socket;
-    // minipass-fetch arms its network timeout on req.once('socket') —
-    // emit before the fetch so timers behave like node's.
-    this.emit('socket', socket);
+
+    // S22: one permit per request+body lifetime (Agent maxSockets parity).
+    acquireHttpSocket(() => this._fetchWithPermit(absUrl, headers, body));
+  }
+
+  /** The actual fetch, run while holding a maxSockets permit. */
+  private _fetchWithPermit(absUrl: string, headers: Record<string, unknown>, body: BodyInit | undefined): void {
+    if (this.destroyed) {
+      releaseHttpSocket(); // aborted while queued — hand the permit back
+      return;
+    }
+    // node Agent semantics: 'socket' fires when the request actually STARTS
+    // (not when it queues) — and npm's fetch timeout arms on it, so a
+    // queued request must not burn its 60s timeout waiting for a permit.
+    this.emit('socket', this.socket!);
     this._armIdle();
+    if (!this._socketReleased) {
+      this.once('close', () => {
+        if (this._socketReleased) return;
+        this._socketReleased = true;
+        releaseHttpSocket();
+      });
+    }
 
     const fetchFn = this._fetchImpl ?? (globalThis as any).fetch;
     const opts: RequestInit & { redirect: 'manual' } = {
@@ -1196,6 +1277,13 @@ export interface FetchHttpClientHandle {
 export function installFetchHttpClient(opts: FetchHttpClientOptions): FetchHttpClientHandle {
   const { http, https } = opts;
   if (!http || !https) throw new Error('installFetchHttpClient: `http` and `https` module objects are required');
+
+  // S22: Agent maxSockets parity (see the semaphore block at the top). The
+  // guest's Agent object is ignored; this cap applies to every outbound
+  // request regardless. Default 15 = npm's own maxsockets default.
+  if (typeof opts.maxSockets === 'number' && opts.maxSockets > 0) {
+    setHttpMaxSockets(opts.maxSockets);
+  }
 
   const rewrite = opts.rewrite;
   const fetchImpl = opts.fetchImpl;
